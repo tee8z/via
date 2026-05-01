@@ -1,0 +1,28 @@
+[package]
+name = "via-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["tee8z <tee8z@protonmail.com>"]
+license = "MIT"
+repository = "https://github.com/tee8z/via"
+description = "secure CLI for running commands and API requests using credentials from your secret provider"
+keywords = ["cli", "credentials"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "via"
+path = "src/lib.rs"
+
+[[bin]]
+name = "via"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.1", default-features = false, features = ["error-context", "help", "std", "usage"] }
+reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "rustls-no-provider"] }
+rustls = { version = "0.23.4", default-features = false, features = ["ring", "std", "tls12"] }
+secrecy = "0.10.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }

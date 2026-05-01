@@ -1,0 +1,86 @@
+name: Build Binaries
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: via-linux-x86_64.tar.gz
+          - name: Linux arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: via-linux-arm64.tar.gz
+          - name: macOS x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: via-macos-x86_64.tar.gz
+          - name: macOS arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            archive: via-macos-arm64.tar.gz
+          - name: Windows x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: via-windows-x86_64.zip
+          - name: Windows arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: via-windows-arm64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/via dist/via
+          tar -C dist -czf ${{ matrix.archive }} via
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/via.exe" "dist/via.exe"
+          Compress-Archive -Path "dist/via.exe" -DestinationPath "${{ matrix.archive }}" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
