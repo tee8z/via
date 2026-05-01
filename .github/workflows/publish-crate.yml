@@ -1,9 +1,15 @@
 name: Publish Crate
 
 on:
-  pull_request_target:
-    types:
-      - closed
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "v* tag to publish to crates.io"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,15 +20,34 @@ env:
 jobs:
   publish:
     name: Publish to crates.io
-    if: ${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' && (startsWith(github.event.pull_request.head.ref, 'release/') || contains(github.event.pull_request.labels.*.name, 'release')) }}
     runs-on: ubuntu-24.04
     environment: crates-io
 
     steps:
-      - name: Checkout merge commit
+      - name: Validate requested tag
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *)
+              echo "::error::tag must start with v"
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout tag
+        if: ${{ github.event_name == 'push' }}
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ github.ref }}
+
+      - name: Checkout requested tag
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Install Rust
         run: |
