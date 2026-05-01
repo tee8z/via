@@ -46,6 +46,9 @@ pub enum ViaError {
     #[error("secret `{secret}` is not configured for service `{service}`")]
     UnknownSecret { service: String, secret: String },
 
+    #[error("doctor checks failed; see output above for setup guidance")]
+    DoctorFailed,
+
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
 
@@ -78,6 +81,7 @@ impl ViaError {
             | ViaError::ParseConfig(_)
             | ViaError::MissingProgram { .. }
             | ViaError::ExternalCommandFailed { .. }
+            | ViaError::DoctorFailed
             | ViaError::Http(_)
             | ViaError::Json(_)
             | ViaError::Io(_) => 1,

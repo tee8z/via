@@ -71,6 +71,29 @@ pub struct RestCommandConfig {
 pub enum AuthConfig {
     #[serde(rename = "bearer")]
     Bearer { secret: String },
+    #[serde(rename = "headers")]
+    Headers {
+        #[serde(default)]
+        headers: BTreeMap<String, SecretHeaderConfig>,
+    },
+    #[serde(rename = "github_app")]
+    GitHubApp {
+        #[serde(default)]
+        secret: Option<String>,
+        #[serde(default)]
+        credential: Option<String>,
+        #[serde(default)]
+        private_key: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SecretHeaderConfig {
+    pub secret: String,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub suffix: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,10 +122,7 @@ pub struct SecretBinding {
 
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self, ViaError> {
-        let path = match path {
-            Some(path) => path.to_path_buf(),
-            None => default_config_path()?,
-        };
+        let path = resolve_path(path)?;
 
         let raw = fs::read_to_string(&path).map_err(|source| ViaError::ReadConfig {
             path: path.clone(),
@@ -150,6 +170,13 @@ impl Config {
     }
 }
 
+pub fn resolve_path(path: Option<&Path>) -> Result<PathBuf, ViaError> {
+    match path {
+        Some(path) => Ok(path.to_path_buf()),
+        None => default_config_path(),
+    }
+}
+
 impl CommandConfig {
     pub fn description(&self) -> Option<&String> {
         match self {
@@ -179,8 +206,39 @@ impl CommandConfig {
                     )));
                 }
 
-                if let Some(AuthConfig::Bearer { secret }) = &rest.auth {
-                    validate_secret_name(service_name, command_name, service, secret)?;
+                if let Some(auth) = &rest.auth {
+                    match auth {
+                        AuthConfig::Bearer { secret } => {
+                            validate_secret_name(service_name, command_name, service, secret)?;
+                        }
+                        AuthConfig::Headers { headers } => {
+                            if headers.is_empty() {
+                                return Err(ViaError::InvalidConfig(format!(
+                                    "command `{service_name}.{command_name}` headers auth must configure at least one header"
+                                )));
+                            }
+                            for secret_header in headers.values() {
+                                validate_secret_name(
+                                    service_name,
+                                    command_name,
+                                    service,
+                                    &secret_header.secret,
+                                )?;
+                            }
+                        }
+                        AuthConfig::GitHubApp {
+                            secret,
+                            credential,
+                            private_key,
+                        } => validate_github_app_auth(
+                            service_name,
+                            command_name,
+                            service,
+                            secret.as_deref(),
+                            credential.as_deref(),
+                            private_key.as_deref(),
+                        )?,
+                    }
                 }
             }
             CommandConfig::Delegated(delegated) => {
@@ -213,6 +271,28 @@ fn validate_secret_name(
     Err(ViaError::InvalidConfig(format!(
         "command `{service_name}.{command_name}` references unknown secret `{secret}`"
     )))
+}
+
+fn validate_github_app_auth(
+    service_name: &str,
+    command_name: &str,
+    service: &ServiceConfig,
+    secret: Option<&str>,
+    credential: Option<&str>,
+    private_key: Option<&str>,
+) -> Result<(), ViaError> {
+    match (secret, credential, private_key) {
+        (Some(secret), None, None) => {
+            validate_secret_name(service_name, command_name, service, secret)
+        }
+        (None, Some(credential), Some(private_key)) => {
+            validate_secret_name(service_name, command_name, service, credential)?;
+            validate_secret_name(service_name, command_name, service, private_key)
+        }
+        _ => Err(ViaError::InvalidConfig(format!(
+            "command `{service_name}.{command_name}` github_app auth must set either `secret` or both `credential` and `private_key`"
+        ))),
+    }
 }
 
 fn default_method() -> String {
@@ -307,6 +387,57 @@ secret = "token"
         assert!(matches!(
             Config::from_toml_str(&raw),
             Err(ViaError::InvalidConfig(message)) if message.contains("unknown secret")
+        ));
+    }
+
+    #[test]
+    fn accepts_github_app_rest_auth() {
+        let raw = VALID.replace(
+            r#"[services.github.commands.api.auth]
+type = "bearer"
+secret = "token""#,
+            r#"[services.github.commands.api.auth]
+type = "github_app"
+credential = "token"
+private_key = "token""#,
+        );
+
+        assert!(Config::from_toml_str(&raw).is_ok());
+    }
+
+    #[test]
+    fn accepts_secret_header_rest_auth() {
+        let raw = VALID.replace(
+            r#"[services.github.commands.api.auth]
+type = "bearer"
+secret = "token""#,
+            r#"[services.github.commands.api.auth]
+type = "headers"
+
+[services.github.commands.api.auth.headers.Authorization]
+secret = "token"
+prefix = "Token "
+
+[services.github.commands.api.auth.headers.X-Api-Key]
+secret = "token""#,
+        );
+
+        assert!(Config::from_toml_str(&raw).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_secret_header_rest_auth() {
+        let raw = VALID.replace(
+            r#"[services.github.commands.api.auth]
+type = "bearer"
+secret = "token""#,
+            r#"[services.github.commands.api.auth]
+type = "headers""#,
+        );
+
+        assert!(matches!(
+            Config::from_toml_str(&raw),
+            Err(ViaError::InvalidConfig(message)) if message.contains("at least one header")
         ));
     }
 

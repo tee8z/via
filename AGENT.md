@@ -1,6 +1,6 @@
 # Agent Notes
 
-`via` is a small Rust CLI for running configured API calls and trusted commands with credentials resolved from a secret provider at runtime. The current provider target is 1Password through the `op` CLI.
+`via` is a small Rust CLI for running commands and API requests with credentials from a secret provider without exposing secrets to the shell. The current provider target is 1Password through its official local CLI.
 
 The crates.io package name is `via-cli` because `via` is already taken. The library crate and installed binary are both named `via`.
 
@@ -42,7 +42,7 @@ The core modules are:
 - `src/app.rs`: top-level command coordination.
 - `src/cli.rs`: CLI parsing with clap.
 - `src/config.rs`: TOML config loading and validation.
-- `src/providers/`: secret provider abstraction and 1Password `op read` backend.
+- `src/providers/`: secret provider abstraction and 1Password local CLI backend.
 - `src/executor/rest.rs`: brokered HTTP execution.
 - `src/executor/delegated.rs`: trusted child-process execution with redaction.
 - `src/redaction.rs`: output redaction for resolved secret values.

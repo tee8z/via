@@ -3,7 +3,6 @@ use std::process::ExitCode;
 
 use crate::cli::{print_help, Cli, Command};
 use crate::config::Config;
-use crate::doctor;
 use crate::error::ViaError;
 use crate::executor;
 use crate::providers::ProviderRegistry;
@@ -42,9 +41,8 @@ fn try_run(args: impl IntoIterator<Item = OsString>) -> Result<ExitCode, ViaErro
             crate::capabilities::print(&config, json)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Doctor { service } => {
-            let config = Config::load(cli.config_path.as_deref())?;
-            doctor::run(&config, service.as_deref())?;
+        Command::Config(command) => {
+            crate::config_command::run(cli.config_path.as_deref(), command)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::SkillPrint => {

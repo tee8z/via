@@ -1,7 +1,9 @@
 pub mod app;
+pub mod auth;
 pub mod capabilities;
 pub mod cli;
 pub mod config;
+pub mod config_command;
 pub mod doctor;
 pub mod error;
 pub mod executor;

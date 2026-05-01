@@ -15,15 +15,19 @@ pub enum Command {
     Capabilities {
         json: bool,
     },
-    Doctor {
-        service: Option<String>,
-    },
+    Config(ConfigCommand),
     SkillPrint,
     Invoke {
         service: String,
         capability: String,
         args: Vec<String>,
     },
+}
+
+pub enum ConfigCommand {
+    Configure,
+    Path,
+    Doctor { service: Option<String> },
 }
 
 pub fn print_help() {
@@ -34,15 +38,13 @@ pub fn print_help() {
 impl Cli {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, ViaError> {
         let matches = command().try_get_matches_from(args)?;
-        let config_path = matches.get_one::<PathBuf>("config").cloned();
+        let config_path = matches.get_one::<PathBuf>("config_path").cloned();
 
         let command = match matches.subcommand() {
             Some(("capabilities", submatches)) => Command::Capabilities {
                 json: submatches.get_flag("json"),
             },
-            Some(("doctor", submatches)) => Command::Doctor {
-                service: submatches.get_one::<String>("service").cloned(),
-            },
+            Some(("config", submatches)) => Command::Config(parse_config_command(submatches)?),
             Some(("skill", submatches)) => match submatches.subcommand() {
                 Some(("print", _)) => Command::SkillPrint,
                 _ => {
@@ -77,14 +79,27 @@ impl Cli {
     }
 }
 
+fn parse_config_command(matches: &clap::ArgMatches) -> Result<ConfigCommand, ViaError> {
+    match matches.subcommand() {
+        Some(("path", _)) => Ok(ConfigCommand::Path),
+        Some(("doctor", submatches)) => Ok(ConfigCommand::Doctor {
+            service: submatches.get_one::<String>("service").cloned(),
+        }),
+        None => Ok(ConfigCommand::Configure),
+        _ => Err(ViaError::InvalidCli(
+            "expected `via config`, `via config path`, or `via config doctor`".to_owned(),
+        )),
+    }
+}
+
 fn command() -> ClapCommand {
     ClapCommand::new("via")
-        .about("Securely run configured capabilities with credentials from 1Password")
+        .about("Run commands and API requests with 1Password-backed credentials without exposing secrets to your shell")
         .disable_help_subcommand(true)
         .allow_external_subcommands(true)
         .external_subcommand_value_parser(clap::value_parser!(String))
         .arg(
-            Arg::new("config")
+            Arg::new("config_path")
                 .long("config")
                 .short('c')
                 .value_name("PATH")
@@ -103,9 +118,14 @@ fn command() -> ClapCommand {
                 ),
         )
         .subcommand(
-            ClapCommand::new("doctor")
-                .about("Check configuration, providers, and delegated tools")
-                .arg(Arg::new("service").help("Only check one service")),
+            ClapCommand::new("config")
+                .about("Create, locate, and check via configuration")
+                .subcommand(ClapCommand::new("path").about("Print the resolved config path"))
+                .subcommand(
+                    ClapCommand::new("doctor")
+                        .about("Check configuration, providers, secrets, and delegated tools")
+                        .arg(Arg::new("service").help("Only check one service")),
+                ),
         )
         .subcommand(
             ClapCommand::new("skill")
@@ -171,13 +191,30 @@ mod tests {
 
     #[test]
     fn parses_doctor_service() {
-        let cli = parse(&["via", "doctor", "github"]);
+        let cli = parse(&["via", "config", "doctor", "github"]);
 
         assert!(matches!(
             cli.command,
-            Command::Doctor {
+            Command::Config(ConfigCommand::Doctor {
                 service: Some(service)
-            } if service == "github"
+            }) if service == "github"
+        ));
+    }
+
+    #[test]
+    fn parses_config_path() {
+        let cli = parse(&["via", "config", "path"]);
+
+        assert!(matches!(cli.command, Command::Config(ConfigCommand::Path)));
+    }
+
+    #[test]
+    fn parses_config_configure() {
+        let cli = parse(&["via", "config"]);
+
+        assert!(matches!(
+            cli.command,
+            Command::Config(ConfigCommand::Configure)
         ));
     }
 

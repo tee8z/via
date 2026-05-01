@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["tee8z <tee8z@protonmail.com>"]
 license = "MIT"
 repository = "https://github.com/tee8z/via"
-description = "secure CLI for running commands and API requests using credentials from your secret provider"
+description = "Run commands and API requests with 1Password-backed credentials without exposing secrets to your shell"
 keywords = ["cli", "credentials"]
 categories = ["command-line-utilities"]
 
@@ -18,8 +18,10 @@ name = "via"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22.1"
 clap = { version = "4.6.1", default-features = false, features = ["error-context", "help", "std", "usage"] }
 reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "rustls-no-provider"] }
+ring = { version = "0.17.14", default-features = false, features = ["std"] }
 rustls = { version = "0.23.4", default-features = false, features = ["ring", "std", "tls12"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }

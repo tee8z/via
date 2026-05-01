@@ -1,6 +1,8 @@
 use std::io::{self, Read};
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
+};
 use reqwest::Method;
 
 use crate::config::{AuthConfig, RestCommandConfig, ServiceConfig};
@@ -21,7 +23,14 @@ pub fn execute(
     let url = build_url(&config.base_url, &request.path, &request.query)?;
     let mut builder = client.request(request.method, url);
 
-    let headers = build_headers(config, service_name, service, provider, &mut redactor)?;
+    let headers = build_headers(
+        Some(&client),
+        config,
+        service_name,
+        service,
+        provider,
+        &mut redactor,
+    )?;
     builder = builder.headers(headers);
 
     if let Some(body) = request.body {
@@ -122,6 +131,7 @@ fn parse_method(method: &str) -> Result<Method, ViaError> {
 }
 
 fn build_headers(
+    client: Option<&reqwest::blocking::Client>,
     config: &RestCommandConfig,
     service_name: &str,
     service: &ServiceConfig,
@@ -129,6 +139,7 @@ fn build_headers(
     redactor: &mut Redactor,
 ) -> Result<HeaderMap, ViaError> {
     let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("via-cli"));
     for (name, value) in &config.headers {
         headers.insert(
             HeaderName::from_bytes(name.as_bytes())
@@ -138,25 +149,121 @@ fn build_headers(
         );
     }
 
-    if let Some(AuthConfig::Bearer { secret }) = &config.auth {
-        let reference = service
-            .secrets
-            .get(secret)
-            .ok_or_else(|| ViaError::UnknownSecret {
-                service: service_name.to_owned(),
-                secret: secret.clone(),
+    match &config.auth {
+        Some(AuthConfig::Bearer { secret }) => {
+            let secret = resolve_service_secret(service_name, service, provider, secret)?;
+            redactor.add(secret.expose());
+            insert_bearer_header(&mut headers, secret.expose(), "invalid bearer token")?;
+        }
+        Some(AuthConfig::Headers {
+            headers: secret_headers,
+        }) => {
+            for (name, secret_header) in secret_headers {
+                let secret =
+                    resolve_service_secret(service_name, service, provider, &secret_header.secret)?;
+                redactor.add(secret.expose());
+                let value = format!(
+                    "{}{}{}",
+                    secret_header.prefix,
+                    secret.expose(),
+                    secret_header.suffix
+                );
+                headers.insert(
+                    HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                        ViaError::InvalidConfig(format!("invalid header name `{name}`"))
+                    })?,
+                    HeaderValue::from_str(&value).map_err(|_| {
+                        ViaError::InvalidConfig(format!("invalid secret header value `{name}`"))
+                    })?,
+                );
+            }
+        }
+        Some(auth @ AuthConfig::GitHubApp { .. }) => {
+            let (credential, private_key) =
+                resolve_github_app_secrets(service_name, service, provider, auth)?;
+            let client = client.ok_or_else(|| {
+                ViaError::InvalidConfig("github_app auth requires an HTTP client".to_owned())
             })?;
-        let secret = provider.resolve(reference)?;
-        redactor.add(secret.expose());
-        let value = format!("Bearer {}", secret.expose());
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&value)
-                .map_err(|_| ViaError::InvalidConfig("invalid bearer token".to_owned()))?,
-        );
+            let token = crate::auth::github_app::installation_access_token(
+                client,
+                &config.base_url,
+                &credential,
+                private_key.as_ref(),
+                redactor,
+            )?;
+            insert_bearer_header(
+                &mut headers,
+                &token,
+                "invalid GitHub App installation token",
+            )?;
+        }
+        None => {}
     }
 
     Ok(headers)
+}
+
+fn resolve_github_app_secrets(
+    service_name: &str,
+    service: &ServiceConfig,
+    provider: &dyn SecretProvider,
+    auth: &AuthConfig,
+) -> Result<
+    (
+        crate::secrets::SecretValue,
+        Option<crate::secrets::SecretValue>,
+    ),
+    ViaError,
+> {
+    let AuthConfig::GitHubApp {
+        secret,
+        credential,
+        private_key,
+    } = auth
+    else {
+        unreachable!("caller only passes github_app auth");
+    };
+
+    match (secret, credential, private_key) {
+        (Some(secret), None, None) => {
+            let credential = resolve_service_secret(service_name, service, provider, secret)?;
+            Ok((credential, None))
+        }
+        (None, Some(credential), Some(private_key)) => {
+            let credential = resolve_service_secret(service_name, service, provider, credential)?;
+            let private_key = resolve_service_secret(service_name, service, provider, private_key)?;
+            Ok((credential, Some(private_key)))
+        }
+        _ => Err(ViaError::InvalidConfig(
+            "github_app auth must set either `secret` or both `credential` and `private_key`"
+                .to_owned(),
+        )),
+    }
+}
+
+fn resolve_service_secret(
+    service_name: &str,
+    service: &ServiceConfig,
+    provider: &dyn SecretProvider,
+    secret: &str,
+) -> Result<crate::secrets::SecretValue, ViaError> {
+    let reference = service
+        .secrets
+        .get(secret)
+        .ok_or_else(|| ViaError::UnknownSecret {
+            service: service_name.to_owned(),
+            secret: secret.to_owned(),
+        })?;
+    provider.resolve(reference)
+}
+
+fn insert_bearer_header(headers: &mut HeaderMap, token: &str, error: &str) -> Result<(), ViaError> {
+    let value = format!("Bearer {token}");
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&value).map_err(|_| ViaError::InvalidConfig(error.to_owned()))?,
+    );
+    Ok(())
 }
 
 fn build_url(base_url: &str, path: &str, query: &[(String, String)]) -> Result<String, ViaError> {
@@ -336,6 +443,7 @@ Accept = "application/vnd.github+json"
         };
         let mut redactor = Redactor::new();
         let headers = build_headers(
+            None,
             &rest_config(),
             "github",
             &service,
@@ -346,5 +454,61 @@ Accept = "application/vnd.github+json"
 
         assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer secret-token");
         assert_eq!(redactor.redact("secret-token"), "[REDACTED]");
+    }
+
+    #[test]
+    fn builds_multiple_secret_headers_and_registers_redaction() {
+        struct FakeProvider;
+
+        impl SecretProvider for FakeProvider {
+            fn resolve(&self, reference: &str) -> Result<SecretValue, ViaError> {
+                match reference {
+                    "op://Private/API/key" => Ok(SecretValue::new("api-key".to_owned())),
+                    "op://Private/API/tenant" => Ok(SecretValue::new("tenant-id".to_owned())),
+                    other => panic!("unexpected secret reference {other}"),
+                }
+            }
+        }
+
+        use std::collections::BTreeMap;
+
+        use crate::config::CommandConfig;
+        use crate::secrets::SecretValue;
+
+        let config: RestCommandConfig = toml::from_str(
+            r#"
+base_url = "https://api.example.com"
+
+[auth]
+type = "headers"
+
+[auth.headers.Authorization]
+secret = "api_key"
+prefix = "Token "
+
+[auth.headers.X-Tenant]
+secret = "tenant"
+"#,
+        )
+        .unwrap();
+        let service = ServiceConfig {
+            description: None,
+            provider: "onepassword".to_owned(),
+            secrets: BTreeMap::from([
+                ("api_key".to_owned(), "op://Private/API/key".to_owned()),
+                ("tenant".to_owned(), "op://Private/API/tenant".to_owned()),
+            ]),
+            commands: BTreeMap::<String, CommandConfig>::new(),
+        };
+        let mut redactor = Redactor::new();
+        let headers =
+            build_headers(None, &config, "api", &service, &FakeProvider, &mut redactor).unwrap();
+
+        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Token api-key");
+        assert_eq!(headers.get("X-Tenant").unwrap(), "tenant-id");
+        assert_eq!(
+            redactor.redact("api-key tenant-id"),
+            "[REDACTED] [REDACTED]"
+        );
     }
 }

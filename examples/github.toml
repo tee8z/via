@@ -4,31 +4,24 @@ version = 1
 type = "1password"
 
 [services.github]
-description = "GitHub API and CLI access"
+description = "GitHub REST API access through a GitHub App installation"
 provider = "onepassword"
 
 [services.github.secrets]
-token = "op://Private/GitHub/token"
+app = "op://Private/Example GitHub App/metadata"
+private_key = "op://Private/Example GitHub App/github-app.private-key.pem"
 
 [services.github.commands.api]
-description = "Call the GitHub REST API. Prefer this for agents."
+description = "Call the GitHub REST API with a GitHub App installation token."
 mode = "rest"
 base_url = "https://api.github.com"
 method_default = "GET"
 
 [services.github.commands.api.auth]
-type = "bearer"
-secret = "token"
+type = "github_app"
+credential = "app"
+private_key = "private_key"
 
 [services.github.commands.api.headers]
 Accept = "application/vnd.github+json"
 X-GitHub-Api-Version = "2022-11-28"
-
-[services.github.commands.gh]
-description = "Run the GitHub CLI with GH_TOKEN injected."
-mode = "delegated"
-program = "gh"
-check = ["--version"]
-
-[services.github.commands.gh.inject.env.GH_TOKEN]
-secret = "token"

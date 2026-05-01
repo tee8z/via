@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
 use std::process::Command;
 
-use crate::config::{CommandConfig, Config};
+use crate::config::{
+    AuthConfig, CommandConfig, Config, ProviderConfig, RestCommandConfig, ServiceConfig,
+};
 use crate::error::ViaError;
+use crate::providers::ProviderRegistry;
 
 pub fn run(config: &Config, only_service: Option<&str>) -> Result<(), ViaError> {
     if let Some(service_name) = only_service {
@@ -10,70 +14,431 @@ pub fn run(config: &Config, only_service: Option<&str>) -> Result<(), ViaError> 
         }
     }
 
-    check_op()?;
+    let mut status = DoctorStatus::default();
+    let provider_ready = check_providers(config, &mut status);
+    let providers = ProviderRegistry::from_config(config)?;
 
     for (service_name, service) in &config.services {
         if only_service.is_some_and(|only| only != service_name) {
             continue;
         }
 
-        println!("service {service_name}: ok");
-        for (command_name, command) in &service.commands {
-            match command {
-                CommandConfig::Rest(_) => {
-                    println!("  {command_name}: rest");
-                }
-                CommandConfig::Delegated(delegated) => {
-                    check_program(&delegated.program, &delegated.check)?;
-                    println!("  {command_name}: delegated {}", delegated.program);
+        println!("service {service_name}: checking");
+        let service_provider_ready = provider_ready
+            .get(&service.provider)
+            .copied()
+            .unwrap_or(false);
+
+        if service.secrets.is_empty() {
+            println!("  secrets: none configured");
+        } else if service_provider_ready {
+            let provider = providers.get(&service.provider)?;
+            for (secret_name, reference) in &service.secrets {
+                match provider.resolve(reference) {
+                    Ok(_) => println!("  secret {secret_name}: readable by via"),
+                    Err(error) => {
+                        status.fail();
+                        print_secret_failure(service_name, secret_name, &error);
+                    }
                 }
             }
+        } else {
+            status.fail();
+            println!(
+                "  secrets: skipped because provider `{}` is not ready",
+                service.provider
+            );
+            print_agent_guidance(
+                "Ask the user to complete secret provider setup, then rerun `via config doctor`.",
+            );
+        }
+
+        for (command_name, command) in &service.commands {
+            match command {
+                CommandConfig::Rest(rest) => {
+                    println!("  capability {command_name}: rest");
+                    if service_provider_ready {
+                        check_rest_auth(
+                            service_name,
+                            command_name,
+                            service,
+                            rest,
+                            &providers,
+                            &mut status,
+                        )?;
+                    }
+                }
+                CommandConfig::Delegated(delegated) => {
+                    match check_program(&delegated.program, &delegated.check) {
+                        Ok(()) => {
+                            println!(
+                                "  capability {command_name}: delegated {}",
+                                delegated.program
+                            )
+                        }
+                        Err(error) => {
+                            status.fail();
+                            print_delegated_failure(command_name, &delegated.program, &error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if status.failed {
+        Err(ViaError::DoctorFailed)
+    } else {
+        Ok(())
+    }
+}
+
+fn check_rest_auth(
+    service_name: &str,
+    command_name: &str,
+    service: &ServiceConfig,
+    rest: &RestCommandConfig,
+    providers: &ProviderRegistry,
+    status: &mut DoctorStatus,
+) -> Result<(), ViaError> {
+    let Some(auth @ AuthConfig::GitHubApp { .. }) = &rest.auth else {
+        return Ok(());
+    };
+
+    let provider = providers.get(&service.provider)?;
+
+    match resolve_github_app_doctor_secrets(service_name, service, provider, auth).and_then(
+        |(credential, private_key)| {
+            crate::auth::github_app::validate_credential_bundle(
+                credential.expose(),
+                private_key.as_deref(),
+            )
+        },
+    ) {
+        Ok(()) => println!("  auth {command_name}: GitHub App credential bundle valid"),
+        Err(error) => {
+            status.fail();
+            println!("  auth {command_name}: GitHub App credential bundle invalid");
+            println!("  reason: {error}");
+            print_human_setup(&[
+                "Edit the configured 1Password metadata field for this GitHub App credential bundle.",
+                "The metadata field must contain valid JSON with `type`, numeric `app_id`, and `installation_id`.",
+                "The private key should be a separate 1Password file attachment referenced by the `private_key` auth setting.",
+                "If using the legacy single-field bundle, replace raw PEM line breaks with escaped `\\n` newlines inside `private_key`.",
+                "Do not paste the real private key into an online validator.",
+                &format!(
+                    "Rerun `via config doctor {service_name}` after updating the 1Password field."
+                ),
+            ]);
+            print_agent_guidance(
+                "Ask the user to fix the GitHub App credential bundle in 1Password; do not ask for the private key value.",
+            );
         }
     }
 
     Ok(())
 }
 
-fn check_op() -> Result<(), ViaError> {
-    let output = Command::new("op").arg("--version").output();
-    match output {
-        Ok(output) if output.status.success() => {
-            println!("1Password CLI op: ok");
-            Ok(())
+fn resolve_github_app_doctor_secrets(
+    service_name: &str,
+    service: &ServiceConfig,
+    provider: &dyn crate::providers::SecretProvider,
+    auth: &AuthConfig,
+) -> Result<(crate::secrets::SecretValue, Option<String>), ViaError> {
+    let AuthConfig::GitHubApp {
+        secret,
+        credential,
+        private_key,
+    } = auth
+    else {
+        unreachable!("caller only passes github_app auth");
+    };
+
+    match (secret, credential, private_key) {
+        (Some(secret), None, None) => {
+            let credential = resolve_doctor_secret(service_name, service, provider, secret)?;
+            Ok((credential, None))
         }
+        (None, Some(credential), Some(private_key)) => {
+            let credential = resolve_doctor_secret(service_name, service, provider, credential)?;
+            let private_key = resolve_doctor_secret(service_name, service, provider, private_key)?;
+            Ok((credential, Some(private_key.expose().to_owned())))
+        }
+        _ => Err(ViaError::InvalidConfig(
+            "github_app auth must set either `secret` or both `credential` and `private_key`"
+                .to_owned(),
+        )),
+    }
+}
+
+fn resolve_doctor_secret(
+    service_name: &str,
+    service: &ServiceConfig,
+    provider: &dyn crate::providers::SecretProvider,
+    secret: &str,
+) -> Result<crate::secrets::SecretValue, ViaError> {
+    let reference = service
+        .secrets
+        .get(secret)
+        .ok_or_else(|| ViaError::UnknownSecret {
+            service: service_name.to_owned(),
+            secret: secret.to_owned(),
+        })?;
+    provider.resolve(reference)
+}
+
+#[derive(Default)]
+struct DoctorStatus {
+    failed: bool,
+}
+
+impl DoctorStatus {
+    fn fail(&mut self) {
+        self.failed = true;
+    }
+}
+
+fn check_program(program: &str, check: &[String]) -> Result<(), ViaError> {
+    let args = if check.is_empty() {
+        vec!["--version".to_owned()]
+    } else {
+        check.to_owned()
+    };
+
+    run_command(program, &args).map(|_| ())
+}
+
+fn check_providers(config: &Config, status: &mut DoctorStatus) -> BTreeMap<String, bool> {
+    let mut ready = BTreeMap::new();
+
+    for (provider_name, provider) in &config.providers {
+        let provider_ready = match provider {
+            ProviderConfig::OnePassword { account } => {
+                check_onepassword_provider(provider_name, account.as_deref(), status)
+            }
+        };
+        ready.insert(provider_name.clone(), provider_ready);
+    }
+
+    ready
+}
+
+fn check_onepassword_provider(
+    provider_name: &str,
+    account: Option<&str>,
+    status: &mut DoctorStatus,
+) -> bool {
+    println!("provider {provider_name} (1Password): checking");
+
+    match run_command("op", &["--version".to_owned()]) {
+        Ok(output) => {
+            let version = output.stdout.trim();
+            if version.is_empty() {
+                println!("  1Password CLI: installed");
+            } else {
+                println!("  1Password CLI: installed ({version})");
+            }
+        }
+        Err(error) => {
+            status.fail();
+            println!("  1Password CLI: not ready");
+            print_error_hint(&error);
+            print_human_setup(&[
+                "Install the 1Password CLI.",
+                "macOS/Homebrew: `brew install --cask 1password-cli`.",
+                "Windows/winget: `winget install -e --id AgileBits.1Password.CLI`.",
+                "Linux: follow the official APT/YUM/Alpine/Nix/manual steps at https://developer.1password.com/docs/cli/get-started/.",
+                "Verify the CLI is available with `op --version`.",
+                "Install the 1Password desktop app if it is not already installed.",
+                "Open and unlock the 1Password desktop app.",
+                "Enable the 1Password CLI integration in the desktop app: Settings > Developer > Integrate with 1Password CLI.",
+                "Rerun `via config doctor` after setup.",
+            ]);
+            print_agent_guidance(
+                "Ask the user to install and authenticate the secret provider, then rerun `via config doctor`.",
+            );
+            return false;
+        }
+    }
+
+    if let Some(account) = account {
+        let args = vec!["account".to_owned(), "get".to_owned(), account.to_owned()];
+        match run_command("op", &args) {
+            Ok(_) => println!("  account {account}: configured"),
+            Err(error) => {
+                status.fail();
+                println!("  account {account}: not ready");
+                print_error_hint(&error);
+                print_human_setup(&[
+                    "Add this 1Password account to the desktop app or CLI.",
+                    "Confirm the provider account in `via.toml` matches a configured account ID or sign-in address.",
+                    "Rerun `via config doctor` after the account is available.",
+                ]);
+                print_agent_guidance(
+                    "Ask the user to fix the configured 1Password account, then rerun `via config doctor`.",
+                );
+                return false;
+            }
+        }
+    }
+
+    let mut args = vec!["whoami".to_owned()];
+    if let Some(account) = account {
+        args.push("--account".to_owned());
+        args.push(account.to_owned());
+    }
+
+    match run_command("op", &args) {
+        Ok(_) => {
+            println!("  authentication: ready");
+            true
+        }
+        Err(error) => {
+            status.fail();
+            println!("  authentication: not ready");
+            print_error_hint(&error);
+            if is_onepassword_not_signed_in(&error) {
+                print_human_setup(&[
+                    "The 1Password CLI can see an account, but it is not signed in.",
+                    "Run `op signin` from your terminal and choose the account that contains the configured vault.",
+                    "Approve the sign-in from the 1Password desktop app if prompted.",
+                    "Run `op whoami` to confirm the CLI session is active.",
+                    "If multiple accounts are visible, set `[providers.onepassword] account = \"<account-id-or-sign-in-address>\"` in the via config.",
+                    "Rerun `via config doctor` after `op whoami` succeeds.",
+                ]);
+            } else if is_onepassword_account_missing(&error) {
+                print_human_setup(&[
+                    "The 1Password CLI is installed, but it cannot find a signed-in account.",
+                    "Open the 1Password desktop app and confirm the account containing the configured vault is added and unlocked.",
+                    "Enable the 1Password CLI integration in the desktop app: Settings > Developer > Integrate with 1Password CLI.",
+                    "Run `op account list` in your terminal to confirm the account is visible to the CLI.",
+                    "If multiple accounts are visible, set `[providers.onepassword] account = \"<account-id-or-sign-in-address>\"` in the via config.",
+                    "Rerun `via config doctor` after the account is visible.",
+                ]);
+            } else {
+                print_human_setup(&[
+                    "Install the 1Password desktop app if it is not already installed.",
+                    "macOS/Homebrew: `brew install --cask 1password`.",
+                    "Windows/winget: `winget install -e --id AgileBits.1Password`.",
+                    "Linux: follow the official desktop app install steps at https://support.1password.com/install-linux/.",
+                    "Add your 1Password account to the desktop app.",
+                    "Open and unlock the 1Password desktop app.",
+                    "Enable the 1Password CLI integration in the desktop app: Settings > Developer > Integrate with 1Password CLI.",
+                    "Sign in to 1Password CLI from your terminal if prompted.",
+                    "Rerun `via config doctor` after authentication succeeds.",
+                ]);
+            }
+            print_agent_guidance(
+                "Ask the user to authenticate the secret provider, then rerun `via config doctor`.",
+            );
+            false
+        }
+    }
+}
+
+struct CommandOutput {
+    stdout: String,
+}
+
+fn run_command(program: &str, args: &[String]) -> Result<CommandOutput, ViaError> {
+    let output = Command::new(program).args(args).output();
+    match output {
+        Ok(output) if output.status.success() => Ok(CommandOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        }),
         Ok(output) => Err(ViaError::ExternalCommandFailed {
-            program: "op".to_owned(),
+            program: program.to_owned(),
             status: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         }),
         Err(source) => Err(ViaError::MissingProgram {
-            program: "op".to_owned(),
+            program: program.to_owned(),
             source,
         }),
     }
 }
 
-fn check_program(program: &str, check: &[String]) -> Result<(), ViaError> {
-    let mut command = Command::new(program);
-    if check.is_empty() {
-        command.arg("--version");
-    } else {
-        command.args(check);
-    }
+fn print_secret_failure(service_name: &str, secret_name: &str, error: &ViaError) {
+    println!("  secret {secret_name}: not readable by via");
+    print_secret_error_hint(error);
+    print_human_setup(&[
+        &format!(
+            "Confirm the configured 1Password reference for `{service_name}.{secret_name}` exists."
+        ),
+        "Confirm your signed-in account has permission to read it.",
+        "Update `via.toml` with the correct secret reference if needed.",
+        &format!("Rerun `via config doctor {service_name}` after fixing the secret."),
+    ]);
+    print_agent_guidance(
+        "Do not ask for the token value. Ask the user to fix the configured secret reference or 1Password permissions.",
+    );
+}
 
-    let output = command.output();
-    match output {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => Err(ViaError::ExternalCommandFailed {
-            program: program.to_owned(),
-            status: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        }),
-        Err(source) => Err(ViaError::MissingProgram {
-            program: program.to_owned(),
-            source,
-        }),
+fn print_secret_error_hint(error: &ViaError) {
+    match error {
+        ViaError::MissingProgram { .. } => {
+            println!("  reason: secret provider command was not found on PATH");
+        }
+        ViaError::ExternalCommandFailed { status, .. } => {
+            println!("  reason: secret provider could not read the configured reference; status {status:?}");
+        }
+        _ => println!("  reason: secret provider could not read the configured reference"),
     }
+}
+
+fn print_delegated_failure(command_name: &str, program: &str, error: &ViaError) {
+    println!("  capability {command_name}: delegated {program} not ready");
+    print_error_hint(error);
+    print_human_setup(&[
+        &format!("Install `{program}` or make sure it is available on PATH."),
+        "Run `via config doctor` again after the delegated tool is available.",
+    ]);
+    print_agent_guidance(
+        "Ask the user to install or fix the delegated tool, then rerun `via config doctor`.",
+    );
+}
+
+fn print_error_hint(error: &ViaError) {
+    match error {
+        ViaError::MissingProgram { program, .. } => {
+            println!("  reason: `{program}` was not found on PATH");
+        }
+        ViaError::ExternalCommandFailed { status, stderr, .. } => {
+            println!("  reason: command exited with status {status:?}");
+            if !stderr.is_empty() {
+                println!("  detail: {stderr}");
+            }
+        }
+        _ => println!("  reason: {error}"),
+    }
+}
+
+fn is_onepassword_account_missing(error: &ViaError) -> bool {
+    matches!(
+        error,
+        ViaError::ExternalCommandFailed { stderr, .. }
+            if stderr.contains("no account found for filter")
+    )
+}
+
+fn is_onepassword_not_signed_in(error: &ViaError) -> bool {
+    matches!(
+        error,
+        ViaError::ExternalCommandFailed { stderr, .. }
+            if stderr.contains("account is not signed in")
+    )
+}
+
+fn print_human_setup(steps: &[&str]) {
+    println!("  Human setup:");
+    for step in steps {
+        println!("    - {step}");
+    }
+}
+
+fn print_agent_guidance(message: &str) {
+    println!("  Agent guidance:");
+    println!("    - {message}");
 }
 
 #[cfg(test)]
@@ -126,5 +491,34 @@ base_url = "https://api.github.com"
                 ..
             } if program == "sh"
         ));
+    }
+
+    #[test]
+    fn run_command_captures_stdout_without_newline() {
+        let output = run_command("sh", &["-c".to_owned(), "printf 'ready\\n'".to_owned()]).unwrap();
+
+        assert_eq!(output.stdout, "ready");
+    }
+
+    #[test]
+    fn detects_onepassword_missing_account_error() {
+        let error = ViaError::ExternalCommandFailed {
+            program: "op".to_owned(),
+            status: Some(1),
+            stderr: "[ERROR] no account found for filter".to_owned(),
+        };
+
+        assert!(is_onepassword_account_missing(&error));
+    }
+
+    #[test]
+    fn detects_onepassword_signed_out_error() {
+        let error = ViaError::ExternalCommandFailed {
+            program: "op".to_owned(),
+            status: Some(1),
+            stderr: "[ERROR] account is not signed in".to_owned(),
+        };
+
+        assert!(is_onepassword_not_signed_in(&error));
     }
 }
