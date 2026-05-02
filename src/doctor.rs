@@ -384,7 +384,7 @@ fn print_onepassword_cli_failure(error: &ViaError) {
         "Rerun `via config doctor` after setup.",
     ]);
     print_agent_guidance(
-        "Ask the user to install and authenticate the secret provider, then rerun `via config doctor`.",
+        "Ask the user to install the secret provider, run `via login`, then rerun `via config doctor`.",
     );
 }
 
@@ -444,9 +444,7 @@ fn print_onepassword_auth_failure(error: &ViaError) {
     println!("  authentication: not ready");
     print_error_hint(error);
     print_onepassword_auth_setup(error);
-    print_agent_guidance(
-        "Ask the user to authenticate the secret provider, then rerun `via config doctor`.",
-    );
+    print_agent_guidance("Ask the user to run `via login`, then rerun `via config doctor`.");
 }
 
 fn print_onepassword_auth_setup(error: &ViaError) {
@@ -462,11 +460,11 @@ fn print_onepassword_auth_setup(error: &ViaError) {
 fn print_onepassword_signed_out_setup() {
     print_human_setup(&[
         "The 1Password CLI can see an account, but it is not signed in.",
-        "Run `op signin` from your terminal and choose the account that contains the configured vault.",
+        "Run `via login` from your terminal and choose the account that contains the configured vault.",
         "Approve the sign-in from the 1Password desktop app if prompted.",
-        "Run `op whoami` to confirm the CLI session is active.",
+        "Run `via config doctor` to confirm the CLI session is active.",
         "If multiple accounts are visible, set `[providers.onepassword] account = \"<account-id-or-sign-in-address>\"` in the via config.",
-        "Rerun `via config doctor` after `op whoami` succeeds.",
+        "Rerun `via login` after pinning the account if needed.",
     ]);
 }
 
@@ -476,8 +474,9 @@ fn print_onepassword_missing_account_setup() {
         "Open the 1Password desktop app and confirm the account containing the configured vault is added and unlocked.",
         "Enable the 1Password CLI integration in the desktop app: Settings > Developer > Integrate with 1Password CLI.",
         "Run `op account list` in your terminal to confirm the account is visible to the CLI.",
+        "Run `via login` after the account is visible.",
         "If multiple accounts are visible, set `[providers.onepassword] account = \"<account-id-or-sign-in-address>\"` in the via config.",
-        "Rerun `via config doctor` after the account is visible.",
+        "Rerun `via config doctor` after authentication succeeds.",
     ]);
 }
 
@@ -490,7 +489,7 @@ fn print_onepassword_desktop_setup() {
         "Add your 1Password account to the desktop app.",
         "Open and unlock the 1Password desktop app.",
         "Enable the 1Password CLI integration in the desktop app: Settings > Developer > Integrate with 1Password CLI.",
-        "Sign in to 1Password CLI from your terminal if prompted.",
+        "Run `via login` from your terminal.",
         "Rerun `via config doctor` after authentication succeeds.",
     ]);
 }

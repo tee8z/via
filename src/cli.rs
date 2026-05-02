@@ -13,6 +13,9 @@ pub struct Cli {
 pub enum Command {
     Help,
     Version,
+    Login {
+        provider: Option<String>,
+    },
     Capabilities {
         json: bool,
     },
@@ -51,6 +54,9 @@ impl Cli {
 
         let command = match matches.subcommand() {
             Some(("version", _)) => Command::Version,
+            Some(("login", submatches)) => Command::Login {
+                provider: submatches.get_one::<String>("provider").cloned(),
+            },
             Some(("capabilities", submatches)) => Command::Capabilities {
                 json: submatches.get_flag("json"),
             },
@@ -133,6 +139,11 @@ fn command() -> ClapCommand {
         )
         .subcommand(
             ClapCommand::new("version").about("Print the via version"),
+        )
+        .subcommand(
+            ClapCommand::new("login")
+                .about("Authenticate configured secret providers")
+                .arg(Arg::new("provider").help("Only authenticate one provider")),
         )
         .subcommand(
             ClapCommand::new("capabilities")
@@ -229,6 +240,25 @@ mod tests {
         let cli = parse(&["via", "version"]);
 
         assert!(matches!(cli.command, Command::Version));
+    }
+
+    #[test]
+    fn parses_login() {
+        let cli = parse(&["via", "login"]);
+
+        assert!(matches!(cli.command, Command::Login { provider: None }));
+    }
+
+    #[test]
+    fn parses_login_provider() {
+        let cli = parse(&["via", "login", "onepassword"]);
+
+        assert!(matches!(
+            cli.command,
+            Command::Login {
+                provider: Some(provider)
+            } if provider == "onepassword"
+        ));
     }
 
     #[test]

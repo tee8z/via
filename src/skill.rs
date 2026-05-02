@@ -15,6 +15,8 @@ pub fn render(config: &Config) -> String {
     output.push_str("Rules:\n");
     output.push_str("- Never ask the user for tokens or passwords.\n");
     output.push_str("- Never call the underlying secret provider directly.\n");
+    output
+        .push_str("- If provider authentication is not ready, ask the user to run `via login`.\n");
     output.push_str("- Prefer REST capabilities because secrets stay inside `via`.\n");
     output.push_str("- Use delegated capabilities only when the configured binary is trusted and its native behavior is required.\n");
     output.push_str("- Do not print environment variables or credentials.\n");
@@ -85,6 +87,7 @@ program = "gh"
 
         assert!(output.contains("Never ask the user for tokens"));
         assert!(output.contains("Never call the underlying secret provider directly"));
+        assert!(output.contains("via login"));
         assert!(output.contains("via github api <path>"));
         assert!(output.contains("via github gh <tool-args...>"));
         assert!(!output.contains("op://Private"));
