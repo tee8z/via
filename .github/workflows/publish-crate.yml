@@ -1,9 +1,6 @@
 name: Publish Crate
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:

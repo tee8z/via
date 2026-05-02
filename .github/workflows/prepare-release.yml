@@ -1,6 +1,14 @@
 name: Prepare Release
 
 on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    types:
+      - closed
+    branches:
+      - master
   workflow_dispatch:
     inputs:
       version:
@@ -9,6 +17,7 @@ on:
         type: string
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -18,6 +27,7 @@ env:
 jobs:
   prepare:
     name: Open version-bump PR
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-24.04
 
     steps:
@@ -35,7 +45,7 @@ jobs:
         id: release
         shell: bash
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
         run: |
           case "$INPUT_VERSION" in
             v*) CRATE_VERSION="${INPUT_VERSION#v}" ;;
@@ -55,7 +65,7 @@ jobs:
           esac
 
           RELEASE_TAG="v$CRATE_VERSION"
-          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+          if [ "$GITHUB_EVENT_NAME" != "push" ] && git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
             echo "::error::tag $RELEASE_TAG already exists"
             exit 1
           fi
@@ -84,6 +94,14 @@ jobs:
           fi
 
           cargo test --locked
+
+      - name: Delete request tag
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          git push origin ":refs/tags/$RELEASE_TAG"
 
       - name: Open pull request
         shell: bash
@@ -118,7 +136,7 @@ jobs:
           cat > pr-body.md <<EOF
           Updates Cargo.toml and Cargo.lock to via-cli $CRATE_VERSION.
 
-          After this PR is merged, create and push tag $RELEASE_TAG from master to publish crates.io and build release artifacts.
+          After this PR is merged, the release workflow will create $RELEASE_TAG on the merge commit, publish crates.io, and build release artifacts.
           EOF
 
           gh pr create \
@@ -126,3 +144,88 @@ jobs:
             --head "$BRANCH" \
             --title "chore: prepare $RELEASE_TAG" \
             --body-file pr-body.md
+
+  finalize:
+    name: Tag and dispatch release
+    if: >-
+      ${{
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        startsWith(github.event.pull_request.head.ref, 'release/v')
+      }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Validate merged release
+        id: release
+        shell: bash
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          RELEASE_TAG="${HEAD_BRANCH#release/}"
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *)
+              echo "::error::release branch must be named release/v*"
+              exit 1
+              ;;
+          esac
+
+          CRATE_VERSION="${RELEASE_TAG#v}"
+          case "$CRATE_VERSION" in
+            ''|*[!0-9A-Za-z.+-]*)
+              echo "::error::release version may only contain ASCII letters, digits, '.', '+', or '-'"
+              exit 1
+              ;;
+            [0-9]*) ;;
+            *)
+              echo "::error::release version must start with a digit"
+              exit 1
+              ;;
+          esac
+
+          MANIFEST_VERSION="$(cargo pkgid --locked -p via-cli)"
+          MANIFEST_VERSION="${MANIFEST_VERSION##*@}"
+          if [ "$MANIFEST_VERSION" != "$CRATE_VERSION" ]; then
+            echo "::error::$HEAD_BRANCH requires via-cli $CRATE_VERSION, but Cargo.toml/Cargo.lock resolve to $MANIFEST_VERSION"
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "::error::tag $RELEASE_TAG already exists"
+            exit 1
+          fi
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$RELEASE_TAG" "$MERGE_SHA"
+          git push origin "refs/tags/$RELEASE_TAG"
+
+      - name: Dispatch release workflows
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          gh workflow run publish-crate.yml --ref master -f tag="$RELEASE_TAG"
+          gh workflow run build-binaries.yml --ref master -f release_tag="$RELEASE_TAG"
