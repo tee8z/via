@@ -70,6 +70,7 @@ If needed, pin via to a specific account:
 ```toml
 [providers.onepassword]
 type = "1password"
+cache = "daemon"
 account = "<account-id-or-sign-in-address>"
 ```
 
@@ -148,6 +149,7 @@ version = 1
 
 [providers.onepassword]
 type = "1password"
+cache = "daemon"
 
 [services.github]
 description = "GitHub REST API access through a GitHub App installation"
@@ -174,6 +176,10 @@ X-GitHub-Api-Version = "2022-11-28"
 ```
 
 REST capabilities accept paths, not arbitrary absolute URLs. The configured `base_url` is the trust boundary for that service.
+
+`cache = "daemon"` is the default on macOS and Linux. `via` auto-starts a per-user local daemon that owns `op read` calls and caches resolved 1Password secrets in memory for a short TTL. There is no separate service to install or manage for normal use. Use `via daemon status`, `via daemon clear`, and `via daemon stop` to inspect, clear, or stop it; the next command auto-starts it again. Set `cache = "off"` to always call `op read` directly. See [docs/daemon-architecture.md](docs/daemon-architecture.md) for the daemon flow, commands, and verification steps.
+
+On Windows, the cache currently defaults to `off` because the daemon needs a named-pipe backend that is not implemented yet. The config shape is already feature-ready: once Windows daemon support exists, `cache = "daemon"` can use the same provider setting.
 
 For GitHub App installation-token auth, store the app metadata and private key as separate 1Password secrets and use:
 

@@ -23,7 +23,18 @@ pub enum ProviderConfig {
     OnePassword {
         #[serde(default)]
         account: Option<String>,
+        #[serde(default)]
+        cache: OnePasswordCacheMode,
+        #[serde(default = "default_onepassword_cache_ttl_seconds")]
+        cache_ttl_seconds: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnePasswordCacheMode {
+    Off,
+    Daemon,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +310,20 @@ fn default_method() -> String {
     "GET".to_owned()
 }
 
+impl Default for OnePasswordCacheMode {
+    fn default() -> Self {
+        if cfg!(unix) {
+            Self::Daemon
+        } else {
+            Self::Off
+        }
+    }
+}
+
+fn default_onepassword_cache_ttl_seconds() -> u64 {
+    300
+}
+
 fn default_config_path() -> Result<PathBuf, ViaError> {
     if let Ok(path) = env::var("VIA_CONFIG") {
         return Ok(PathBuf::from(path));
@@ -403,6 +428,49 @@ private_key = "token""#,
         );
 
         assert!(Config::from_toml_str(&raw).is_ok());
+    }
+
+    #[test]
+    fn accepts_onepassword_daemon_cache() {
+        let raw = VALID.replace(
+            r#"[providers.onepassword]
+type = "1password""#,
+            r#"[providers.onepassword]
+type = "1password"
+cache = "daemon"
+cache_ttl_seconds = 600"#,
+        );
+        let config = Config::from_toml_str(&raw).unwrap();
+
+        match &config.providers["onepassword"] {
+            ProviderConfig::OnePassword {
+                cache,
+                cache_ttl_seconds,
+                ..
+            } => {
+                assert_eq!(*cache, OnePasswordCacheMode::Daemon);
+                assert_eq!(*cache_ttl_seconds, 600);
+            }
+        }
+    }
+
+    #[test]
+    fn defaults_onepassword_cache_for_platform() {
+        let config = Config::from_toml_str(VALID).unwrap();
+
+        match &config.providers["onepassword"] {
+            ProviderConfig::OnePassword {
+                cache,
+                cache_ttl_seconds,
+                ..
+            } => {
+                #[cfg(unix)]
+                assert_eq!(*cache, OnePasswordCacheMode::Daemon);
+                #[cfg(not(unix))]
+                assert_eq!(*cache, OnePasswordCacheMode::Off);
+                assert_eq!(*cache_ttl_seconds, 300);
+            }
+        }
     }
 
     #[test]
