@@ -139,6 +139,7 @@ https://<hostname>/api/v3
 Check local setup:
 
 ```sh
+via login
 via config doctor github
 via capabilities
 ```

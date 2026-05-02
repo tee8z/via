@@ -42,6 +42,7 @@ fn run_cli(cli: Cli) -> Result<ExitCode, ViaError> {
     match cli.command {
         Command::Help => run_help_command(),
         Command::Version => run_version_command(),
+        Command::Login { provider } => run_login_command(config_path, provider.as_deref()),
         Command::Capabilities { json } => run_capabilities_command(config_path, json),
         Command::Config(command) => run_config_command(config_path, command),
         Command::Daemon(command) => run_daemon_cli_command(command),
@@ -61,6 +62,14 @@ fn run_help_command() -> Result<ExitCode, ViaError> {
 
 fn run_version_command() -> Result<ExitCode, ViaError> {
     println!("via {}", env!("CARGO_PKG_VERSION"));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_login_command(
+    config_path: Option<&Path>,
+    provider: Option<&str>,
+) -> Result<ExitCode, ViaError> {
+    crate::login::run(config_path, provider)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -132,6 +141,18 @@ mod tests {
         let code = try_run([OsString::from("via"), OsString::from("version")]).unwrap();
 
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn login_command_without_config_returns_runtime_error() {
+        let code = run([
+            OsString::from("via"),
+            OsString::from("--config"),
+            OsString::from("/definitely/missing/via.toml"),
+            OsString::from("login"),
+        ]);
+
+        assert_eq!(code, ExitCode::from(1));
     }
 
     #[test]

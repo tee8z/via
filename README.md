@@ -55,7 +55,8 @@ cargo install via-cli
 
 ## Human Setup Requirements
 
-- 1Password CLI installed and signed in.
+- 1Password CLI installed.
+- Provider authentication handled through `via login`.
 - Secrets stored in 1Password and referenced by `op://...` URIs.
 
 Install 1Password CLI:
@@ -90,14 +91,16 @@ op --version
 
 Open and unlock the 1Password desktop app, add your account if needed, then enable the CLI integration in Settings > Developer > Integrate with 1Password CLI.
 
-Sign in to the CLI session:
+Sign in through via:
 
 ```sh
-op signin
-op whoami
+via login
+via config doctor
 ```
 
-If `op signin` lists multiple accounts, choose the account that contains the configured vault. To see which accounts the CLI can access:
+`via login` runs the configured provider's official login flow with an interactive terminal. For 1Password, it delegates to `op signin` and passes the configured account when `[providers.onepassword] account = "..."` is set.
+
+If 1Password lists multiple accounts, choose the account that contains the configured vault. To see which accounts the CLI can access:
 
 ```sh
 op account list
@@ -170,6 +173,7 @@ Discover what is configured:
 
 ```sh
 via config path
+via login
 via config doctor
 via capabilities
 via capabilities --json

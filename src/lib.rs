@@ -8,6 +8,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod error;
 pub mod executor;
+pub mod login;
 pub mod providers;
 pub mod redaction;
 pub mod secrets;
