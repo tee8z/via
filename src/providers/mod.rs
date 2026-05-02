@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{Config, ProviderConfig};
 use crate::error::ViaError;
@@ -19,10 +19,19 @@ impl ProviderRegistry {
         let mut providers: BTreeMap<String, Box<dyn SecretProvider>> = BTreeMap::new();
         for (name, provider) in &config.providers {
             match provider {
-                ProviderConfig::OnePassword { account } => {
+                ProviderConfig::OnePassword {
+                    account,
+                    cache,
+                    cache_ttl_seconds,
+                } => {
                     providers.insert(
                         name.clone(),
-                        Box::new(onepassword::OnePasswordCliProvider::new(account.clone())),
+                        Box::new(onepassword::OnePasswordCliProvider::new(
+                            account.clone(),
+                            *cache,
+                            *cache_ttl_seconds,
+                            provider_secret_references(config, name),
+                        )),
                     );
                 }
             }
@@ -37,6 +46,17 @@ impl ProviderRegistry {
             .map(|provider| provider.as_ref())
             .ok_or_else(|| ViaError::InvalidConfig(format!("unknown provider `{name}`")))
     }
+}
+
+fn provider_secret_references(config: &Config, provider_name: &str) -> Vec<String> {
+    config
+        .services
+        .values()
+        .filter(|service| service.provider == provider_name)
+        .flat_map(|service| service.secrets.values().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]

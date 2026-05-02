@@ -112,35 +112,11 @@ fn prompt_service_setup() -> Result<ServiceSetup, ViaError> {
     let service_name = prompt_required("Service name", None)?;
     let secret_name = prompt_required("Secret name in via config", Some("token"))?;
     let secret_reference = prompt_secret_reference()?;
-
-    let mode = prompt_choice(
-        "How should via run this service?",
-        &["REST API", "Trusted CLI", "Both"],
-        1,
-    )?;
-
-    let rest = if mode == 1 || mode == 3 {
-        Some(prompt_rest_setup()?)
-    } else {
-        None
-    };
-    let (private_key_secret_name, private_key_secret_reference) = if rest
-        .as_ref()
-        .is_some_and(|rest| matches!(rest.auth, RestAuthSetup::GitHubApp))
-    {
-        println!();
-        println!("GitHub App private key");
-        let name = prompt_required("Private key secret name in via config", Some("private_key"))?;
-        let reference = prompt_secret_reference()?;
-        (Some(name), Some(reference))
-    } else {
-        (None, None)
-    };
-    let delegated = if mode == 2 || mode == 3 {
-        Some(prompt_delegated_setup()?)
-    } else {
-        None
-    };
+    let mode = prompt_service_mode()?;
+    let rest = prompt_optional_rest_setup(mode)?;
+    let (private_key_secret_name, private_key_secret_reference) =
+        prompt_optional_private_key(rest.as_ref())?;
+    let delegated = prompt_optional_delegated_setup(mode)?;
 
     Ok(ServiceSetup {
         service_name,
@@ -151,6 +127,60 @@ fn prompt_service_setup() -> Result<ServiceSetup, ViaError> {
         rest,
         delegated,
     })
+}
+
+fn prompt_service_mode() -> Result<usize, ViaError> {
+    prompt_choice(
+        "How should via run this service?",
+        &["REST API", "Trusted CLI", "Both"],
+        1,
+    )
+}
+
+fn prompt_optional_rest_setup(mode: usize) -> Result<Option<RestSetup>, ViaError> {
+    if mode_uses_rest(mode) {
+        Ok(Some(prompt_rest_setup()?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn prompt_optional_private_key(
+    rest: Option<&RestSetup>,
+) -> Result<(Option<String>, Option<String>), ViaError> {
+    if rest.is_some_and(rest_uses_github_app) {
+        prompt_private_key_secret()
+    } else {
+        Ok((None, None))
+    }
+}
+
+fn prompt_optional_delegated_setup(mode: usize) -> Result<Option<DelegatedSetup>, ViaError> {
+    if mode_uses_delegated(mode) {
+        Ok(Some(prompt_delegated_setup()?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn mode_uses_rest(mode: usize) -> bool {
+    mode == 1 || mode == 3
+}
+
+fn mode_uses_delegated(mode: usize) -> bool {
+    mode == 2 || mode == 3
+}
+
+fn rest_uses_github_app(rest: &RestSetup) -> bool {
+    matches!(rest.auth, RestAuthSetup::GitHubApp)
+}
+
+fn prompt_private_key_secret() -> Result<(Option<String>, Option<String>), ViaError> {
+    println!();
+    println!("GitHub App private key");
+    let name = prompt_required("Private key secret name in via config", Some("private_key"))?;
+    let reference = prompt_secret_reference()?;
+    Ok((Some(name), Some(reference)))
 }
 
 fn prompt_secret_reference() -> Result<String, ViaError> {
@@ -260,7 +290,8 @@ fn build_service_config(setup: ServiceSetup) -> String {
     let mut output = String::new();
     output.push_str("version = 1\n\n");
     output.push_str("[providers.onepassword]\n");
-    output.push_str("type = \"1password\"\n\n");
+    output.push_str("type = \"1password\"\n");
+    output.push_str("cache = \"daemon\"\n\n");
     output.push_str(&format!("[services.{}]\n", toml_key(&setup.service_name)));
     output.push_str(&format!(
         "description = {}\n",
@@ -359,6 +390,7 @@ fn empty_config() -> &'static str {
 
 [providers.onepassword]
 type = "1password"
+cache = "daemon"
 
 "#
 }
@@ -428,6 +460,7 @@ mod tests {
         });
 
         assert!(config.contains("[services.\"gitlab\"]"));
+        assert!(config.contains("cache = \"daemon\""));
         assert!(config.contains("base_url = \"https://gitlab.example.com/api/v4\""));
         assert!(Config::from_toml_str(&config).is_ok());
     }
@@ -452,6 +485,7 @@ mod tests {
         });
 
         assert!(config.contains("type = \"github_app\""));
+        assert!(config.contains("cache = \"daemon\""));
         assert!(config.contains("credential = \"app\""));
         assert!(config.contains("private_key = \"private_key\""));
         assert!(Config::from_toml_str(&config).is_ok());

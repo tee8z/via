@@ -4,6 +4,7 @@ pub mod capabilities;
 pub mod cli;
 pub mod config;
 pub mod config_command;
+pub mod daemon;
 pub mod doctor;
 pub mod error;
 pub mod executor;
@@ -11,6 +12,7 @@ pub mod providers;
 pub mod redaction;
 pub mod secrets;
 pub mod skill;
+pub mod timing;
 pub mod tls;
 
 pub use app::run;

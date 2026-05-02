@@ -100,6 +100,7 @@ version = 1
 
 [providers.onepassword]
 type = "1password"
+cache = "daemon"
 
 [services.github]
 description = "GitHub API access"
@@ -124,6 +125,8 @@ private_key = "private_key"
 Accept = "application/vnd.github+json"
 X-GitHub-Api-Version = "2022-11-28"
 ```
+
+`cache = "daemon"` is the default on macOS and Linux and keeps resolved 1Password secrets in a local memory-only daemon for a short TTL. There is no separate service to install. Set `cache = "off"` if you want every invocation to call `op read` directly. On Windows, via defaults to `cache = "off"` until the daemon has a named-pipe backend. See [daemon-architecture.md](daemon-architecture.md) for the daemon flow, commands, and verification steps.
 
 For GitHub Enterprise Server, use that server's REST API base URL instead, usually:
 

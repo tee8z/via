@@ -16,6 +16,7 @@ pub enum Command {
         json: bool,
     },
     Config(ConfigCommand),
+    Daemon(DaemonCommand),
     SkillPrint,
     Invoke {
         service: String,
@@ -28,6 +29,13 @@ pub enum ConfigCommand {
     Configure,
     Path,
     Doctor { service: Option<String> },
+}
+
+pub enum DaemonCommand {
+    Status,
+    Clear,
+    Stop,
+    Serve,
 }
 
 pub fn print_help() {
@@ -45,6 +53,7 @@ impl Cli {
                 json: submatches.get_flag("json"),
             },
             Some(("config", submatches)) => Command::Config(parse_config_command(submatches)?),
+            Some(("daemon", submatches)) => Command::Daemon(parse_daemon_command(submatches)?),
             Some(("skill", submatches)) => match submatches.subcommand() {
                 Some(("print", _)) => Command::SkillPrint,
                 _ => {
@@ -92,6 +101,18 @@ fn parse_config_command(matches: &clap::ArgMatches) -> Result<ConfigCommand, Via
     }
 }
 
+fn parse_daemon_command(matches: &clap::ArgMatches) -> Result<DaemonCommand, ViaError> {
+    match matches.subcommand() {
+        Some(("status", _)) => Ok(DaemonCommand::Status),
+        Some(("clear", _)) => Ok(DaemonCommand::Clear),
+        Some(("stop", _)) => Ok(DaemonCommand::Stop),
+        Some(("serve", _)) => Ok(DaemonCommand::Serve),
+        _ => Err(ViaError::InvalidCli(
+            "expected `via daemon status`, `via daemon clear`, or `via daemon stop`".to_owned(),
+        )),
+    }
+}
+
 fn command() -> ClapCommand {
     ClapCommand::new("via")
         .about("Run commands and API requests with 1Password-backed credentials without exposing secrets to your shell")
@@ -126,6 +147,14 @@ fn command() -> ClapCommand {
                         .about("Check configuration, providers, secrets, and delegated tools")
                         .arg(Arg::new("service").help("Only check one service")),
                 ),
+        )
+        .subcommand(
+            ClapCommand::new("daemon")
+                .about("Manage the local via secret cache daemon")
+                .subcommand(ClapCommand::new("status").about("Show daemon status"))
+                .subcommand(ClapCommand::new("clear").about("Clear cached daemon secrets"))
+                .subcommand(ClapCommand::new("stop").about("Stop the daemon"))
+                .subcommand(ClapCommand::new("serve").hide(true)),
         )
         .subcommand(
             ClapCommand::new("skill")
@@ -223,6 +252,30 @@ mod tests {
         let cli = parse(&["via", "skill", "print"]);
 
         assert!(matches!(cli.command, Command::SkillPrint));
+    }
+
+    #[test]
+    fn parses_daemon_status() {
+        let cli = parse(&["via", "daemon", "status"]);
+
+        assert!(matches!(
+            cli.command,
+            Command::Daemon(DaemonCommand::Status)
+        ));
+    }
+
+    #[test]
+    fn parses_daemon_clear() {
+        let cli = parse(&["via", "daemon", "clear"]);
+
+        assert!(matches!(cli.command, Command::Daemon(DaemonCommand::Clear)));
+    }
+
+    #[test]
+    fn parses_daemon_stop() {
+        let cli = parse(&["via", "daemon", "stop"]);
+
+        assert!(matches!(cli.command, Command::Daemon(DaemonCommand::Stop)));
     }
 
     #[test]

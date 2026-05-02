@@ -1,5 +1,6 @@
 use std::io::{self, Read};
 
+use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
 };
@@ -19,32 +20,139 @@ pub fn execute(
 ) -> Result<(), ViaError> {
     let request = RestInvocation::parse(config, args)?;
     let mut redactor = Redactor::new();
-    let client = reqwest::blocking::Client::new();
-    let url = build_url(&config.base_url, &request.path, &request.query)?;
-    let mut builder = client.request(request.method, url);
-
-    let headers = build_headers(
-        Some(&client),
+    let client = Client::new();
+    let builder = build_authenticated_request(
+        &client,
         config,
         service_name,
         service,
         provider,
+        &request,
         &mut redactor,
     )?;
-    builder = builder.headers(headers);
+    let response = send_rest_request(builder, &request.method, &request.path)?;
+    let body = redactor.redact(&response.body);
 
-    if let Some(body) = request.body {
-        builder = builder.header(CONTENT_TYPE, "application/json").body(body);
+    ensure_success(response.status, &response.headers, &body)?;
+    println!("{body}");
+    Ok(())
+}
+
+struct RestResponse {
+    status: reqwest::StatusCode,
+    headers: HeaderMap,
+    body: String,
+}
+
+fn build_authenticated_request(
+    client: &Client,
+    config: &RestCommandConfig,
+    service_name: &str,
+    service: &ServiceConfig,
+    provider: &dyn SecretProvider,
+    request: &RestInvocation,
+    redactor: &mut Redactor,
+) -> Result<RequestBuilder, ViaError> {
+    let url = build_url(&config.base_url, &request.path, &request.query)?;
+    let builder = client.request(request.method.clone(), url);
+    let builder = with_auth_headers(
+        builder,
+        client,
+        config,
+        service_name,
+        service,
+        provider,
+        redactor,
+    )?;
+    Ok(with_body(builder, request.body.as_deref()))
+}
+
+fn with_auth_headers(
+    builder: RequestBuilder,
+    client: &Client,
+    config: &RestCommandConfig,
+    service_name: &str,
+    service: &ServiceConfig,
+    provider: &dyn SecretProvider,
+    redactor: &mut Redactor,
+) -> Result<RequestBuilder, ViaError> {
+    let auth_span = crate::timing::span("rest auth headers");
+    let headers = match build_headers(
+        Some(client),
+        config,
+        service_name,
+        service,
+        provider,
+        redactor,
+    ) {
+        Ok(headers) => {
+            auth_span.finish("ok");
+            headers
+        }
+        Err(error) => {
+            auth_span.finish("failed");
+            return Err(error);
+        }
+    };
+    Ok(builder.headers(headers))
+}
+
+fn with_body(builder: RequestBuilder, body: Option<&str>) -> RequestBuilder {
+    match body {
+        Some(body) => builder
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.to_owned()),
+        None => builder,
     }
+}
 
-    let response = builder.send()?;
+fn send_rest_request(
+    builder: RequestBuilder,
+    method: &Method,
+    path: &str,
+) -> Result<RestResponse, ViaError> {
+    let request_span = crate::timing::span(format!("rest request {method} {path}"));
+    let response = match builder.send() {
+        Ok(response) => {
+            let status = response.status();
+            request_span.finish(format!("status={status}"));
+            response
+        }
+        Err(error) => {
+            request_span.finish("failed");
+            return Err(error.into());
+        }
+    };
     let status = response.status();
     let headers = response.headers().clone();
-    let body = response.text()?;
-    let body = redactor.redact(&body);
+    let body = read_response_body(response)?;
 
-    println!("{body}");
+    Ok(RestResponse {
+        status,
+        headers,
+        body,
+    })
+}
 
+fn read_response_body(response: reqwest::blocking::Response) -> Result<String, ViaError> {
+    let body_span = crate::timing::span("rest response body");
+    match response.text() {
+        Ok(body) => {
+            body_span.finish(format!("bytes={}", body.len()));
+            Ok(body)
+        }
+        Err(error) => {
+            body_span.finish("failed");
+            Err(error.into())
+        }
+    }
+}
+
+fn ensure_success(
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+) -> Result<(), ViaError> {
     if status.is_success() {
         return Ok(());
     }
@@ -53,9 +161,39 @@ pub fn execute(
         .get("x-github-request-id")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("unknown");
-    Err(ViaError::InvalidArgument(format!(
-        "request failed with status {status}; request id {request_id}"
-    )))
+    let mut message = format!("request failed with status {status}; request id {request_id}");
+    if let Some(body) = error_body_summary(body) {
+        message.push_str("; response body: ");
+        message.push_str(&body);
+    }
+    Err(ViaError::InvalidArgument(message))
+}
+
+fn error_body_summary(body: &str) -> Option<String> {
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
+            return Some(truncate_error_body(message));
+        }
+    }
+
+    Some(truncate_error_body(body))
+}
+
+fn truncate_error_body(body: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let truncated = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 struct RestInvocation {
@@ -254,7 +392,17 @@ fn resolve_service_secret(
             service: service_name.to_owned(),
             secret: secret.to_owned(),
         })?;
-    provider.resolve(reference)
+    let span = crate::timing::span(format!("secret resolve {service_name}.{secret}"));
+    match provider.resolve(reference) {
+        Ok(value) => {
+            span.finish("ok");
+            Ok(value)
+        }
+        Err(error) => {
+            span.finish("failed");
+            Err(error)
+        }
+    }
 }
 
 fn insert_bearer_header(headers: &mut HeaderMap, token: &str, error: &str) -> Result<(), ViaError> {
@@ -412,6 +560,32 @@ Accept = "application/vnd.github+json"
             url,
             "https://api.github.com/search/issues?q=repo%3Aowner%2Fname%20bug%20fix"
         );
+    }
+
+    #[test]
+    fn success_status_accepts_response_body_without_error() {
+        let headers = HeaderMap::new();
+
+        assert!(ensure_success(reqwest::StatusCode::OK, &headers, "{\"ok\":true}").is_ok());
+    }
+
+    #[test]
+    fn failure_status_includes_request_id_and_error_message() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-request-id", HeaderValue::from_static("ABC123"));
+
+        let error = ensure_success(
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+            &headers,
+            r#"{"message":"Endpoint request timed out","secret":"[REDACTED]"}"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ViaError::InvalidArgument(message)
+                if message.contains("504 Gateway Timeout")
+                    && message.contains("ABC123")
+                    && message.contains("Endpoint request timed out")
+                    && !message.contains("secret")));
     }
 
     #[test]
