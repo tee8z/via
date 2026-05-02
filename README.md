@@ -17,10 +17,16 @@ The crates.io package is `via-cli`; the installed binary is `via`.
 
 ## Install via
 
-Download and install a prebuilt release binary from a checkout of this repo:
+Download and install the latest prebuilt release binary:
 
 ```sh
-VERSION=v0.1.1 ./scripts/install-release.sh
+curl -fsSL https://raw.githubusercontent.com/tee8z/via/master/scripts/install-release.sh | bash
+```
+
+To pin a specific release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tee8z/via/master/scripts/install-release.sh | VERSION=v0.2.0 bash
 ```
 
 The installer selects the macOS or Linux asset for your machine, installs `via`
@@ -30,7 +36,7 @@ verification metadata are checked against `SHA256SUMS`; signed checksum
 verification can be required with `VERIFY=required`. See
 [docs/release-signing.md](docs/release-signing.md).
 
-To install manually, open the [v0.1.1 release](https://github.com/tee8z/via/releases/tag/v0.1.1)
+To install manually, open the [latest release](https://github.com/tee8z/via/releases/latest)
 and download the asset for your platform:
 
 - Linux x86_64: `via-linux-x86_64.tar.gz`
