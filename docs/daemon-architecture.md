@@ -130,6 +130,16 @@ via daemon status
 After `stop`, `status` should report that the daemon is stopped. The next
 command that needs daemon caching starts it again.
 
+Validate the socket guard:
+
+```sh
+scripts/validate-daemon-socket-guard.sh
+```
+
+The script talks to the daemon as a raw non-`via` socket client and expects the
+daemon to reject the connection before handling any request. Set `VIA_BIN` or
+`VIA_DAEMON_SOCKET` if you are validating a non-default binary or socket.
+
 ## Security Notes
 
 The daemon reduces repeated `op read` latency and avoids writing resolved
@@ -138,16 +148,18 @@ the requesting `via` process over the local socket because `via` needs the value
 to build headers, generate GitHub App tokens, or inject delegated command
 environment variables.
 
-The socket permissions restrict access to the same local user. This is intended
-to protect against other users on the machine, not against malicious processes
-already running as the same user. The registration handshake protects normal
-operation by preventing arbitrary unregistered refs from being resolved through
-the hot path.
+The socket permissions restrict access to the same local user. On macOS and
+Linux, the daemon also checks the connecting process executable before reading a
+request and only serves clients that resolve to the same `via` executable path
+or inode. This blocks a same-user script from casually speaking the daemon JSON
+protocol directly. The registration handshake protects normal operation by
+preventing arbitrary unregistered refs from being resolved through the hot path.
 
 If you run agents that should not share secret access, run them under separate
 OS users, containers, or another sandbox with a separate `via` config and
-1Password session. A process running as the same OS user can usually talk to the
-daemon socket directly, read local files available to that user, or invoke
-`op read` directly if the 1Password CLI session allows it. For untrusted
-same-user work, set `cache = "off"` or stop the daemon with `via daemon stop`
-before handing over execution.
+1Password session. The daemon executable check is defense in depth, not a full
+same-user sandbox: a process running as the same OS user can still run `via`
+itself, read local files available to that user, or invoke `op read` directly if
+the 1Password CLI session allows it. For untrusted same-user work, set
+`cache = "off"` or stop the daemon with `via daemon stop` before handing over
+execution.

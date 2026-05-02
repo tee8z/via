@@ -12,6 +12,7 @@ pub struct Cli {
 
 pub enum Command {
     Help,
+    Version,
     Capabilities {
         json: bool,
     },
@@ -49,6 +50,7 @@ impl Cli {
         let config_path = matches.get_one::<PathBuf>("config_path").cloned();
 
         let command = match matches.subcommand() {
+            Some(("version", _)) => Command::Version,
             Some(("capabilities", submatches)) => Command::Capabilities {
                 json: submatches.get_flag("json"),
             },
@@ -116,6 +118,7 @@ fn parse_daemon_command(matches: &clap::ArgMatches) -> Result<DaemonCommand, Via
 fn command() -> ClapCommand {
     ClapCommand::new("via")
         .about("Run commands and API requests with 1Password-backed credentials without exposing secrets to your shell")
+        .version(env!("CARGO_PKG_VERSION"))
         .disable_help_subcommand(true)
         .allow_external_subcommands(true)
         .external_subcommand_value_parser(clap::value_parser!(String))
@@ -127,6 +130,9 @@ fn command() -> ClapCommand {
                 .value_parser(clap::value_parser!(PathBuf))
                 .global(true)
                 .help("Path to via.toml"),
+        )
+        .subcommand(
+            ClapCommand::new("version").about("Print the via version"),
         )
         .subcommand(
             ClapCommand::new("capabilities")
@@ -216,6 +222,13 @@ mod tests {
         let cli = parse(&["via", "capabilities", "--json"]);
 
         assert!(matches!(cli.command, Command::Capabilities { json: true }));
+    }
+
+    #[test]
+    fn parses_version() {
+        let cli = parse(&["via", "version"]);
+
+        assert!(matches!(cli.command, Command::Version));
     }
 
     #[test]

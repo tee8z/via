@@ -10,7 +10,13 @@ mod imp {
     use std::env;
     use std::fs;
     use std::io::{self, BufRead, BufReader, Write};
+    #[cfg(target_os = "macos")]
+    use std::os::unix::ffi::OsStringExt;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::unix::io::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -116,11 +122,12 @@ mod imp {
 
     fn run_server(listener: UnixListener, path: &Path) -> Result<(), ViaError> {
         let mut state = DaemonState::default();
+        let expected_client = daemon_executable_identity()?;
         let mut last_activity = Instant::now();
         loop {
             match next_server_event(&listener, &mut last_activity)? {
                 ServerEvent::Connection(stream) => {
-                    let action = handle_stream(stream, &mut state);
+                    let action = handle_stream(stream, &mut state, expected_client.as_ref());
                     if action == DaemonAction::Stop {
                         break;
                     }
@@ -271,10 +278,35 @@ mod imp {
         ))
     }
 
-    fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> DaemonAction {
+    fn handle_stream(
+        mut stream: UnixStream,
+        state: &mut DaemonState,
+        expected_client: Option<&ExecutableIdentity>,
+    ) -> DaemonAction {
+        let response = match verify_peer_executable(&stream, expected_client) {
+            Ok(()) => handle_verified_stream(&mut stream, state),
+            Err(error) => {
+                DaemonResponseInternal::error(format!("daemon client verification failed: {error}"))
+            }
+        };
+        let action = if response.stop {
+            DaemonAction::Stop
+        } else {
+            DaemonAction::Continue
+        };
+
+        write_daemon_response(&mut stream, response);
+
+        action
+    }
+
+    fn handle_verified_stream(
+        stream: &mut UnixStream,
+        state: &mut DaemonState,
+    ) -> DaemonResponseInternal {
         let mut line = String::new();
         let mut reader = BufReader::new(stream);
-        let response = match reader.read_line(&mut line) {
+        match reader.read_line(&mut line) {
             Ok(_) => {
                 let line = SecretValue::new(line);
                 match serde_json::from_str(line.expose()) {
@@ -287,21 +319,15 @@ mod imp {
             Err(error) => {
                 DaemonResponseInternal::error(format!("failed to read daemon request: {error}"))
             }
-        };
-        let action = if response.stop {
-            DaemonAction::Stop
-        } else {
-            DaemonAction::Continue
-        };
+        }
+    }
 
-        let mut stream = reader.into_inner();
+    fn write_daemon_response(stream: &mut UnixStream, response: DaemonResponseInternal) {
         if let Ok(raw) = serde_json::to_string(&response.into_public()) {
             let raw = SecretValue::new(raw);
             let _ = stream.write_all(raw.expose().as_bytes());
             let _ = stream.write_all(b"\n");
         }
-
-        action
     }
 
     #[derive(Clone, Deserialize, Serialize)]
@@ -634,6 +660,151 @@ mod imp {
                 | io::ErrorKind::ConnectionReset
                 | io::ErrorKind::BrokenPipe
         ))
+    }
+
+    #[derive(Clone)]
+    struct ExecutableIdentity {
+        path: PathBuf,
+        device: u64,
+        inode: u64,
+    }
+
+    impl ExecutableIdentity {
+        fn matches(&self, other: &Self) -> bool {
+            self.path == other.path || (self.device == other.device && self.inode == other.inode)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn daemon_executable_identity() -> Result<Option<ExecutableIdentity>, ViaError> {
+        Ok(Some(executable_identity_from_path(&env::current_exe()?)?))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn daemon_executable_identity() -> Result<Option<ExecutableIdentity>, ViaError> {
+        Ok(None)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn verify_peer_executable(
+        stream: &UnixStream,
+        expected: Option<&ExecutableIdentity>,
+    ) -> Result<(), ViaError> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let peer = peer_executable_identity(stream)?;
+        if expected.matches(&peer) {
+            Ok(())
+        } else {
+            Err(ViaError::InvalidConfig(
+                "daemon refused connection from executable other than via".to_owned(),
+            ))
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn verify_peer_executable(
+        _stream: &UnixStream,
+        _expected: Option<&ExecutableIdentity>,
+    ) -> Result<(), ViaError> {
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn executable_identity_from_path(path: &Path) -> Result<ExecutableIdentity, ViaError> {
+        let metadata = fs::metadata(path)?;
+        Ok(executable_identity_from_parts(path.to_path_buf(), metadata))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn executable_identity_from_parts(path: PathBuf, metadata: fs::Metadata) -> ExecutableIdentity {
+        let path = fs::canonicalize(&path).unwrap_or(path);
+        ExecutableIdentity {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn peer_executable_identity(stream: &UnixStream) -> Result<ExecutableIdentity, ViaError> {
+        let pid = linux_peer_pid(stream)?;
+        let proc_exe = PathBuf::from(format!("/proc/{pid}/exe"));
+        let metadata = fs::metadata(&proc_exe)?;
+        let path = fs::read_link(&proc_exe).unwrap_or_else(|_| proc_exe.clone());
+        Ok(executable_identity_from_parts(path, metadata))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_peer_pid(stream: &UnixStream) -> Result<libc::pid_t, ViaError> {
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `credentials` points to valid writable memory for `length` bytes,
+        // and `stream.as_raw_fd()` is a live Unix socket file descriptor.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        if length as usize != std::mem::size_of::<libc::ucred>() {
+            return Err(ViaError::InvalidConfig(
+                "daemon could not read peer process credentials".to_owned(),
+            ));
+        }
+
+        // SAFETY: `getsockopt` succeeded and wrote a complete `ucred` value.
+        Ok(unsafe { credentials.assume_init() }.pid)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn peer_executable_identity(stream: &UnixStream) -> Result<ExecutableIdentity, ViaError> {
+        let pid = macos_peer_pid(stream)?;
+        let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: `buffer` is valid writable memory for `buffer.len()` bytes.
+        let length =
+            unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        if length <= 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        buffer.truncate(length as usize);
+        let path = PathBuf::from(std::ffi::OsString::from_vec(buffer));
+        executable_identity_from_path(&path)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_peer_pid(stream: &UnixStream) -> Result<libc::pid_t, ViaError> {
+        let mut pid = std::mem::MaybeUninit::<libc::pid_t>::uninit();
+        let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        // SAFETY: `pid` points to valid writable memory for `length` bytes,
+        // and `stream.as_raw_fd()` is a live Unix socket file descriptor.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                pid.as_mut_ptr().cast(),
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        if length as usize != std::mem::size_of::<libc::pid_t>() {
+            return Err(ViaError::InvalidConfig(
+                "daemon could not read peer process id".to_owned(),
+            ));
+        }
+
+        // SAFETY: `getsockopt` succeeded and wrote a complete `pid_t` value.
+        Ok(unsafe { pid.assume_init() })
     }
 
     #[derive(PartialEq, Eq)]

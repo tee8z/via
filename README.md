@@ -15,6 +15,44 @@ The first provider backend is the 1Password CLI. via uses the official local CLI
 
 The crates.io package is `via-cli`; the installed binary is `via`.
 
+## Install via
+
+Download and install a prebuilt release binary from a checkout of this repo:
+
+```sh
+VERSION=v0.1.1 ./scripts/install-release.sh
+```
+
+The installer selects the macOS or Linux asset for your machine, installs `via`
+to `${INSTALL_DIR:-$HOME/.local/bin}`, and prints a PATH update if that
+directory is not already available in your shell. Releases built with
+verification metadata are checked against `SHA256SUMS`; signed checksum
+verification can be required with `VERIFY=required`. See
+[docs/release-signing.md](docs/release-signing.md).
+
+To install manually, open the [v0.1.1 release](https://github.com/tee8z/via/releases/tag/v0.1.1)
+and download the asset for your platform:
+
+- Linux x86_64: `via-linux-x86_64.tar.gz`
+- Linux arm64: `via-linux-arm64.tar.gz`
+- macOS Intel: `via-macos-x86_64.tar.gz`
+- macOS Apple Silicon: `via-macos-arm64.tar.gz`
+- Windows x86_64: `via-windows-x86_64.zip`
+- Windows arm64: `via-windows-arm64.zip`
+
+Extract the archive and place `via` or `via.exe` in a directory on your PATH.
+Then verify the install:
+
+```sh
+via --help
+```
+
+If you already have Rust installed, you can also install from crates.io:
+
+```sh
+cargo install via-cli
+```
+
 ## Human Setup Requirements
 
 - 1Password CLI installed and signed in.

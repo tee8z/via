@@ -106,9 +106,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/via.exe" "dist/via.exe"
           Compress-Archive -Path "dist/via.exe" -DestinationPath "${{ matrix.archive }}" -Force
 
-      - name: Upload CI artifact
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.release_tag == '') }}
-        continue-on-error: true
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.archive }}
@@ -142,4 +140,86 @@ jobs:
           done
 
           echo "::error::Failed to upload ${{ matrix.archive }} to $RELEASE_TAG"
+          exit 1
+
+  checksums:
+    name: Release Checksums
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      VIA_MINISIGN_SECRET_KEY: ${{ secrets.VIA_MINISIGN_SECRET_KEY }}
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Build SHA256SUMS
+        shell: bash
+        run: |
+          shopt -s nullglob
+
+          archives=()
+          while IFS= read -r archive; do
+            archives+=("$archive")
+          done < <(find release-assets -type f \( -name 'via-*.tar.gz' -o -name 'via-*.zip' \) | sort)
+
+          if [[ "${#archives[@]}" -eq 0 ]]; then
+            echo "::error::No release archives found"
+            exit 1
+          fi
+
+          for archive in "${archives[@]}"; do
+            cp "$archive" .
+          done
+
+          sha256sum via-*.tar.gz via-*.zip > SHA256SUMS
+
+      - name: Install minisign
+        if: ${{ env.VIA_MINISIGN_SECRET_KEY != '' }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Sign SHA256SUMS
+        if: ${{ env.VIA_MINISIGN_SECRET_KEY != '' }}
+        shell: bash
+        run: |
+          printf '%s' "$VIA_MINISIGN_SECRET_KEY" > minisign.key
+          chmod 600 minisign.key
+          minisign -S -W -s minisign.key -m SHA256SUMS -x SHA256SUMS.minisig \
+            -t "via $RELEASE_TAG SHA256SUMS"
+
+      - name: Ensure GitHub Release exists
+        shell: bash
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes || gh release view "$RELEASE_TAG" >/dev/null
+          fi
+
+      - name: Upload release verification assets
+        shell: bash
+        run: |
+          files=(SHA256SUMS)
+          if [[ -f SHA256SUMS.minisig ]]; then
+            files+=(SHA256SUMS.minisig)
+          fi
+
+          for attempt in 1 2 3; do
+            if gh release upload "$RELEASE_TAG" "${files[@]}" --clobber; then
+              exit 0
+            fi
+
+            sleep $((attempt * 10))
+          done
+
+          echo "::error::Failed to upload release verification assets to $RELEASE_TAG"
           exit 1

@@ -41,6 +41,7 @@ fn run_cli(cli: Cli) -> Result<ExitCode, ViaError> {
     let config_path = cli.config_path.as_deref();
     match cli.command {
         Command::Help => run_help_command(),
+        Command::Version => run_version_command(),
         Command::Capabilities { json } => run_capabilities_command(config_path, json),
         Command::Config(command) => run_config_command(config_path, command),
         Command::Daemon(command) => run_daemon_cli_command(command),
@@ -55,6 +56,11 @@ fn run_cli(cli: Cli) -> Result<ExitCode, ViaError> {
 
 fn run_help_command() -> Result<ExitCode, ViaError> {
     print_help();
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_version_command() -> Result<ExitCode, ViaError> {
+    println!("via {}", env!("CARGO_PKG_VERSION"));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -117,6 +123,13 @@ mod tests {
             OsString::from("capabilities"),
         ])
         .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn version_command_returns_success() {
+        let code = try_run([OsString::from("via"), OsString::from("version")]).unwrap();
 
         assert_eq!(code, ExitCode::SUCCESS);
     }
