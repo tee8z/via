@@ -1,0 +1,128 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to prepare (for example 0.2.0 or v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Open version-bump PR
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Normalize release version
+        id: release
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          case "$INPUT_VERSION" in
+            v*) CRATE_VERSION="${INPUT_VERSION#v}" ;;
+            *) CRATE_VERSION="$INPUT_VERSION" ;;
+          esac
+
+          case "$CRATE_VERSION" in
+            ''|*[!0-9A-Za-z.+-]*)
+              echo "::error::version may only contain ASCII letters, digits, '.', '+', or '-'"
+              exit 1
+              ;;
+            [0-9]*) ;;
+            *)
+              echo "::error::version must start with a digit, with or without a leading v"
+              exit 1
+              ;;
+          esac
+
+          RELEASE_TAG="v$CRATE_VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "::error::tag $RELEASE_TAG already exists"
+            exit 1
+          fi
+
+          echo "crate_version=$CRATE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Update Cargo version
+        shell: bash
+        env:
+          CRATE_VERSION: ${{ steps.release.outputs.crate_version }}
+        run: |
+          perl -0pi -e 's/^version = "[^"]+"/version = "$ENV{CRATE_VERSION}"/m' Cargo.toml
+          cargo update -p via-cli --precise "$CRATE_VERSION"
+
+      - name: Validate release version
+        shell: bash
+        env:
+          CRATE_VERSION: ${{ steps.release.outputs.crate_version }}
+        run: |
+          MANIFEST_VERSION="$(cargo pkgid --locked -p via-cli)"
+          MANIFEST_VERSION="${MANIFEST_VERSION##*@}"
+          if [ "$MANIFEST_VERSION" != "$CRATE_VERSION" ]; then
+            echo "::error::Cargo.toml/Cargo.lock resolve to $MANIFEST_VERSION, expected $CRATE_VERSION"
+            exit 1
+          fi
+
+          cargo test --locked
+
+      - name: Open pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CRATE_VERSION: ${{ steps.release.outputs.crate_version }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          BRANCH="release/$RELEASE_TAG"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || true
+          git switch -c "$BRANCH"
+          git add Cargo.toml Cargo.lock
+
+          if git diff --cached --quiet; then
+            echo "::error::No Cargo version changes to commit"
+            exit 1
+          fi
+
+          git commit -m "chore: prepare $RELEASE_TAG"
+          git push --force-with-lease origin "HEAD:refs/heads/$BRANCH"
+
+          PR_URL="$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // ""')"
+          if [ -n "$PR_URL" ]; then
+            echo "Release PR already exists: $PR_URL"
+            exit 0
+          fi
+
+          cat > pr-body.md <<EOF
+          Updates Cargo.toml and Cargo.lock to via-cli $CRATE_VERSION.
+
+          After this PR is merged, create and push tag $RELEASE_TAG from master to publish crates.io and build release artifacts.
+          EOF
+
+          gh pr create \
+            --base master \
+            --head "$BRANCH" \
+            --title "chore: prepare $RELEASE_TAG" \
+            --body-file pr-body.md

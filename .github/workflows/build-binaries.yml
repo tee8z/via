@@ -87,6 +87,41 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
 
+      - name: Validate crate version matches tag
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        run: |
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *)
+              echo "::error::release_tag must start with v"
+              exit 1
+              ;;
+          esac
+
+          CRATE_VERSION="${RELEASE_TAG#v}"
+          case "$CRATE_VERSION" in
+            ''|*[!0-9A-Za-z.+-]*)
+              echo "::error::release version may only contain ASCII letters, digits, '.', '+', or '-'"
+              exit 1
+              ;;
+            [0-9]*) ;;
+            *)
+              echo "::error::release version must start with a digit"
+              exit 1
+              ;;
+          esac
+
+          MANIFEST_VERSION="$(cargo pkgid --locked -p via-cli)"
+          MANIFEST_VERSION="${MANIFEST_VERSION##*@}"
+          if [ "$MANIFEST_VERSION" != "$CRATE_VERSION" ]; then
+            echo "::error::tag $RELEASE_TAG requires via-cli $CRATE_VERSION, but Cargo.toml/Cargo.lock resolve to $MANIFEST_VERSION"
+            echo "::error::Run the Prepare Release workflow, merge its version-bump PR, then tag the merge commit."
+            exit 1
+          fi
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -152,6 +187,7 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
       VIA_MINISIGN_SECRET_KEY: ${{ secrets.VIA_MINISIGN_SECRET_KEY }}
 
