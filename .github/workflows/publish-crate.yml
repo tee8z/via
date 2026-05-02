@@ -54,6 +54,40 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Validate crate version matches tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *)
+              echo "::error::tag must start with v"
+              exit 1
+              ;;
+          esac
+
+          CRATE_VERSION="${RELEASE_TAG#v}"
+          case "$CRATE_VERSION" in
+            ''|*[!0-9A-Za-z.+-]*)
+              echo "::error::tag version may only contain ASCII letters, digits, '.', '+', or '-'"
+              exit 1
+              ;;
+            [0-9]*) ;;
+            *)
+              echo "::error::tag version must start with a digit"
+              exit 1
+              ;;
+          esac
+
+          MANIFEST_VERSION="$(cargo pkgid --locked -p via-cli)"
+          MANIFEST_VERSION="${MANIFEST_VERSION##*@}"
+          if [ "$MANIFEST_VERSION" != "$CRATE_VERSION" ]; then
+            echo "::error::tag $RELEASE_TAG requires via-cli $CRATE_VERSION, but Cargo.toml/Cargo.lock resolve to $MANIFEST_VERSION"
+            echo "::error::Run the Prepare Release workflow, merge its version-bump PR, then tag the merge commit."
+            exit 1
+          fi
+
       - name: Test
         run: cargo test --locked
 
