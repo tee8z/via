@@ -1,16 +1,9 @@
-use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
 use ring::digest::{Context, SHA256};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::ViaError;
@@ -18,96 +11,23 @@ use crate::redaction::Redactor;
 use crate::secrets::SecretValue;
 
 const CACHE_EXPIRY_SKEW_SECONDS: i64 = 60;
-const CACHE_LOCK_WAIT: Duration = Duration::from_secs(10);
-const CACHE_LOCK_POLL: Duration = Duration::from_millis(50);
-const CACHE_LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
 const SERVICE_OAUTH_TYPE: &str = "service_oauth";
 
-pub fn access_token(
-    client: &Client,
-    credential: &SecretValue,
-    redactor: &mut Redactor,
-) -> Result<String, ViaError> {
+pub fn access_token(credential: &SecretValue, redactor: &mut Redactor) -> Result<String, ViaError> {
     redactor.add(credential.expose());
     let bundle = CredentialBundle::parse(credential.expose())?;
     register_bundle_secrets(&bundle, redactor);
 
-    let cache_dir = default_cache_dir().ok_or_else(|| {
-        ViaError::InvalidConfig(
-            "oauth auth requires VIA_CACHE_DIR, XDG_CACHE_HOME, or HOME for its token cache"
-                .to_owned(),
-        )
-    })?;
-    access_token_with_cache_dir(client, &bundle, redactor, &cache_dir)
+    let token = crate::daemon::oauth_access_token(credential.expose())?;
+    redactor.add(token.expose());
+    Ok(token.expose().to_owned())
 }
 
 pub fn validate_credential_bundle(raw: &str) -> Result<(), ViaError> {
     CredentialBundle::parse(raw).map(|_| ())
 }
 
-fn access_token_with_cache_dir(
-    client: &Client,
-    bundle: &CredentialBundle,
-    redactor: &mut Redactor,
-    cache_dir: &Path,
-) -> Result<String, ViaError> {
-    let now = unix_timestamp()?;
-    let key = cache_key(bundle);
-    let cache_path = token_cache_path(cache_dir, &key);
-
-    let cache_span = crate::timing::span("oauth token cache read");
-    let cached = read_cached_token(&cache_path);
-    if let Some(token) = cached_access_token(cached.as_ref(), now) {
-        cache_span.finish("hit");
-        redactor.add(&token);
-        return Ok(token);
-    }
-    cache_span.finish("miss");
-    register_cached_secrets(cached.as_ref(), redactor);
-
-    let lock_path = token_lock_path(cache_dir, &key);
-    let lock_span = crate::timing::span("oauth token cache lock");
-    let Some(_lock) = CacheLock::acquire(&lock_path) else {
-        lock_span.finish("unavailable");
-        return Err(ViaError::InvalidArgument(
-            "oauth token cache is locked by another via process; try again".to_owned(),
-        ));
-    };
-    lock_span.finish("acquired");
-
-    let now = unix_timestamp()?;
-    let cache_span = crate::timing::span("oauth token cache read_after_lock");
-    let cached = read_cached_token(&cache_path);
-    if let Some(token) = cached_access_token(cached.as_ref(), now) {
-        cache_span.finish("hit");
-        redactor.add(&token);
-        return Ok(token);
-    }
-    cache_span.finish("miss");
-    register_cached_secrets(cached.as_ref(), redactor);
-
-    let token = exchange_access_token(client, bundle, cached.as_ref(), redactor)?;
-    let write_span = crate::timing::span("oauth token cache write");
-    match write_cached_token(
-        &cache_path,
-        &CachedOAuthToken {
-            access_token: token.access_token.clone(),
-            expires_at: token.expires_at,
-            refresh_token: token.refresh_token.clone(),
-        },
-    ) {
-        Ok(()) => {
-            write_span.finish("ok");
-        }
-        Err(error) => {
-            write_span.finish("failed");
-            return Err(error);
-        }
-    }
-    Ok(token.access_token)
-}
-
-fn exchange_access_token(
+pub(crate) fn exchange_access_token(
     client: &Client,
     bundle: &CredentialBundle,
     cached: Option<&CachedOAuthToken>,
@@ -157,7 +77,7 @@ fn exchange_refresh_token(
         client,
         bundle,
         &form,
-        TokenResponseRefreshMode::RequireRefreshToken,
+        TokenResponseRefreshMode::PreserveRefreshToken(refresh_token),
         redactor,
     )
 }
@@ -196,7 +116,7 @@ fn exchange_token_form(
     client: &Client,
     bundle: &CredentialBundle,
     form: &[(&str, &str)],
-    refresh_mode: TokenResponseRefreshMode,
+    refresh_mode: TokenResponseRefreshMode<'_>,
     redactor: &mut Redactor,
 ) -> Result<OAuthAccessToken, ViaError> {
     let body = form_encode(form);
@@ -242,7 +162,7 @@ fn exchange_token_form(
 
 fn parse_token_response(
     body: &str,
-    refresh_mode: TokenResponseRefreshMode,
+    refresh_mode: TokenResponseRefreshMode<'_>,
     redactor: &mut Redactor,
 ) -> Result<OAuthAccessToken, ViaError> {
     let response: TokenResponse = serde_json::from_str(body)?;
@@ -255,13 +175,11 @@ fn parse_token_response(
     }
 
     let refresh_token = match refresh_mode {
-        TokenResponseRefreshMode::RequireRefreshToken => {
-            Some(response.refresh_token.ok_or_else(|| {
-                ViaError::InvalidArgument(
-                    "OAuth token response did not include a rotated refresh_token".to_owned(),
-                )
-            })?)
-        }
+        TokenResponseRefreshMode::PreserveRefreshToken(refresh_token) => Some(
+            response
+                .refresh_token
+                .unwrap_or_else(|| refresh_token.to_owned()),
+        ),
         TokenResponseRefreshMode::NoRefreshToken => response.refresh_token,
     };
     let expires_at = expires_at(response.expires_in)?;
@@ -288,7 +206,7 @@ fn expires_at(expires_in: u64) -> Result<i64, ViaError> {
     })
 }
 
-fn register_bundle_secrets(bundle: &CredentialBundle, redactor: &mut Redactor) {
+pub(crate) fn register_bundle_secrets(bundle: &CredentialBundle, redactor: &mut Redactor) {
     if let Some(client_secret) = &bundle.client_secret {
         redactor.add(client_secret);
     }
@@ -298,7 +216,7 @@ fn register_bundle_secrets(bundle: &CredentialBundle, redactor: &mut Redactor) {
     }
 }
 
-fn register_cached_secrets(cached: Option<&CachedOAuthToken>, redactor: &mut Redactor) {
+pub(crate) fn register_cached_secrets(cached: Option<&CachedOAuthToken>, redactor: &mut Redactor) {
     if let Some(cached) = cached {
         redactor.add(&cached.access_token);
         if let Some(refresh_token) = &cached.refresh_token {
@@ -308,16 +226,16 @@ fn register_cached_secrets(cached: Option<&CachedOAuthToken>, redactor: &mut Red
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct CredentialBundle {
+pub(crate) struct CredentialBundle {
     credential_type: String,
-    token_url: String,
-    client_id: String,
-    client_secret: Option<String>,
+    pub(crate) token_url: String,
+    pub(crate) client_id: String,
+    pub(crate) client_secret: Option<String>,
     grant: OAuthGrant,
 }
 
 impl CredentialBundle {
-    fn parse(raw: &str) -> Result<Self, ViaError> {
+    pub(crate) fn parse(raw: &str) -> Result<Self, ViaError> {
         let value: Value = serde_json::from_str(raw).map_err(credential_json_error)?;
         let credential_type = required_string(&value, "type")?;
         validate_credential_type(&credential_type)?;
@@ -380,8 +298,8 @@ enum OAuthGrant {
 }
 
 #[derive(Clone, Copy)]
-enum TokenResponseRefreshMode {
-    RequireRefreshToken,
+enum TokenResponseRefreshMode<'a> {
+    PreserveRefreshToken(&'a str),
     NoRefreshToken,
 }
 
@@ -396,85 +314,21 @@ struct TokenResponse {
 }
 
 #[derive(Debug)]
-struct OAuthAccessToken {
-    access_token: String,
-    refresh_token: Option<String>,
-    expires_at: i64,
+pub(crate) struct OAuthAccessToken {
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: Option<String>,
+    pub(crate) expires_at: i64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct CachedOAuthToken {
-    access_token: String,
-    expires_at: i64,
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct CachedOAuthToken {
+    pub(crate) access_token: String,
+    pub(crate) expires_at: i64,
     #[serde(default)]
-    refresh_token: Option<String>,
+    pub(crate) refresh_token: Option<String>,
 }
 
-struct CacheLock {
-    path: PathBuf,
-}
-
-impl CacheLock {
-    fn acquire(path: &Path) -> Option<Self> {
-        if let Some(parent) = path.parent() {
-            create_private_dir(parent).ok()?;
-        }
-
-        let started = Instant::now();
-        loop {
-            match OpenOptions::new().write(true).create_new(true).open(path) {
-                Ok(mut file) => {
-                    let _ = set_private_file_permissions(path);
-                    let _ = writeln!(file, "{}", std::process::id());
-                    return Some(Self {
-                        path: path.to_path_buf(),
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(path) {
-                        let _ = fs::remove_file(path);
-                        continue;
-                    }
-
-                    if started.elapsed() >= CACHE_LOCK_WAIT {
-                        return None;
-                    }
-
-                    thread::sleep(CACHE_LOCK_POLL);
-                }
-                Err(_) => return None,
-            }
-        }
-    }
-}
-
-impl Drop for CacheLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn default_cache_dir() -> Option<PathBuf> {
-    env_path("VIA_CACHE_DIR")
-        .or_else(|| env_path("XDG_CACHE_HOME").map(|path| path.join("via")))
-        .or_else(|| env_path("HOME").map(|path| path.join(".cache").join("via")))
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    env::var_os(name)
-        .filter(|value| !value.as_os_str().is_empty())
-        .map(PathBuf::from)
-}
-
-fn token_cache_path(cache_dir: &Path, key: &str) -> PathBuf {
-    cache_dir.join("oauth").join(format!("{key}.json"))
-}
-
-fn token_lock_path(cache_dir: &Path, key: &str) -> PathBuf {
-    cache_dir.join("oauth").join(format!("{key}.lock"))
-}
-
-fn cache_key(bundle: &CredentialBundle) -> String {
+pub(crate) fn cache_key(bundle: &CredentialBundle) -> String {
     let mut context = Context::new(&SHA256);
     context.update(bundle.credential_type.as_bytes());
     context.update(b"\0");
@@ -495,12 +349,7 @@ fn cache_key(bundle: &CredentialBundle) -> String {
     hex_encode(context.finish().as_ref())
 }
 
-fn read_cached_token(path: &Path) -> Option<CachedOAuthToken> {
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-fn cached_access_token(cached: Option<&CachedOAuthToken>, now: i64) -> Option<String> {
+pub(crate) fn cached_access_token(cached: Option<&CachedOAuthToken>, now: i64) -> Option<String> {
     let cached = cached?;
     if cached.expires_at <= now + CACHE_EXPIRY_SKEW_SECONDS {
         return None;
@@ -508,79 +357,7 @@ fn cached_access_token(cached: Option<&CachedOAuthToken>, now: i64) -> Option<St
     Some(cached.access_token.clone())
 }
 
-fn write_cached_token(path: &Path, token: &CachedOAuthToken) -> Result<(), ViaError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| ViaError::InvalidConfig("cache path has no parent".to_owned()))?;
-    create_private_dir(parent)?;
-
-    let temp_path = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("token"),
-        std::process::id()
-    ));
-    let raw = serde_json::to_vec(token)?;
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)?;
-        let _ = set_private_file_permissions(&temp_path);
-        file.write_all(&raw)?;
-        file.sync_all()?;
-    }
-
-    match fs::rename(&temp_path, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                fs::remove_file(path)?;
-                fs::rename(&temp_path, path)?;
-                Ok(())
-            } else {
-                let _ = fs::remove_file(&temp_path);
-                Err(error.into())
-            }
-        }
-    }
-}
-
-fn create_private_dir(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path)?;
-    set_private_dir_permissions(path)
-}
-
-#[cfg(unix)]
-fn set_private_dir_permissions(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn set_private_dir_permissions(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-fn lock_is_stale(path: &Path) -> bool {
-    path.metadata()
-        .and_then(|metadata| metadata.modified())
-        .and_then(|modified| modified.elapsed().map_err(io::Error::other))
-        .is_ok_and(|age| age >= CACHE_LOCK_STALE_AFTER)
-}
-
-fn unix_timestamp() -> Result<i64, ViaError> {
+pub(crate) fn unix_timestamp() -> Result<i64, ViaError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ViaError::InvalidConfig("system clock is before UNIX epoch".to_owned()))?;
@@ -658,8 +435,9 @@ fn optional_string(value: &Value, field: &str) -> Result<Option<String>, ViaErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::thread;
 
     const LINEAR_TOKEN_URL: &str = "https://api.linear.app/oauth/token";
 
@@ -749,33 +527,19 @@ mod tests {
 
     #[test]
     fn returns_unexpired_cached_oauth_token() {
-        let cache_dir = temp_cache_dir("hit");
-        let bundle = test_refresh_bundle("http://127.0.0.1:9/oauth/token");
-        let key = cache_key(&bundle);
-        let cache_path = token_cache_path(&cache_dir, &key);
-        write_cached_token(
-            &cache_path,
-            &CachedOAuthToken {
-                access_token: "cached-access-token".to_owned(),
-                expires_at: unix_timestamp().unwrap() + 3_600,
-                refresh_token: Some("cached-refresh-token".to_owned()),
-            },
-        )
-        .unwrap();
+        let cached = CachedOAuthToken {
+            access_token: "cached-access-token".to_owned(),
+            expires_at: unix_timestamp().unwrap() + 3_600,
+            refresh_token: Some("cached-refresh-token".to_owned()),
+        };
 
-        let client = Client::new();
-        let mut redactor = Redactor::new();
-        let token =
-            access_token_with_cache_dir(&client, &bundle, &mut redactor, &cache_dir).unwrap();
+        let token = cached_access_token(Some(&cached), unix_timestamp().unwrap()).unwrap();
 
         assert_eq!(token, "cached-access-token");
-        assert_eq!(redactor.redact("cached-access-token"), "[REDACTED]");
-        let _ = fs::remove_dir_all(cache_dir);
     }
 
     #[test]
-    fn refreshes_and_caches_rotated_refresh_token() {
-        let cache_dir = temp_cache_dir("refresh");
+    fn refreshes_and_returns_rotated_refresh_token() {
         let response_body = serde_json::json!({
             "access_token": "fresh-access-token",
             "token_type": "Bearer",
@@ -789,33 +553,50 @@ mod tests {
 
         let client = Client::new();
         let mut redactor = Redactor::new();
-        let token =
-            access_token_with_cache_dir(&client, &bundle, &mut redactor, &cache_dir).unwrap();
+        let token = exchange_access_token(&client, &bundle, None, &mut redactor).unwrap();
         let request = server.join().unwrap();
-        let key = cache_key(&bundle);
-        let cache_path = token_cache_path(&cache_dir, &key);
-        let cached = read_cached_token(&cache_path).unwrap();
 
-        assert_eq!(token, "fresh-access-token");
+        assert_eq!(token.access_token, "fresh-access-token");
         assert!(request.starts_with("POST /oauth/token "));
         assert!(request.contains("content-type: application/x-www-form-urlencoded"));
         assert!(request.contains("grant_type=refresh_token"));
         assert!(request.contains("refresh_token=configured-refresh-token"));
-        assert_eq!(cached.access_token, "fresh-access-token");
         assert_eq!(
-            cached.refresh_token.as_deref(),
+            token.refresh_token.as_deref(),
             Some("rotated-refresh-token")
         );
         assert_eq!(
             redactor.redact("fresh-access-token rotated-refresh-token configured-refresh-token"),
             "[REDACTED] [REDACTED] [REDACTED]"
         );
-        let _ = fs::remove_dir_all(cache_dir);
     }
 
     #[test]
-    fn exchanges_client_credentials_and_caches_access_token() {
-        let cache_dir = temp_cache_dir("client-credentials");
+    fn refreshes_and_preserves_current_refresh_token_when_response_omits_rotation() {
+        let response_body = serde_json::json!({
+            "access_token": "fresh-access-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })
+        .to_string();
+        let (token_url, server) = token_server(response_body);
+        let bundle = test_refresh_bundle(&token_url);
+
+        let client = Client::new();
+        let mut redactor = Redactor::new();
+        let token = exchange_access_token(&client, &bundle, None, &mut redactor).unwrap();
+        let request = server.join().unwrap();
+
+        assert_eq!(token.access_token, "fresh-access-token");
+        assert!(request.contains("grant_type=refresh_token"));
+        assert_eq!(
+            token.refresh_token.as_deref(),
+            Some("configured-refresh-token")
+        );
+    }
+
+    #[test]
+    fn exchanges_client_credentials_and_returns_access_token() {
         let response_body = serde_json::json!({
             "access_token": "client-access-token",
             "token_type": "Bearer",
@@ -836,15 +617,13 @@ mod tests {
 
         let client = Client::new();
         let mut redactor = Redactor::new();
-        let token =
-            access_token_with_cache_dir(&client, &bundle, &mut redactor, &cache_dir).unwrap();
+        let token = exchange_access_token(&client, &bundle, None, &mut redactor).unwrap();
         let request = server.join().unwrap();
 
-        assert_eq!(token, "client-access-token");
+        assert_eq!(token.access_token, "client-access-token");
         assert!(request.contains("grant_type=client_credentials"));
         assert!(request.contains("scope=read%2Cissues%3Acreate"));
         assert!(request.contains("client_secret=client-secret"));
-        let _ = fs::remove_dir_all(cache_dir);
     }
 
     #[test]
@@ -858,7 +637,7 @@ mod tests {
                 "refresh_token": "refresh-token",
             })
             .to_string(),
-            TokenResponseRefreshMode::RequireRefreshToken,
+            TokenResponseRefreshMode::PreserveRefreshToken("refresh-token"),
             &mut redactor,
         )
         .unwrap_err();
@@ -878,17 +657,6 @@ mod tests {
                 refresh_token: "configured-refresh-token".to_owned(),
             },
         }
-    }
-
-    fn temp_cache_dir(name: &str) -> PathBuf {
-        let mut path = env::temp_dir();
-        path.push(format!(
-            "via-oauth-cache-test-{name}-{}-{}",
-            std::process::id(),
-            unix_timestamp().unwrap()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        path
     }
 
     fn token_server(response_body: String) -> (String, thread::JoinHandle<String>) {

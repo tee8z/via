@@ -185,6 +185,17 @@ fn check_rest_auth(
     };
 
     let provider = providers.get(&service.provider)?;
+    check_rest_auth_config(service_name, command_name, service, provider, auth, status)
+}
+
+fn check_rest_auth_config(
+    service_name: &str,
+    command_name: &str,
+    service: &ServiceConfig,
+    provider: &dyn crate::providers::SecretProvider,
+    auth: &AuthConfig,
+    status: &mut DoctorStatus,
+) -> Result<(), ViaError> {
     match auth {
         AuthConfig::GitHubApp { .. } => {
             check_github_app_auth(service_name, command_name, service, provider, auth, status)
@@ -659,6 +670,9 @@ fn print_agent_guidance(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    const PRIVATE_KEY: &str = include_str!("../tests/fixtures/rsa-private-key.pkcs1.pem");
 
     fn config() -> Config {
         Config::from_toml_str(
@@ -680,6 +694,57 @@ base_url = "https://api.github.com"
 "#,
         )
         .unwrap()
+    }
+
+    fn auth_config() -> Config {
+        Config::from_toml_str(
+            r#"
+version = 1
+
+[providers.onepassword]
+type = "1password"
+
+[services.example]
+provider = "onepassword"
+
+[services.example.secrets]
+oauth = "op://Private/OAuth/credential"
+github_metadata = "op://Private/GitHub App/metadata"
+github_private_key = "op://Private/GitHub App/private key"
+
+[services.example.commands.api]
+mode = "rest"
+base_url = "https://api.example.com"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[derive(Default)]
+    struct FakeProvider {
+        values: BTreeMap<String, String>,
+    }
+
+    impl FakeProvider {
+        fn with(reference: &str, value: String) -> Self {
+            let mut values = BTreeMap::new();
+            values.insert(reference.to_owned(), value);
+            Self { values }
+        }
+
+        fn insert(&mut self, reference: &str, value: String) {
+            self.values.insert(reference.to_owned(), value);
+        }
+    }
+
+    impl crate::providers::SecretProvider for FakeProvider {
+        fn resolve(&self, reference: &str) -> Result<crate::secrets::SecretValue, ViaError> {
+            self.values
+                .get(reference)
+                .cloned()
+                .map(crate::secrets::SecretValue::new)
+                .ok_or_else(|| ViaError::InvalidConfig(format!("missing test secret {reference}")))
+        }
     }
 
     #[test]
@@ -713,6 +778,85 @@ base_url = "https://api.github.com"
         let output = run_command("sh", &["-c".to_owned(), "printf 'ready\\n'".to_owned()]).unwrap();
 
         assert_eq!(output.stdout, "ready");
+    }
+
+    #[test]
+    fn check_rest_auth_accepts_oauth_bundle() {
+        let config = auth_config();
+        let service = config.services.get("example").unwrap();
+        let provider = FakeProvider::with(
+            "op://Private/OAuth/credential",
+            serde_json::json!({
+                "type": "service_oauth",
+                "token_url": "https://api.example.com/oauth/token",
+                "grant_type": "refresh_token",
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "refresh_token": "refresh-token",
+            })
+            .to_string(),
+        );
+        let auth = AuthConfig::OAuth {
+            credential: "oauth".to_owned(),
+        };
+        let mut status = DoctorStatus::default();
+
+        check_rest_auth_config("example", "api", service, &provider, &auth, &mut status).unwrap();
+
+        assert!(status.into_result().is_ok());
+    }
+
+    #[test]
+    fn check_rest_auth_reports_invalid_oauth_bundle() {
+        let config = auth_config();
+        let service = config.services.get("example").unwrap();
+        let provider = FakeProvider::with(
+            "op://Private/OAuth/credential",
+            serde_json::json!({
+                "type": "service_oauth",
+                "grant_type": "refresh_token",
+                "client_id": "client-id",
+                "refresh_token": "refresh-token",
+            })
+            .to_string(),
+        );
+        let auth = AuthConfig::OAuth {
+            credential: "oauth".to_owned(),
+        };
+        let mut status = DoctorStatus::default();
+
+        check_rest_auth_config("example", "api", service, &provider, &auth, &mut status).unwrap();
+
+        assert!(matches!(status.into_result(), Err(ViaError::DoctorFailed)));
+    }
+
+    #[test]
+    fn check_rest_auth_accepts_github_app_bundle() {
+        let config = auth_config();
+        let service = config.services.get("example").unwrap();
+        let mut provider = FakeProvider::with(
+            "op://Private/GitHub App/metadata",
+            serde_json::json!({
+                "type": "github_app",
+                "app_id": 42,
+                "installation_id": "123",
+            })
+            .to_string(),
+        );
+        provider.insert(
+            "op://Private/GitHub App/private key",
+            PRIVATE_KEY.to_owned(),
+        );
+        let auth = AuthConfig::GitHubApp {
+            secret: None,
+            credential: Some("github_metadata".to_owned()),
+            private_key: Some("github_private_key".to_owned()),
+        };
+        let mut status = DoctorStatus::default();
+
+        check_rest_auth_config("example", "api", service, &provider, &auth, &mut status).unwrap();
+
+        assert!(status.into_result().is_ok());
     }
 
     #[test]

@@ -66,8 +66,13 @@ order:
 The socket directory is created with mode `0700`, and the socket file is set to
 `0600`. The daemon exits automatically after 15 minutes without activity.
 
-The cache is memory-only. Nothing is written to disk. Cache entries expire after
-`cache_ttl_seconds`, defaulting to 300 seconds.
+The cache is memory-only. Nothing is written to disk. 1Password secret cache
+entries expire after `cache_ttl_seconds`, defaulting to 300 seconds. OAuth
+access tokens and refresh-token state also live only in daemon memory while
+the daemon is running. `via daemon clear`, `via daemon stop`, daemon idle
+timeout, daemon restart, or machine reboot drops OAuth token state; for
+rotating-refresh-token services, complete OAuth setup again and update the
+configured 1Password credential bundle.
 
 ## Commands
 
@@ -76,15 +81,15 @@ via daemon status
 ```
 
 Shows whether the daemon is running. If it is running, this also prints the
-number of cached secret values.
+number of cached memory entries.
 
 ```sh
 via daemon clear
 ```
 
-Clears cached secret values and registered allowlists. The daemon remains
-running. The next command invocation registers its configured refs again and
-repopulates the cache on demand.
+Clears cached secret values, OAuth token state, and registered allowlists. The
+daemon remains running. The next command invocation registers its configured
+refs again and repopulates the cache on demand.
 
 ```sh
 via daemon stop

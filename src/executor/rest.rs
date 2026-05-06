@@ -428,10 +428,7 @@ fn apply_oauth_auth(
         context.provider,
         credential,
     )?;
-    let client = context
-        .client
-        .ok_or_else(|| ViaError::InvalidConfig("oauth auth requires an HTTP client".to_owned()))?;
-    let token = crate::auth::oauth::access_token(client, &credential, context.redactor)?;
+    let token = crate::auth::oauth::access_token(&credential, context.redactor)?;
     insert_bearer_header(headers, &token, "invalid OAuth access token")
 }
 
@@ -781,7 +778,7 @@ secret = "tenant"
     }
 
     #[test]
-    fn oauth_auth_requires_http_client() {
+    fn oauth_auth_validates_credential_before_daemon_request() {
         struct FakeProvider;
 
         impl SecretProvider for FakeProvider {
@@ -789,7 +786,7 @@ secret = "tenant"
                 assert_eq!(reference, "op://Private/Linear/oauth");
                 Ok(SecretValue::new(
                     serde_json::json!({
-                        "type": "service_oauth",
+                        "type": "wrong_oauth",
                         "token_url": "https://api.linear.app/oauth/token",
                         "grant_type": "refresh_token",
                         "client_id": "client-id",
@@ -833,7 +830,7 @@ credential = "oauth"
         .unwrap_err();
 
         assert!(
-            matches!(error, ViaError::InvalidConfig(message) if message.contains("HTTP client"))
+            matches!(error, ViaError::InvalidConfig(message) if message.contains("unsupported oauth credential type"))
         );
     }
 

@@ -93,7 +93,7 @@ The 1Password reference should look like:
 op://Private/Linear OAuth/credential
 ```
 
-Linear refresh tokens rotate. via caches the newest access token and refresh token in its private cache directory so future invocations keep working after the original 1Password refresh token has been consumed. If that cache is deleted after a refresh, update the 1Password field with a fresh Linear OAuth credential bundle.
+Linear refresh tokens rotate. via keeps the newest access token and refresh token only in daemon memory while the daemon is running so future invocations can keep working after the original 1Password refresh token has been consumed. OAuth tokens are not written to disk. If the daemon idles out, is stopped, cleared, restarted, or the machine reboots after a refresh token has rotated, complete the Linear OAuth flow again and update the 1Password field with a fresh credential bundle.
 
 ## 4. Configure via
 
@@ -124,7 +124,7 @@ type = "oauth"
 credential = "oauth"
 ```
 
-The `oauth` auth type resolves the configured credential bundle, refreshes or mints an access token through Linear's REST OAuth endpoint, then sends the request with:
+The `oauth` auth type resolves the configured credential bundle, asks the local via daemon to refresh or mint an access token through Linear's REST OAuth endpoint, then sends the request with:
 
 ```text
 Authorization: Bearer <access-token>
