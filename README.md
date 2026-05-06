@@ -246,6 +246,32 @@ See [docs/github-app-setup.md](docs/github-app-setup.md) for the full GitHub App
 
 The GitHub App metadata field must be valid JSON with `type`, numeric `app_id`, and `installation_id`. Store the PEM as a 1Password file attachment so it does not need JSON escaping.
 
+For OAuth-backed REST capabilities, store the OAuth credential bundle in 1Password and use:
+
+```toml
+[services.service.secrets]
+oauth = "op://Private/OAuth/credential"
+
+[services.service.commands.api.auth]
+type = "oauth"
+credential = "oauth"
+```
+
+OAuth credential bundles use `type = "service_oauth"`, a provider REST `token_url`, and the grant fields needed by that service. For Linear:
+
+```json
+{
+  "type": "service_oauth",
+  "token_url": "https://api.linear.app/oauth/token",
+  "grant_type": "refresh_token",
+  "client_id": "client_id",
+  "client_secret": "client_secret",
+  "refresh_token": "refresh_token"
+}
+```
+
+via refreshes OAuth access tokens through the provider's REST token endpoint and sends API requests with a bearer token. See [docs/linear-oauth-setup.md](docs/linear-oauth-setup.md) for the Linear setup flow and refresh-token rotation notes.
+
 For APIs that need one or more secret-backed headers:
 
 ```toml

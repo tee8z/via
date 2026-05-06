@@ -96,6 +96,8 @@ pub enum AuthConfig {
         #[serde(default)]
         private_key: Option<String>,
     },
+    #[serde(rename = "oauth")]
+    OAuth { credential: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,6 +251,9 @@ impl CommandConfig {
                             credential.as_deref(),
                             private_key.as_deref(),
                         )?,
+                        AuthConfig::OAuth { credential } => {
+                            validate_secret_name(service_name, command_name, service, credential)?;
+                        }
                     }
                 }
             }
@@ -425,6 +430,20 @@ secret = "token""#,
 type = "github_app"
 credential = "token"
 private_key = "token""#,
+        );
+
+        assert!(Config::from_toml_str(&raw).is_ok());
+    }
+
+    #[test]
+    fn accepts_oauth_rest_auth() {
+        let raw = VALID.replace(
+            r#"[services.github.commands.api.auth]
+type = "bearer"
+secret = "token""#,
+            r#"[services.github.commands.api.auth]
+type = "oauth"
+credential = "token""#,
         );
 
         assert!(Config::from_toml_str(&raw).is_ok());

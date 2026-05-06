@@ -99,6 +99,7 @@ struct RestSetup {
 enum RestAuthSetup {
     Bearer,
     GitHubApp,
+    OAuth,
 }
 
 struct DelegatedSetup {
@@ -198,22 +199,46 @@ fn prompt_secret_reference() -> Result<String, ViaError> {
 fn prompt_rest_setup() -> Result<RestSetup, ViaError> {
     println!();
     println!("REST API capability");
-    let auth = match prompt_choice(
-        "How should REST authenticate?",
-        &["Bearer token", "GitHub App credential bundle"],
-        1,
-    )? {
-        1 => RestAuthSetup::Bearer,
-        2 => RestAuthSetup::GitHubApp,
-        _ => unreachable!("prompt_choice only returns listed choices"),
-    };
+    let (command_name, base_url, method_default) = prompt_rest_fields()?;
+    let auth = prompt_rest_auth_setup()?;
 
     Ok(RestSetup {
-        command_name: prompt_required("Capability name", Some("api"))?,
-        base_url: prompt_required("Base URL", None)?,
-        method_default: prompt_required("Default HTTP method", Some("GET"))?,
+        command_name,
+        base_url,
+        method_default,
         auth,
     })
+}
+
+fn prompt_rest_fields() -> Result<(String, String, String), ViaError> {
+    Ok((
+        prompt_required("Capability name", Some("api"))?,
+        prompt_required("Base URL", None)?,
+        prompt_required("Default HTTP method", Some("GET"))?,
+    ))
+}
+
+fn prompt_rest_auth_setup() -> Result<RestAuthSetup, ViaError> {
+    rest_auth_setup_from_choice(prompt_choice(
+        "How should REST authenticate?",
+        &[
+            "Bearer token",
+            "GitHub App credential bundle",
+            "OAuth credential bundle",
+        ],
+        1,
+    )?)
+}
+
+fn rest_auth_setup_from_choice(choice: usize) -> Result<RestAuthSetup, ViaError> {
+    match choice {
+        1 => Ok(RestAuthSetup::Bearer),
+        2 => Ok(RestAuthSetup::GitHubApp),
+        3 => Ok(RestAuthSetup::OAuth),
+        _ => Err(ViaError::InvalidConfig(format!(
+            "unsupported REST auth choice {choice}"
+        ))),
+    }
 }
 
 fn prompt_delegated_setup() -> Result<DelegatedSetup, ViaError> {
@@ -356,6 +381,13 @@ fn build_service_config(setup: ServiceSetup) -> String {
                 ));
                 output.push_str(&format!("private_key = {}\n\n", toml_string(private_key)));
             }
+            RestAuthSetup::OAuth => {
+                output.push_str("type = \"oauth\"\n");
+                output.push_str(&format!(
+                    "credential = {}\n\n",
+                    toml_string(&setup.secret_name)
+                ));
+            }
         }
     }
 
@@ -489,6 +521,45 @@ mod tests {
         assert!(config.contains("credential = \"app\""));
         assert!(config.contains("private_key = \"private_key\""));
         assert!(Config::from_toml_str(&config).is_ok());
+    }
+
+    #[test]
+    fn builds_oauth_rest_config() {
+        let config = build_service_config(ServiceSetup {
+            service_name: "linear".to_owned(),
+            secret_name: "oauth".to_owned(),
+            secret_reference: "op://Private/Linear/oauth".to_owned(),
+            private_key_secret_name: None,
+            private_key_secret_reference: None,
+            rest: Some(RestSetup {
+                command_name: "api".to_owned(),
+                base_url: "https://api.linear.app".to_owned(),
+                method_default: "GET".to_owned(),
+                auth: RestAuthSetup::OAuth,
+            }),
+            delegated: None,
+        });
+
+        assert!(config.contains("type = \"oauth\""));
+        assert!(config.contains("credential = \"oauth\""));
+        assert!(Config::from_toml_str(&config).is_ok());
+    }
+
+    #[test]
+    fn maps_rest_auth_setup_choices() {
+        assert!(matches!(
+            rest_auth_setup_from_choice(1).unwrap(),
+            RestAuthSetup::Bearer
+        ));
+        assert!(matches!(
+            rest_auth_setup_from_choice(2).unwrap(),
+            RestAuthSetup::GitHubApp
+        ));
+        assert!(matches!(
+            rest_auth_setup_from_choice(3).unwrap(),
+            RestAuthSetup::OAuth
+        ));
+        assert!(rest_auth_setup_from_choice(4).is_err());
     }
 
     #[test]

@@ -180,12 +180,35 @@ fn check_rest_auth(
     providers: &ProviderRegistry,
     status: &mut DoctorStatus,
 ) -> Result<(), ViaError> {
-    let Some(auth @ AuthConfig::GitHubApp { .. }) = &rest.auth else {
+    let Some(auth) = &rest.auth else {
         return Ok(());
     };
 
     let provider = providers.get(&service.provider)?;
+    match auth {
+        AuthConfig::GitHubApp { .. } => {
+            check_github_app_auth(service_name, command_name, service, provider, auth, status)
+        }
+        AuthConfig::OAuth { credential } => check_oauth_auth(
+            service_name,
+            command_name,
+            service,
+            provider,
+            credential,
+            status,
+        ),
+        AuthConfig::Bearer { .. } | AuthConfig::Headers { .. } => Ok(()),
+    }
+}
 
+fn check_github_app_auth(
+    service_name: &str,
+    command_name: &str,
+    service: &ServiceConfig,
+    provider: &dyn crate::providers::SecretProvider,
+    auth: &AuthConfig,
+    status: &mut DoctorStatus,
+) -> Result<(), ViaError> {
     match resolve_github_app_doctor_secrets(service_name, service, provider, auth).and_then(
         |(credential, private_key)| {
             crate::auth::github_app::validate_credential_bundle(
@@ -211,6 +234,40 @@ fn check_rest_auth(
             ]);
             print_agent_guidance(
                 "Ask the user to fix the GitHub App credential bundle in 1Password; do not ask for the private key value.",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn check_oauth_auth(
+    service_name: &str,
+    command_name: &str,
+    service: &ServiceConfig,
+    provider: &dyn crate::providers::SecretProvider,
+    credential: &str,
+    status: &mut DoctorStatus,
+) -> Result<(), ViaError> {
+    match resolve_doctor_secret(service_name, service, provider, credential)
+        .and_then(|credential| crate::auth::oauth::validate_credential_bundle(credential.expose()))
+    {
+        Ok(()) => println!("  auth {command_name}: OAuth credential bundle valid"),
+        Err(error) => {
+            status.fail();
+            println!("  auth {command_name}: OAuth credential bundle invalid");
+            println!("  reason: {error}");
+            print_human_setup(&[
+                "Edit the configured 1Password field for this OAuth credential bundle.",
+                "The field must contain valid JSON with `\"type\":\"service_oauth\"`, `token_url`, `client_id`, and either a refresh-token or client-credentials grant.",
+                "Use `\"grant_type\":\"refresh_token\"` with `refresh_token`, or `\"grant_type\":\"client_credentials\"` with `scope`.",
+                "Store `client_secret` in the same 1Password field unless the OAuth service intentionally uses a public PKCE client.",
+                &format!(
+                    "Rerun `via config doctor {service_name}` after updating the 1Password field."
+                ),
+            ]);
+            print_agent_guidance(
+                "Ask the user to fix the OAuth credential bundle in 1Password; do not ask for OAuth token or client secret values.",
             );
         }
     }
