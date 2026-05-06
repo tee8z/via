@@ -5,14 +5,14 @@ type = "1password"
 cache = "daemon"
 
 [services.linear]
-description = "Linear API access through OAuth"
+description = "Linear app-actor API access through OAuth"
 provider = "onepassword"
 
 [services.linear.secrets]
 oauth = "op://Private/Linear OAuth/credential"
 
 [services.linear.commands.api]
-description = "Call configured Linear API endpoints with an OAuth bearer token."
+description = "Call configured Linear API endpoints with an app-actor OAuth bearer token."
 mode = "rest"
 base_url = "https://api.linear.app"
 method_default = "GET"

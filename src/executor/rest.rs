@@ -21,16 +21,35 @@ pub fn execute(
     let request = RestInvocation::parse(config, args)?;
     let mut redactor = Redactor::new();
     let client = Client::new();
-    let builder = build_authenticated_request(
-        &client,
-        config,
-        service_name,
-        service,
-        provider,
-        &request,
-        &mut redactor,
-    )?;
-    let response = send_rest_request(builder, &request.method, &request.path)?;
+    let builder = {
+        let mut context = RestRequestBuildContext {
+            client: &client,
+            config,
+            service_name,
+            service,
+            provider,
+            redactor: &mut redactor,
+            oauth_token_mode: OAuthTokenMode::Cached,
+        };
+        build_authenticated_request(&mut context, &request)?
+    };
+    let mut response = send_rest_request(builder, &request.method, &request.path)?;
+    if should_retry_with_fresh_oauth(config, response.status) {
+        crate::timing::event("rest oauth retry", "status=401");
+        let builder = {
+            let mut context = RestRequestBuildContext {
+                client: &client,
+                config,
+                service_name,
+                service,
+                provider,
+                redactor: &mut redactor,
+                oauth_token_mode: OAuthTokenMode::Refresh,
+            };
+            build_authenticated_request(&mut context, &request)?
+        };
+        response = send_rest_request(builder, &request.method, &request.path)?;
+    }
     let body = redactor.redact(&response.body);
 
     ensure_success(response.status, &response.headers, &body)?;
@@ -44,46 +63,39 @@ struct RestResponse {
     body: String,
 }
 
+struct RestRequestBuildContext<'a> {
+    client: &'a Client,
+    config: &'a RestCommandConfig,
+    service_name: &'a str,
+    service: &'a ServiceConfig,
+    provider: &'a dyn SecretProvider,
+    redactor: &'a mut Redactor,
+    oauth_token_mode: OAuthTokenMode,
+}
+
 fn build_authenticated_request(
-    client: &Client,
-    config: &RestCommandConfig,
-    service_name: &str,
-    service: &ServiceConfig,
-    provider: &dyn SecretProvider,
+    context: &mut RestRequestBuildContext<'_>,
     request: &RestInvocation,
-    redactor: &mut Redactor,
 ) -> Result<RequestBuilder, ViaError> {
-    let url = build_url(&config.base_url, &request.path, &request.query)?;
-    let builder = client.request(request.method.clone(), url);
-    let builder = with_auth_headers(
-        builder,
-        client,
-        config,
-        service_name,
-        service,
-        provider,
-        redactor,
-    )?;
+    let url = build_url(&context.config.base_url, &request.path, &request.query)?;
+    let builder = context.client.request(request.method.clone(), url);
+    let builder = with_auth_headers(builder, context)?;
     Ok(with_body(builder, request.body.as_deref()))
 }
 
 fn with_auth_headers(
     builder: RequestBuilder,
-    client: &Client,
-    config: &RestCommandConfig,
-    service_name: &str,
-    service: &ServiceConfig,
-    provider: &dyn SecretProvider,
-    redactor: &mut Redactor,
+    context: &mut RestRequestBuildContext<'_>,
 ) -> Result<RequestBuilder, ViaError> {
     let auth_span = crate::timing::span("rest auth headers");
-    let headers = match build_headers(
-        Some(client),
-        config,
-        service_name,
-        service,
-        provider,
-        redactor,
+    let headers = match build_headers_with_oauth_mode(
+        Some(context.client),
+        context.config,
+        context.service_name,
+        context.service,
+        context.provider,
+        context.redactor,
+        context.oauth_token_mode,
     ) {
         Ok(headers) => {
             auth_span.finish("ok");
@@ -132,6 +144,17 @@ fn send_rest_request(
         headers,
         body,
     })
+}
+
+#[derive(Clone, Copy)]
+enum OAuthTokenMode {
+    Cached,
+    Refresh,
+}
+
+fn should_retry_with_fresh_oauth(config: &RestCommandConfig, status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        && matches!(config.auth, Some(AuthConfig::OAuth { .. }))
 }
 
 fn read_response_body(response: reqwest::blocking::Response) -> Result<String, ViaError> {
@@ -268,6 +291,7 @@ fn parse_method(method: &str) -> Result<Method, ViaError> {
         .map_err(|_| ViaError::InvalidArgument(format!("invalid HTTP method `{method}`")))
 }
 
+#[cfg(test)]
 fn build_headers(
     client: Option<&reqwest::blocking::Client>,
     config: &RestCommandConfig,
@@ -275,6 +299,26 @@ fn build_headers(
     service: &ServiceConfig,
     provider: &dyn SecretProvider,
     redactor: &mut Redactor,
+) -> Result<HeaderMap, ViaError> {
+    build_headers_with_oauth_mode(
+        client,
+        config,
+        service_name,
+        service,
+        provider,
+        redactor,
+        OAuthTokenMode::Cached,
+    )
+}
+
+fn build_headers_with_oauth_mode(
+    client: Option<&reqwest::blocking::Client>,
+    config: &RestCommandConfig,
+    service_name: &str,
+    service: &ServiceConfig,
+    provider: &dyn SecretProvider,
+    redactor: &mut Redactor,
+    oauth_token_mode: OAuthTokenMode,
 ) -> Result<HeaderMap, ViaError> {
     let mut headers = build_static_headers(config)?;
     let mut auth_context = AuthHeaderContext {
@@ -284,6 +328,7 @@ fn build_headers(
         service,
         provider,
         redactor,
+        oauth_token_mode,
     };
     apply_auth_headers(&mut headers, &mut auth_context)?;
     Ok(headers)
@@ -296,6 +341,7 @@ struct AuthHeaderContext<'a> {
     service: &'a ServiceConfig,
     provider: &'a dyn SecretProvider,
     redactor: &'a mut Redactor,
+    oauth_token_mode: OAuthTokenMode,
 }
 
 fn build_static_headers(config: &RestCommandConfig) -> Result<HeaderMap, ViaError> {
@@ -428,7 +474,12 @@ fn apply_oauth_auth(
         context.provider,
         credential,
     )?;
-    let token = crate::auth::oauth::access_token(&credential, context.redactor)?;
+    let token = match context.oauth_token_mode {
+        OAuthTokenMode::Cached => crate::auth::oauth::access_token(&credential, context.redactor)?,
+        OAuthTokenMode::Refresh => {
+            crate::auth::oauth::refresh_access_token(&credential, context.redactor)?
+        }
+    };
     insert_bearer_header(headers, &token, "invalid OAuth access token")
 }
 
@@ -677,6 +728,34 @@ Accept = "application/vnd.github+json"
                     && message.contains("ABC123")
                     && message.contains("Endpoint request timed out")
                     && !message.contains("secret")));
+    }
+
+    #[test]
+    fn retries_oauth_requests_after_unauthorized_response() {
+        let config: RestCommandConfig = toml::from_str(
+            r#"
+base_url = "https://api.linear.app"
+
+[auth]
+type = "oauth"
+credential = "oauth"
+"#,
+        )
+        .unwrap();
+        let bearer_config = rest_config();
+
+        assert!(should_retry_with_fresh_oauth(
+            &config,
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!should_retry_with_fresh_oauth(
+            &config,
+            reqwest::StatusCode::FORBIDDEN
+        ));
+        assert!(!should_retry_with_fresh_oauth(
+            &bearer_config,
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
     }
 
     #[test]

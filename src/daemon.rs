@@ -4,6 +4,13 @@ pub struct AllowedOnePasswordRef {
     pub reference: String,
 }
 
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthTokenMode {
+    Cached,
+    Refresh,
+}
+
 #[cfg(unix)]
 mod imp {
     use std::collections::HashMap;
@@ -93,10 +100,14 @@ mod imp {
         }
     }
 
-    pub fn oauth_access_token(credential: &str) -> Result<SecretValue, ViaError> {
+    pub fn oauth_access_token(
+        credential: &str,
+        mode: super::OAuthTokenMode,
+    ) -> Result<SecretValue, ViaError> {
         let span = crate::timing::span("oauth daemon access token");
         let response = match request_with_autostart(DaemonRequest::OAuthAccessToken {
             credential: credential.to_owned(),
+            mode,
         }) {
             Ok(response) => response,
             Err(error) => {
@@ -381,10 +392,16 @@ mod imp {
         },
         OAuthAccessToken {
             credential: String,
+            #[serde(default = "default_oauth_token_mode")]
+            mode: super::OAuthTokenMode,
         },
         Clear,
         Status,
         Stop,
+    }
+
+    fn default_oauth_token_mode() -> super::OAuthTokenMode {
+        super::OAuthTokenMode::Cached
     }
 
     #[derive(Default)]
@@ -409,8 +426,8 @@ mod imp {
                     ref_id,
                     ttl_seconds,
                 } => self.resolve(config_hash, ref_id, ttl_seconds),
-                DaemonRequest::OAuthAccessToken { credential } => {
-                    self.oauth_access_token(&credential)
+                DaemonRequest::OAuthAccessToken { credential, mode } => {
+                    self.oauth_access_token(&credential, mode)
                 }
                 DaemonRequest::Clear => {
                     self.cache.clear();
@@ -501,7 +518,11 @@ mod imp {
             })
         }
 
-        fn oauth_access_token(&mut self, credential: &str) -> DaemonResponseInternal {
+        fn oauth_access_token(
+            &mut self,
+            credential: &str,
+            mode: super::OAuthTokenMode,
+        ) -> DaemonResponseInternal {
             let bundle = match crate::auth::oauth::CredentialBundle::parse(credential) {
                 Ok(bundle) => bundle,
                 Err(error) => return DaemonResponseInternal::error(error.to_string()),
@@ -512,13 +533,15 @@ mod imp {
                 Err(error) => return DaemonResponseInternal::error(error.to_string()),
             };
 
-            if let Some(access_token) =
-                crate::auth::oauth::cached_access_token(self.oauth_cache.get(&key), now)
-            {
-                let mut response = DaemonResponseInternal::ok();
-                response.value = Some(SecretValue::new(access_token));
-                response.cache = Some("hit".to_owned());
-                return response;
+            if matches!(mode, super::OAuthTokenMode::Cached) {
+                if let Some(access_token) =
+                    crate::auth::oauth::cached_access_token(self.oauth_cache.get(&key), now)
+                {
+                    let mut response = DaemonResponseInternal::ok();
+                    response.value = Some(SecretValue::new(access_token));
+                    response.cache = Some("hit".to_owned());
+                    return response;
+                }
             }
 
             let cached = self.oauth_cache.get(&key).cloned();
@@ -1063,9 +1086,13 @@ mod imp {
 
             let response = state.handle(DaemonRequest::OAuthAccessToken {
                 credential: credential.clone(),
+                mode: crate::daemon::OAuthTokenMode::Cached,
             });
             let request = server.join().unwrap();
-            let cached_response = state.handle(DaemonRequest::OAuthAccessToken { credential });
+            let cached_response = state.handle(DaemonRequest::OAuthAccessToken {
+                credential,
+                mode: crate::daemon::OAuthTokenMode::Cached,
+            });
 
             assert!(response.ok);
             assert_eq!(response.cache.as_deref(), Some("miss"));
@@ -1082,6 +1109,50 @@ mod imp {
                 cached_response.value.as_ref().map(SecretValue::expose),
                 Some("fresh-access-token")
             );
+        }
+
+        #[test]
+        fn oauth_access_token_refresh_mode_skips_unexpired_cache() {
+            let response_body = serde_json::json!({
+                "access_token": "fresh-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })
+            .to_string();
+            let (token_url, server) = token_server(response_body);
+            let mut state = DaemonState::default();
+            let credential = serde_json::json!({
+                "type": "service_oauth",
+                "token_url": token_url,
+                "grant_type": "client_credentials",
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "scope": "read,issues:create",
+            })
+            .to_string();
+            let bundle = crate::auth::oauth::CredentialBundle::parse(&credential).unwrap();
+            state.oauth_cache.insert(
+                crate::auth::oauth::cache_key(&bundle),
+                crate::auth::oauth::CachedOAuthToken {
+                    access_token: "cached-access-token".to_owned(),
+                    expires_at: crate::auth::oauth::unix_timestamp().unwrap() + 3_600,
+                    refresh_token: None,
+                },
+            );
+
+            let response = state.handle(DaemonRequest::OAuthAccessToken {
+                credential,
+                mode: crate::daemon::OAuthTokenMode::Refresh,
+            });
+            let request = server.join().unwrap();
+
+            assert!(response.ok);
+            assert_eq!(response.cache.as_deref(), Some("miss"));
+            assert_eq!(
+                response.value.as_ref().map(SecretValue::expose),
+                Some("fresh-access-token")
+            );
+            assert!(request.contains("grant_type=client_credentials"));
         }
 
         #[test]
@@ -1156,7 +1227,10 @@ mod imp {
         ))
     }
 
-    pub fn oauth_access_token(_credential: &str) -> Result<SecretValue, ViaError> {
+    pub fn oauth_access_token(
+        _credential: &str,
+        _mode: super::OAuthTokenMode,
+    ) -> Result<SecretValue, ViaError> {
         Err(ViaError::InvalidConfig(
             "OAuth auth requires the via daemon, which is only supported on Unix-like platforms"
                 .to_owned(),

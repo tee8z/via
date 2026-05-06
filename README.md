@@ -257,20 +257,20 @@ type = "oauth"
 credential = "oauth"
 ```
 
-OAuth credential bundles use `type = "service_oauth"`, the service's REST OAuth `token_url`, and the grant fields needed by that service. For a refresh-token service such as Linear:
+OAuth credential bundles use `type = "service_oauth"`, the service's REST OAuth `token_url`, and the grant fields needed by that service. Prefer `client_credentials` for bot, agent, service-account, or app-actor connections whenever the OAuth service supports it. For Linear:
 
 ```json
 {
   "type": "service_oauth",
   "token_url": "https://api.linear.app/oauth/token",
-  "grant_type": "refresh_token",
+  "grant_type": "client_credentials",
   "client_id": "client_id",
   "client_secret": "client_secret",
-  "refresh_token": "refresh_token"
+  "scope": "read,issues:create"
 }
 ```
 
-via asks the local daemon to refresh OAuth access tokens through the provider's REST token endpoint, keeps access tokens and refresh-token state only in daemon memory while the daemon is running, and sends API requests with a bearer token. Nothing from the OAuth token exchange is written to disk. See [docs/linear-oauth-setup.md](docs/linear-oauth-setup.md) for the Linear setup flow and refresh-token rotation notes.
+via asks the local daemon to mint OAuth access tokens through the provider's REST token endpoint, keeps access tokens and refresh-token state only in daemon memory while the daemon is running, and sends API requests with a bearer token. Nothing from the OAuth token exchange is written to disk. Use `refresh_token` only for services that need user-actor OAuth and cannot issue bot/app credentials. See [docs/linear-oauth-setup.md](docs/linear-oauth-setup.md) for the Linear app-actor setup flow.
 
 For APIs that need one or more secret-backed headers:
 

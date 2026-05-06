@@ -14,11 +14,26 @@ const CACHE_EXPIRY_SKEW_SECONDS: i64 = 60;
 const SERVICE_OAUTH_TYPE: &str = "service_oauth";
 
 pub fn access_token(credential: &SecretValue, redactor: &mut Redactor) -> Result<String, ViaError> {
+    access_token_with_mode(credential, redactor, crate::daemon::OAuthTokenMode::Cached)
+}
+
+pub fn refresh_access_token(
+    credential: &SecretValue,
+    redactor: &mut Redactor,
+) -> Result<String, ViaError> {
+    access_token_with_mode(credential, redactor, crate::daemon::OAuthTokenMode::Refresh)
+}
+
+fn access_token_with_mode(
+    credential: &SecretValue,
+    redactor: &mut Redactor,
+    mode: crate::daemon::OAuthTokenMode,
+) -> Result<String, ViaError> {
     redactor.add(credential.expose());
     let bundle = CredentialBundle::parse(credential.expose())?;
     register_bundle_secrets(&bundle, redactor);
 
-    let token = crate::daemon::oauth_access_token(credential.expose())?;
+    let token = crate::daemon::oauth_access_token(credential.expose(), mode)?;
     redactor.add(token.expose());
     Ok(token.expose().to_owned())
 }

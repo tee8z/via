@@ -224,7 +224,7 @@ fn prompt_rest_auth_setup() -> Result<RestAuthSetup, ViaError> {
         &[
             "Bearer token",
             "GitHub App credential bundle",
-            "OAuth credential bundle",
+            "OAuth credential bundle (prefer client_credentials for bots)",
         ],
         1,
     )?)

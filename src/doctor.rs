@@ -271,7 +271,8 @@ fn check_oauth_auth(
             print_human_setup(&[
                 "Edit the configured 1Password field for this OAuth credential bundle.",
                 "The field must contain valid JSON with `\"type\":\"service_oauth\"`, `token_url`, `client_id`, and either a refresh-token or client-credentials grant.",
-                "Use `\"grant_type\":\"refresh_token\"` with `refresh_token`, or `\"grant_type\":\"client_credentials\"` with `scope`.",
+                "Prefer `\"grant_type\":\"client_credentials\"` with `scope` for bot, agent, service-account, or app-actor access.",
+                "Use `\"grant_type\":\"refresh_token\"` with `refresh_token` only when the service must act as a specific user.",
                 "Store `client_secret` in the same 1Password field unless the OAuth service intentionally uses a public PKCE client.",
                 &format!(
                     "Rerun `via config doctor {service_name}` after updating the 1Password field."
