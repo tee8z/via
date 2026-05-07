@@ -41,6 +41,8 @@ pub enum OnePasswordCacheMode {
 pub struct ServiceConfig {
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub hint: Option<String>,
     pub provider: String,
     #[serde(default)]
     pub secrets: BTreeMap<String, String>,
@@ -96,6 +98,8 @@ pub enum AuthConfig {
         #[serde(default)]
         private_key: Option<String>,
     },
+    #[serde(rename = "oauth")]
+    OAuth { credential: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,6 +253,9 @@ impl CommandConfig {
                             credential.as_deref(),
                             private_key.as_deref(),
                         )?,
+                        AuthConfig::OAuth { credential } => {
+                            validate_secret_name(service_name, command_name, service, credential)?;
+                        }
                     }
                 }
             }
@@ -352,6 +359,7 @@ type = "1password"
 
 [services.github]
 description = "GitHub access"
+hint = "via github api /user"
 provider = "onepassword"
 
 [services.github.secrets]
@@ -381,6 +389,10 @@ secret = "token"
         let config = Config::from_toml_str(VALID).unwrap();
 
         assert_eq!(config.version, 1);
+        assert_eq!(
+            config.services["github"].hint.as_deref(),
+            Some("via github api /user")
+        );
         assert!(config.services["github"].commands.contains_key("api"));
         assert!(config.services["github"].commands.contains_key("gh"));
     }
@@ -425,6 +437,20 @@ secret = "token""#,
 type = "github_app"
 credential = "token"
 private_key = "token""#,
+        );
+
+        assert!(Config::from_toml_str(&raw).is_ok());
+    }
+
+    #[test]
+    fn accepts_oauth_rest_auth() {
+        let raw = VALID.replace(
+            r#"[services.github.commands.api.auth]
+type = "bearer"
+secret = "token""#,
+            r#"[services.github.commands.api.auth]
+type = "oauth"
+credential = "token""#,
         );
 
         assert!(Config::from_toml_str(&raw).is_ok());

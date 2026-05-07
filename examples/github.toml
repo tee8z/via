@@ -6,6 +6,7 @@ cache = "daemon"
 
 [services.github]
 description = "GitHub REST API access through a GitHub App installation"
+hint = "via github api /user"
 provider = "onepassword"
 
 [services.github.secrets]

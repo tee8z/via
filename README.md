@@ -201,6 +201,7 @@ cache = "daemon"
 
 [services.github]
 description = "GitHub REST API access through a GitHub App installation"
+hint = "via github api /user"
 provider = "onepassword"
 
 [services.github.secrets]
@@ -225,7 +226,11 @@ X-GitHub-Api-Version = "2022-11-28"
 
 REST capabilities accept paths, not arbitrary absolute URLs. The configured `base_url` is the trust boundary for that service.
 
+Service-level `hint` values are optional example commands shown by `via capabilities` and `via skill print`. They should demonstrate a safe, minimal call for the configured service without embedding secrets.
+
 `cache = "daemon"` is the default on macOS and Linux. `via` auto-starts a per-user local daemon that owns `op read` calls and caches resolved 1Password secrets in memory for a short TTL. There is no separate service to install or manage for normal use. Use `via daemon status`, `via daemon clear`, and `via daemon stop` to inspect, clear, or stop it; the next command auto-starts it again. Set `cache = "off"` to always call `op read` directly. See [docs/daemon-architecture.md](docs/daemon-architecture.md) for the daemon flow, commands, and verification steps.
+
+Config changes do not require a daemon reload. Each `via` invocation reads the config file again and registers the current allowed secret references with the daemon. Discovery commands such as `via capabilities` and `via skill print` show config-only changes immediately. If you changed a secret value in 1Password or want to drop cached OAuth/token state, run `via daemon clear`; use `via daemon stop` to restart the daemon completely on the next command.
 
 On Windows, the cache currently defaults to `off` because the daemon needs a named-pipe backend that is not implemented yet. The config shape is already feature-ready: once Windows daemon support exists, `cache = "daemon"` can use the same provider setting.
 
@@ -245,6 +250,32 @@ private_key = "private_key"
 See [docs/github-app-setup.md](docs/github-app-setup.md) for the full GitHub App setup flow.
 
 The GitHub App metadata field must be valid JSON with `type`, numeric `app_id`, and `installation_id`. Store the PEM as a 1Password file attachment so it does not need JSON escaping.
+
+For OAuth-backed REST capabilities, store the OAuth credential bundle in 1Password and use:
+
+```toml
+[services.service.secrets]
+oauth = "op://Private/OAuth/credential"
+
+[services.service.commands.api.auth]
+type = "oauth"
+credential = "oauth"
+```
+
+OAuth credential bundles use `type = "service_oauth"`, the service's REST OAuth `token_url`, and the grant fields needed by that service. Prefer `client_credentials` for bot, agent, service-account, or app-actor connections whenever the OAuth service supports it. For Linear:
+
+```json
+{
+  "type": "service_oauth",
+  "token_url": "https://api.linear.app/oauth/token",
+  "grant_type": "client_credentials",
+  "client_id": "client_id",
+  "client_secret": "client_secret",
+  "scope": "read,issues:create"
+}
+```
+
+via asks the local daemon to mint OAuth access tokens through the provider's REST token endpoint, keeps access tokens and refresh-token state only in daemon memory while the daemon is running, and sends API requests with a bearer token. Nothing from the OAuth token exchange is written to disk. Use `refresh_token` only for services that need user-actor OAuth and cannot issue bot/app credentials. See [docs/linear-oauth-setup.md](docs/linear-oauth-setup.md) for the Linear app-actor setup flow.
 
 For APIs that need one or more secret-backed headers:
 

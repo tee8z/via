@@ -1,0 +1,23 @@
+version = 1
+
+[providers.onepassword]
+type = "1password"
+cache = "daemon"
+
+[services.linear]
+description = "Linear app-actor API access through OAuth"
+hint = "via linear api POST /graphql --json '{\"query\":\"{ viewer { id name } }\"}'"
+provider = "onepassword"
+
+[services.linear.secrets]
+oauth = "op://Private/Example Linear OAuth/credential"
+
+[services.linear.commands.api]
+description = "Call configured Linear API endpoints with an app-actor OAuth bearer token."
+mode = "rest"
+base_url = "https://api.linear.app"
+method_default = "GET"
+
+[services.linear.commands.api.auth]
+type = "oauth"
+credential = "oauth"

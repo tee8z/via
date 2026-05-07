@@ -12,6 +12,8 @@ struct Capabilities<'a> {
 struct ServiceCapabilities<'a> {
     name: &'a str,
     description: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<&'a str>,
     capabilities: Vec<CapabilitySummary<'a>>,
 }
 
@@ -36,6 +38,7 @@ pub fn render(config: &Config, json: bool) -> Result<String, ViaError> {
                 .map(|(name, service)| ServiceCapabilities {
                     name,
                     description: service.description.as_deref(),
+                    hint: service.hint.as_deref(),
                     capabilities: service
                         .commands
                         .iter()
@@ -59,6 +62,9 @@ pub fn render(config: &Config, json: bool) -> Result<String, ViaError> {
         match &service.description {
             Some(description) => output.push_str(&format!("{service_name}: {description}\n")),
             None => output.push_str(&format!("{service_name}\n")),
+        }
+        if let Some(hint) = &service.hint {
+            output.push_str(&format!("  hint: {hint}\n"));
         }
 
         for (command_name, command) in &service.commands {
@@ -89,6 +95,7 @@ type = "1password"
 
 [services.github]
 description = "GitHub access"
+hint = "via github api /user"
 provider = "onepassword"
 
 [services.github.secrets]
@@ -112,6 +119,7 @@ secret = "token"
         let output = render(&config(), false).unwrap();
 
         assert!(output.contains("github: GitHub access"));
+        assert!(output.contains("hint: via github api /user"));
         assert!(output.contains("api (Rest): REST access"));
     }
 
@@ -120,6 +128,7 @@ secret = "token"
         let output = render(&config(), true).unwrap();
 
         assert!(output.contains("\"name\": \"github\""));
+        assert!(output.contains("\"hint\": \"via github api /user\""));
         assert!(output.contains("\"mode\": \"rest\""));
         assert!(!output.contains("op://"));
     }

@@ -81,6 +81,7 @@ fn write_config(path: &Path, contents: &str) -> Result<(), ViaError> {
 
 struct ServiceSetup {
     service_name: String,
+    hint: String,
     secret_name: String,
     secret_reference: String,
     private_key_secret_name: Option<String>,
@@ -99,6 +100,7 @@ struct RestSetup {
 enum RestAuthSetup {
     Bearer,
     GitHubApp,
+    OAuth,
 }
 
 struct DelegatedSetup {
@@ -110,6 +112,7 @@ struct DelegatedSetup {
 
 fn prompt_service_setup() -> Result<ServiceSetup, ViaError> {
     let service_name = prompt_required("Service name", None)?;
+    let hint = prompt_optional("Example command hint")?;
     let secret_name = prompt_required("Secret name in via config", Some("token"))?;
     let secret_reference = prompt_secret_reference()?;
     let mode = prompt_service_mode()?;
@@ -120,6 +123,7 @@ fn prompt_service_setup() -> Result<ServiceSetup, ViaError> {
 
     Ok(ServiceSetup {
         service_name,
+        hint,
         secret_name,
         secret_reference,
         private_key_secret_name,
@@ -198,22 +202,46 @@ fn prompt_secret_reference() -> Result<String, ViaError> {
 fn prompt_rest_setup() -> Result<RestSetup, ViaError> {
     println!();
     println!("REST API capability");
-    let auth = match prompt_choice(
-        "How should REST authenticate?",
-        &["Bearer token", "GitHub App credential bundle"],
-        1,
-    )? {
-        1 => RestAuthSetup::Bearer,
-        2 => RestAuthSetup::GitHubApp,
-        _ => unreachable!("prompt_choice only returns listed choices"),
-    };
+    let (command_name, base_url, method_default) = prompt_rest_fields()?;
+    let auth = prompt_rest_auth_setup()?;
 
     Ok(RestSetup {
-        command_name: prompt_required("Capability name", Some("api"))?,
-        base_url: prompt_required("Base URL", None)?,
-        method_default: prompt_required("Default HTTP method", Some("GET"))?,
+        command_name,
+        base_url,
+        method_default,
         auth,
     })
+}
+
+fn prompt_rest_fields() -> Result<(String, String, String), ViaError> {
+    Ok((
+        prompt_required("Capability name", Some("api"))?,
+        prompt_required("Base URL", None)?,
+        prompt_required("Default HTTP method", Some("GET"))?,
+    ))
+}
+
+fn prompt_rest_auth_setup() -> Result<RestAuthSetup, ViaError> {
+    rest_auth_setup_from_choice(prompt_choice(
+        "How should REST authenticate?",
+        &[
+            "Bearer token",
+            "GitHub App credential bundle",
+            "OAuth credential bundle (prefer client_credentials for bots)",
+        ],
+        1,
+    )?)
+}
+
+fn rest_auth_setup_from_choice(choice: usize) -> Result<RestAuthSetup, ViaError> {
+    match choice {
+        1 => Ok(RestAuthSetup::Bearer),
+        2 => Ok(RestAuthSetup::GitHubApp),
+        3 => Ok(RestAuthSetup::OAuth),
+        _ => Err(ViaError::InvalidConfig(format!(
+            "unsupported REST auth choice {choice}"
+        ))),
+    }
 }
 
 fn prompt_delegated_setup() -> Result<DelegatedSetup, ViaError> {
@@ -297,6 +325,9 @@ fn build_service_config(setup: ServiceSetup) -> String {
         "description = {}\n",
         toml_string(&format!("{} access", setup.service_name))
     ));
+    if !setup.hint.is_empty() {
+        output.push_str(&format!("hint = {}\n", toml_string(&setup.hint)));
+    }
     output.push_str("provider = \"onepassword\"\n\n");
     output.push_str(&format!(
         "[services.{}.secrets]\n",
@@ -355,6 +386,13 @@ fn build_service_config(setup: ServiceSetup) -> String {
                     toml_string(&setup.secret_name)
                 ));
                 output.push_str(&format!("private_key = {}\n\n", toml_string(private_key)));
+            }
+            RestAuthSetup::OAuth => {
+                output.push_str("type = \"oauth\"\n");
+                output.push_str(&format!(
+                    "credential = {}\n\n",
+                    toml_string(&setup.secret_name)
+                ));
             }
         }
     }
@@ -446,6 +484,7 @@ mod tests {
     fn builds_generic_rest_config() {
         let config = build_service_config(ServiceSetup {
             service_name: "gitlab".to_owned(),
+            hint: "via gitlab api /projects".to_owned(),
             secret_name: "token".to_owned(),
             secret_reference: "op://Private/GitLab/token".to_owned(),
             private_key_secret_name: None,
@@ -460,6 +499,7 @@ mod tests {
         });
 
         assert!(config.contains("[services.\"gitlab\"]"));
+        assert!(config.contains("hint = \"via gitlab api /projects\""));
         assert!(config.contains("cache = \"daemon\""));
         assert!(config.contains("base_url = \"https://gitlab.example.com/api/v4\""));
         assert!(Config::from_toml_str(&config).is_ok());
@@ -469,6 +509,7 @@ mod tests {
     fn builds_github_app_rest_config() {
         let config = build_service_config(ServiceSetup {
             service_name: "github".to_owned(),
+            hint: String::new(),
             secret_name: "app".to_owned(),
             secret_reference: "op://Private/Example GitHub App/metadata".to_owned(),
             private_key_secret_name: Some("private_key".to_owned()),
@@ -492,9 +533,54 @@ mod tests {
     }
 
     #[test]
+    fn builds_oauth_rest_config() {
+        let config = build_service_config(ServiceSetup {
+            service_name: "linear".to_owned(),
+            hint: "via linear api POST /graphql --json '{\"query\":\"{ viewer { id name } }\"}'"
+                .to_owned(),
+            secret_name: "oauth".to_owned(),
+            secret_reference: "op://Private/Linear/oauth".to_owned(),
+            private_key_secret_name: None,
+            private_key_secret_reference: None,
+            rest: Some(RestSetup {
+                command_name: "api".to_owned(),
+                base_url: "https://api.linear.app".to_owned(),
+                method_default: "GET".to_owned(),
+                auth: RestAuthSetup::OAuth,
+            }),
+            delegated: None,
+        });
+
+        assert!(config.contains("type = \"oauth\""));
+        assert!(config.contains(
+            "hint = \"via linear api POST /graphql --json '{\\\"query\\\":\\\"{ viewer { id name } }\\\"}'\""
+        ));
+        assert!(config.contains("credential = \"oauth\""));
+        assert!(Config::from_toml_str(&config).is_ok());
+    }
+
+    #[test]
+    fn maps_rest_auth_setup_choices() {
+        assert!(matches!(
+            rest_auth_setup_from_choice(1).unwrap(),
+            RestAuthSetup::Bearer
+        ));
+        assert!(matches!(
+            rest_auth_setup_from_choice(2).unwrap(),
+            RestAuthSetup::GitHubApp
+        ));
+        assert!(matches!(
+            rest_auth_setup_from_choice(3).unwrap(),
+            RestAuthSetup::OAuth
+        ));
+        assert!(rest_auth_setup_from_choice(4).is_err());
+    }
+
+    #[test]
     fn builds_generic_delegated_config() {
         let config = build_service_config(ServiceSetup {
             service_name: "deploy tool".to_owned(),
+            hint: String::new(),
             secret_name: "api token".to_owned(),
             secret_reference: "op://Private/Deploy/token".to_owned(),
             private_key_secret_name: None,

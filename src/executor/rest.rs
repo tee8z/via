@@ -6,7 +6,7 @@ use reqwest::header::{
 };
 use reqwest::Method;
 
-use crate::config::{AuthConfig, RestCommandConfig, ServiceConfig};
+use crate::config::{AuthConfig, RestCommandConfig, SecretHeaderConfig, ServiceConfig};
 use crate::error::ViaError;
 use crate::providers::SecretProvider;
 use crate::redaction::Redactor;
@@ -21,16 +21,35 @@ pub fn execute(
     let request = RestInvocation::parse(config, args)?;
     let mut redactor = Redactor::new();
     let client = Client::new();
-    let builder = build_authenticated_request(
-        &client,
-        config,
-        service_name,
-        service,
-        provider,
-        &request,
-        &mut redactor,
-    )?;
-    let response = send_rest_request(builder, &request.method, &request.path)?;
+    let builder = {
+        let mut context = RestRequestBuildContext {
+            client: &client,
+            config,
+            service_name,
+            service,
+            provider,
+            redactor: &mut redactor,
+            oauth_token_mode: OAuthTokenMode::Cached,
+        };
+        build_authenticated_request(&mut context, &request)?
+    };
+    let mut response = send_rest_request(builder, &request.method, &request.path)?;
+    if should_retry_with_fresh_oauth(config, response.status) {
+        crate::timing::event("rest oauth retry", "status=401");
+        let builder = {
+            let mut context = RestRequestBuildContext {
+                client: &client,
+                config,
+                service_name,
+                service,
+                provider,
+                redactor: &mut redactor,
+                oauth_token_mode: OAuthTokenMode::Refresh,
+            };
+            build_authenticated_request(&mut context, &request)?
+        };
+        response = send_rest_request(builder, &request.method, &request.path)?;
+    }
     let body = redactor.redact(&response.body);
 
     ensure_success(response.status, &response.headers, &body)?;
@@ -44,46 +63,39 @@ struct RestResponse {
     body: String,
 }
 
+struct RestRequestBuildContext<'a> {
+    client: &'a Client,
+    config: &'a RestCommandConfig,
+    service_name: &'a str,
+    service: &'a ServiceConfig,
+    provider: &'a dyn SecretProvider,
+    redactor: &'a mut Redactor,
+    oauth_token_mode: OAuthTokenMode,
+}
+
 fn build_authenticated_request(
-    client: &Client,
-    config: &RestCommandConfig,
-    service_name: &str,
-    service: &ServiceConfig,
-    provider: &dyn SecretProvider,
+    context: &mut RestRequestBuildContext<'_>,
     request: &RestInvocation,
-    redactor: &mut Redactor,
 ) -> Result<RequestBuilder, ViaError> {
-    let url = build_url(&config.base_url, &request.path, &request.query)?;
-    let builder = client.request(request.method.clone(), url);
-    let builder = with_auth_headers(
-        builder,
-        client,
-        config,
-        service_name,
-        service,
-        provider,
-        redactor,
-    )?;
+    let url = build_url(&context.config.base_url, &request.path, &request.query)?;
+    let builder = context.client.request(request.method.clone(), url);
+    let builder = with_auth_headers(builder, context)?;
     Ok(with_body(builder, request.body.as_deref()))
 }
 
 fn with_auth_headers(
     builder: RequestBuilder,
-    client: &Client,
-    config: &RestCommandConfig,
-    service_name: &str,
-    service: &ServiceConfig,
-    provider: &dyn SecretProvider,
-    redactor: &mut Redactor,
+    context: &mut RestRequestBuildContext<'_>,
 ) -> Result<RequestBuilder, ViaError> {
     let auth_span = crate::timing::span("rest auth headers");
-    let headers = match build_headers(
-        Some(client),
-        config,
-        service_name,
-        service,
-        provider,
-        redactor,
+    let headers = match build_headers_with_oauth_mode(
+        Some(context.client),
+        context.config,
+        context.service_name,
+        context.service,
+        context.provider,
+        context.redactor,
+        context.oauth_token_mode,
     ) {
         Ok(headers) => {
             auth_span.finish("ok");
@@ -132,6 +144,17 @@ fn send_rest_request(
         headers,
         body,
     })
+}
+
+#[derive(Clone, Copy)]
+enum OAuthTokenMode {
+    Cached,
+    Refresh,
+}
+
+fn should_retry_with_fresh_oauth(config: &RestCommandConfig, status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        && matches!(config.auth, Some(AuthConfig::OAuth { .. }))
 }
 
 fn read_response_body(response: reqwest::blocking::Response) -> Result<String, ViaError> {
@@ -268,6 +291,7 @@ fn parse_method(method: &str) -> Result<Method, ViaError> {
         .map_err(|_| ViaError::InvalidArgument(format!("invalid HTTP method `{method}`")))
 }
 
+#[cfg(test)]
 fn build_headers(
     client: Option<&reqwest::blocking::Client>,
     config: &RestCommandConfig,
@@ -276,6 +300,51 @@ fn build_headers(
     provider: &dyn SecretProvider,
     redactor: &mut Redactor,
 ) -> Result<HeaderMap, ViaError> {
+    build_headers_with_oauth_mode(
+        client,
+        config,
+        service_name,
+        service,
+        provider,
+        redactor,
+        OAuthTokenMode::Cached,
+    )
+}
+
+fn build_headers_with_oauth_mode(
+    client: Option<&reqwest::blocking::Client>,
+    config: &RestCommandConfig,
+    service_name: &str,
+    service: &ServiceConfig,
+    provider: &dyn SecretProvider,
+    redactor: &mut Redactor,
+    oauth_token_mode: OAuthTokenMode,
+) -> Result<HeaderMap, ViaError> {
+    let mut headers = build_static_headers(config)?;
+    let mut auth_context = AuthHeaderContext {
+        client,
+        config,
+        service_name,
+        service,
+        provider,
+        redactor,
+        oauth_token_mode,
+    };
+    apply_auth_headers(&mut headers, &mut auth_context)?;
+    Ok(headers)
+}
+
+struct AuthHeaderContext<'a> {
+    client: Option<&'a reqwest::blocking::Client>,
+    config: &'a RestCommandConfig,
+    service_name: &'a str,
+    service: &'a ServiceConfig,
+    provider: &'a dyn SecretProvider,
+    redactor: &'a mut Redactor,
+    oauth_token_mode: OAuthTokenMode,
+}
+
+fn build_static_headers(config: &RestCommandConfig) -> Result<HeaderMap, ViaError> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static("via-cli"));
     for (name, value) in &config.headers {
@@ -287,58 +356,131 @@ fn build_headers(
         );
     }
 
-    match &config.auth {
+    Ok(headers)
+}
+
+fn apply_auth_headers(
+    headers: &mut HeaderMap,
+    context: &mut AuthHeaderContext<'_>,
+) -> Result<(), ViaError> {
+    match &context.config.auth {
         Some(AuthConfig::Bearer { secret }) => {
-            let secret = resolve_service_secret(service_name, service, provider, secret)?;
-            redactor.add(secret.expose());
-            insert_bearer_header(&mut headers, secret.expose(), "invalid bearer token")?;
+            apply_bearer_auth(headers, context, secret)?;
         }
         Some(AuthConfig::Headers {
             headers: secret_headers,
         }) => {
-            for (name, secret_header) in secret_headers {
-                let secret =
-                    resolve_service_secret(service_name, service, provider, &secret_header.secret)?;
-                redactor.add(secret.expose());
-                let value = format!(
-                    "{}{}{}",
-                    secret_header.prefix,
-                    secret.expose(),
-                    secret_header.suffix
-                );
-                headers.insert(
-                    HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-                        ViaError::InvalidConfig(format!("invalid header name `{name}`"))
-                    })?,
-                    HeaderValue::from_str(&value).map_err(|_| {
-                        ViaError::InvalidConfig(format!("invalid secret header value `{name}`"))
-                    })?,
-                );
-            }
+            apply_secret_headers(headers, context, secret_headers)?;
         }
         Some(auth @ AuthConfig::GitHubApp { .. }) => {
-            let (credential, private_key) =
-                resolve_github_app_secrets(service_name, service, provider, auth)?;
-            let client = client.ok_or_else(|| {
-                ViaError::InvalidConfig("github_app auth requires an HTTP client".to_owned())
-            })?;
-            let token = crate::auth::github_app::installation_access_token(
-                client,
-                &config.base_url,
-                &credential,
-                private_key.as_ref(),
-                redactor,
-            )?;
-            insert_bearer_header(
-                &mut headers,
-                &token,
-                "invalid GitHub App installation token",
-            )?;
+            apply_github_app_auth(headers, context, auth)?;
+        }
+        Some(AuthConfig::OAuth { credential }) => {
+            apply_oauth_auth(headers, context, credential)?;
         }
         None => {}
     }
 
-    Ok(headers)
+    Ok(())
+}
+
+fn apply_bearer_auth(
+    headers: &mut HeaderMap,
+    context: &mut AuthHeaderContext<'_>,
+    secret: &str,
+) -> Result<(), ViaError> {
+    let secret = resolve_service_secret(
+        context.service_name,
+        context.service,
+        context.provider,
+        secret,
+    )?;
+    context.redactor.add(secret.expose());
+    insert_bearer_header(headers, secret.expose(), "invalid bearer token")
+}
+
+fn apply_secret_headers(
+    headers: &mut HeaderMap,
+    context: &mut AuthHeaderContext<'_>,
+    secret_headers: &std::collections::BTreeMap<String, SecretHeaderConfig>,
+) -> Result<(), ViaError> {
+    for (name, secret_header) in secret_headers {
+        apply_secret_header(headers, context, name, secret_header)?;
+    }
+    Ok(())
+}
+
+fn apply_secret_header(
+    headers: &mut HeaderMap,
+    context: &mut AuthHeaderContext<'_>,
+    name: &str,
+    secret_header: &SecretHeaderConfig,
+) -> Result<(), ViaError> {
+    let secret = resolve_service_secret(
+        context.service_name,
+        context.service,
+        context.provider,
+        &secret_header.secret,
+    )?;
+    context.redactor.add(secret.expose());
+    let value = format!(
+        "{}{}{}",
+        secret_header.prefix,
+        secret.expose(),
+        secret_header.suffix
+    );
+    headers.insert(
+        HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| ViaError::InvalidConfig(format!("invalid header name `{name}`")))?,
+        HeaderValue::from_str(&value).map_err(|_| {
+            ViaError::InvalidConfig(format!("invalid secret header value `{name}`"))
+        })?,
+    );
+    Ok(())
+}
+
+fn apply_github_app_auth(
+    headers: &mut HeaderMap,
+    context: &mut AuthHeaderContext<'_>,
+    auth: &AuthConfig,
+) -> Result<(), ViaError> {
+    let (credential, private_key) = resolve_github_app_secrets(
+        context.service_name,
+        context.service,
+        context.provider,
+        auth,
+    )?;
+    let client = context.client.ok_or_else(|| {
+        ViaError::InvalidConfig("github_app auth requires an HTTP client".to_owned())
+    })?;
+    let token = crate::auth::github_app::installation_access_token(
+        client,
+        &context.config.base_url,
+        &credential,
+        private_key.as_ref(),
+        context.redactor,
+    )?;
+    insert_bearer_header(headers, &token, "invalid GitHub App installation token")
+}
+
+fn apply_oauth_auth(
+    headers: &mut HeaderMap,
+    context: &mut AuthHeaderContext<'_>,
+    credential: &str,
+) -> Result<(), ViaError> {
+    let credential = resolve_service_secret(
+        context.service_name,
+        context.service,
+        context.provider,
+        credential,
+    )?;
+    let token = match context.oauth_token_mode {
+        OAuthTokenMode::Cached => crate::auth::oauth::access_token(&credential, context.redactor)?,
+        OAuthTokenMode::Refresh => {
+            crate::auth::oauth::refresh_access_token(&credential, context.redactor)?
+        }
+    };
+    insert_bearer_header(headers, &token, "invalid OAuth access token")
 }
 
 fn resolve_github_app_secrets(
@@ -589,6 +731,34 @@ Accept = "application/vnd.github+json"
     }
 
     #[test]
+    fn retries_oauth_requests_after_unauthorized_response() {
+        let config: RestCommandConfig = toml::from_str(
+            r#"
+base_url = "https://api.linear.app"
+
+[auth]
+type = "oauth"
+credential = "oauth"
+"#,
+        )
+        .unwrap();
+        let bearer_config = rest_config();
+
+        assert!(should_retry_with_fresh_oauth(
+            &config,
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!should_retry_with_fresh_oauth(
+            &config,
+            reqwest::StatusCode::FORBIDDEN
+        ));
+        assert!(!should_retry_with_fresh_oauth(
+            &bearer_config,
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+    }
+
+    #[test]
     fn reads_inline_body_arg() {
         assert_eq!(read_body_arg("{\"ok\":true}").unwrap(), "{\"ok\":true}");
     }
@@ -611,6 +781,7 @@ Accept = "application/vnd.github+json"
 
         let service = ServiceConfig {
             description: None,
+            hint: None,
             provider: "onepassword".to_owned(),
             secrets: BTreeMap::from([("token".to_owned(), "op://Private/GitHub/token".to_owned())]),
             commands: BTreeMap::<String, CommandConfig>::new(),
@@ -667,6 +838,7 @@ secret = "tenant"
         .unwrap();
         let service = ServiceConfig {
             description: None,
+            hint: None,
             provider: "onepassword".to_owned(),
             secrets: BTreeMap::from([
                 ("api_key".to_owned(), "op://Private/API/key".to_owned()),
@@ -683,6 +855,132 @@ secret = "tenant"
         assert_eq!(
             redactor.redact("api-key tenant-id"),
             "[REDACTED] [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn oauth_auth_validates_credential_before_daemon_request() {
+        struct FakeProvider;
+
+        impl SecretProvider for FakeProvider {
+            fn resolve(&self, reference: &str) -> Result<SecretValue, ViaError> {
+                assert_eq!(reference, "op://Private/Linear/oauth");
+                Ok(SecretValue::new(
+                    serde_json::json!({
+                        "type": "wrong_oauth",
+                        "token_url": "https://api.linear.app/oauth/token",
+                        "grant_type": "refresh_token",
+                        "client_id": "client-id",
+                        "refresh_token": "refresh-token",
+                    })
+                    .to_string(),
+                ))
+            }
+        }
+
+        use std::collections::BTreeMap;
+
+        use crate::config::CommandConfig;
+        use crate::secrets::SecretValue;
+
+        let config: RestCommandConfig = toml::from_str(
+            r#"
+base_url = "https://api.linear.app"
+
+[auth]
+type = "oauth"
+credential = "oauth"
+"#,
+        )
+        .unwrap();
+        let service = ServiceConfig {
+            description: None,
+            hint: None,
+            provider: "onepassword".to_owned(),
+            secrets: BTreeMap::from([("oauth".to_owned(), "op://Private/Linear/oauth".to_owned())]),
+            commands: BTreeMap::<String, CommandConfig>::new(),
+        };
+        let mut redactor = Redactor::new();
+        let error = build_headers(
+            None,
+            &config,
+            "linear",
+            &service,
+            &FakeProvider,
+            &mut redactor,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ViaError::InvalidConfig(message) if message.contains("unsupported oauth credential type"))
+        );
+    }
+
+    #[test]
+    fn github_app_auth_requires_http_client() {
+        struct FakeProvider;
+
+        impl SecretProvider for FakeProvider {
+            fn resolve(&self, reference: &str) -> Result<SecretValue, ViaError> {
+                match reference {
+                    "op://Private/GitHub/app" => Ok(SecretValue::new(
+                        serde_json::json!({
+                            "type": "github_app",
+                            "app_id": 42,
+                            "installation_id": 123,
+                        })
+                        .to_string(),
+                    )),
+                    "op://Private/GitHub/private_key" => {
+                        Ok(SecretValue::new("private-key".to_owned()))
+                    }
+                    other => panic!("unexpected secret reference {other}"),
+                }
+            }
+        }
+
+        use std::collections::BTreeMap;
+
+        use crate::config::CommandConfig;
+        use crate::secrets::SecretValue;
+
+        let config: RestCommandConfig = toml::from_str(
+            r#"
+base_url = "https://api.github.com"
+
+[auth]
+type = "github_app"
+credential = "app"
+private_key = "private_key"
+"#,
+        )
+        .unwrap();
+        let service = ServiceConfig {
+            description: None,
+            hint: None,
+            provider: "onepassword".to_owned(),
+            secrets: BTreeMap::from([
+                ("app".to_owned(), "op://Private/GitHub/app".to_owned()),
+                (
+                    "private_key".to_owned(),
+                    "op://Private/GitHub/private_key".to_owned(),
+                ),
+            ]),
+            commands: BTreeMap::<String, CommandConfig>::new(),
+        };
+        let mut redactor = Redactor::new();
+        let error = build_headers(
+            None,
+            &config,
+            "github",
+            &service,
+            &FakeProvider,
+            &mut redactor,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ViaError::InvalidConfig(message) if message.contains("HTTP client"))
         );
     }
 }

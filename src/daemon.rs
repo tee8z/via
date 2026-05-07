@@ -4,6 +4,13 @@ pub struct AllowedOnePasswordRef {
     pub reference: String,
 }
 
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthTokenMode {
+    Cached,
+    Refresh,
+}
+
 #[cfg(unix)]
 mod imp {
     use std::collections::HashMap;
@@ -23,9 +30,11 @@ mod imp {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use reqwest::blocking::Client;
     use serde::{Deserialize, Serialize};
 
     use crate::error::ViaError;
+    use crate::redaction::Redactor;
     use crate::secrets::SecretValue;
 
     const CONNECT_WAIT: Duration = Duration::from_secs(2);
@@ -89,6 +98,44 @@ mod imp {
                 "failed to register 1Password references",
             ))
         }
+    }
+
+    pub fn oauth_access_token(
+        credential: &str,
+        mode: super::OAuthTokenMode,
+    ) -> Result<SecretValue, ViaError> {
+        let span = crate::timing::span("oauth daemon access token");
+        let response = match request_with_autostart(DaemonRequest::OAuthAccessToken {
+            credential: credential.to_owned(),
+            mode,
+        }) {
+            Ok(response) => response,
+            Err(error) => {
+                span.finish("failed");
+                return Err(error);
+            }
+        };
+        span.finish(format!(
+            "cache={}",
+            response.cache.as_deref().unwrap_or("unknown")
+        ));
+
+        oauth_access_token_from_response(response)
+    }
+
+    fn oauth_access_token_from_response(
+        response: ClientDaemonResponse,
+    ) -> Result<SecretValue, ViaError> {
+        if response.ok {
+            return response.value.ok_or_else(|| {
+                ViaError::InvalidConfig("daemon returned no OAuth access token".to_owned())
+            });
+        }
+
+        Err(daemon_response_error(
+            response,
+            "failed to resolve OAuth access token",
+        ))
     }
 
     pub fn serve() -> Result<(), ViaError> {
@@ -207,7 +254,7 @@ mod imp {
 
     fn print_status(response: &ClientDaemonResponse) {
         println!("via daemon: running");
-        println!("cached secrets: {}", response.entries.unwrap_or(0));
+        println!("cached entries: {}", response.entries.unwrap_or(0));
     }
 
     fn daemon_response_error(response: ClientDaemonResponse, fallback: &str) -> ViaError {
@@ -343,14 +390,24 @@ mod imp {
             ref_id: String,
             ttl_seconds: u64,
         },
+        OAuthAccessToken {
+            credential: String,
+            #[serde(default = "default_oauth_token_mode")]
+            mode: super::OAuthTokenMode,
+        },
         Clear,
         Status,
         Stop,
     }
 
+    fn default_oauth_token_mode() -> super::OAuthTokenMode {
+        super::OAuthTokenMode::Cached
+    }
+
     #[derive(Default)]
     struct DaemonState {
         cache: HashMap<SecretCacheKey, SecretCacheEntry>,
+        oauth_cache: HashMap<String, crate::auth::oauth::CachedOAuthToken>,
         registrations: HashMap<String, RegisteredConfig>,
     }
 
@@ -369,14 +426,18 @@ mod imp {
                     ref_id,
                     ttl_seconds,
                 } => self.resolve(config_hash, ref_id, ttl_seconds),
+                DaemonRequest::OAuthAccessToken { credential, mode } => {
+                    self.oauth_access_token(&credential, mode)
+                }
                 DaemonRequest::Clear => {
                     self.cache.clear();
+                    self.oauth_cache.clear();
                     self.registrations.clear();
                     DaemonResponseInternal::ok()
                 }
                 DaemonRequest::Status => {
                     let mut response = DaemonResponseInternal::ok();
-                    response.entries = Some(self.cache.len());
+                    response.entries = Some(self.cache.len() + self.oauth_cache.len());
                     response
                 }
                 DaemonRequest::Stop => {
@@ -457,9 +518,72 @@ mod imp {
             })
         }
 
+        fn oauth_access_token(
+            &mut self,
+            credential: &str,
+            mode: super::OAuthTokenMode,
+        ) -> DaemonResponseInternal {
+            let bundle = match crate::auth::oauth::CredentialBundle::parse(credential) {
+                Ok(bundle) => bundle,
+                Err(error) => return DaemonResponseInternal::error(error.to_string()),
+            };
+            let key = crate::auth::oauth::cache_key(&bundle);
+            let now = match crate::auth::oauth::unix_timestamp() {
+                Ok(now) => now,
+                Err(error) => return DaemonResponseInternal::error(error.to_string()),
+            };
+
+            if matches!(mode, super::OAuthTokenMode::Cached) {
+                if let Some(access_token) =
+                    crate::auth::oauth::cached_access_token(self.oauth_cache.get(&key), now)
+                {
+                    let mut response = DaemonResponseInternal::ok();
+                    response.value = Some(SecretValue::new(access_token));
+                    response.cache = Some("hit".to_owned());
+                    return response;
+                }
+            }
+
+            let cached = self.oauth_cache.get(&key).cloned();
+            let mut redactor = Redactor::new();
+            redactor.add(credential);
+            crate::auth::oauth::register_bundle_secrets(&bundle, &mut redactor);
+            crate::auth::oauth::register_cached_secrets(cached.as_ref(), &mut redactor);
+
+            let client = Client::new();
+            match crate::auth::oauth::exchange_access_token(
+                &client,
+                &bundle,
+                cached.as_ref(),
+                &mut redactor,
+            ) {
+                Ok(token) => {
+                    self.oauth_cache.insert(
+                        key,
+                        crate::auth::oauth::CachedOAuthToken {
+                            access_token: token.access_token.clone(),
+                            expires_at: token.expires_at,
+                            refresh_token: token.refresh_token.clone(),
+                        },
+                    );
+                    let mut response = DaemonResponseInternal::ok();
+                    response.value = Some(SecretValue::new(token.access_token));
+                    response.cache = Some("miss".to_owned());
+                    response
+                }
+                Err(error) => DaemonResponseInternal::error(redactor.redact(&error.to_string())),
+            }
+        }
+
         fn prune_expired(&mut self) {
             let now = Instant::now();
             self.cache.retain(|_, entry| entry.expires_at > now);
+            if let Ok(now) = crate::auth::oauth::unix_timestamp() {
+                self.oauth_cache.retain(|_, entry| {
+                    entry.refresh_token.is_some()
+                        || crate::auth::oauth::cached_access_token(Some(entry), now).is_some()
+                });
+            }
         }
     }
 
@@ -822,6 +946,9 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
 
         #[test]
         fn rejects_unregistered_resolve_request() {
@@ -932,7 +1059,145 @@ mod imp {
 
             assert!(!response.ok);
             assert!(state.cache.is_empty());
+            assert!(state.oauth_cache.is_empty());
             assert!(state.registrations.is_empty());
+        }
+
+        #[test]
+        fn oauth_access_token_is_cached_in_daemon_memory() {
+            let response_body = serde_json::json!({
+                "access_token": "fresh-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "rotated-refresh-token",
+            })
+            .to_string();
+            let (token_url, server) = token_server(response_body);
+            let mut state = DaemonState::default();
+            let credential = serde_json::json!({
+                "type": "service_oauth",
+                "token_url": token_url,
+                "grant_type": "refresh_token",
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "refresh_token": "configured-refresh-token",
+            })
+            .to_string();
+
+            let response = state.handle(DaemonRequest::OAuthAccessToken {
+                credential: credential.clone(),
+                mode: crate::daemon::OAuthTokenMode::Cached,
+            });
+            let request = server.join().unwrap();
+            let cached_response = state.handle(DaemonRequest::OAuthAccessToken {
+                credential,
+                mode: crate::daemon::OAuthTokenMode::Cached,
+            });
+
+            assert!(response.ok);
+            assert_eq!(response.cache.as_deref(), Some("miss"));
+            assert_eq!(
+                response.value.as_ref().map(SecretValue::expose),
+                Some("fresh-access-token")
+            );
+            assert!(request.contains("grant_type=refresh_token"));
+            assert!(request.contains("refresh_token=configured-refresh-token"));
+            assert_eq!(state.oauth_cache.len(), 1);
+            assert!(cached_response.ok);
+            assert_eq!(cached_response.cache.as_deref(), Some("hit"));
+            assert_eq!(
+                cached_response.value.as_ref().map(SecretValue::expose),
+                Some("fresh-access-token")
+            );
+        }
+
+        #[test]
+        fn oauth_access_token_refresh_mode_skips_unexpired_cache() {
+            let response_body = serde_json::json!({
+                "access_token": "fresh-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })
+            .to_string();
+            let (token_url, server) = token_server(response_body);
+            let mut state = DaemonState::default();
+            let credential = serde_json::json!({
+                "type": "service_oauth",
+                "token_url": token_url,
+                "grant_type": "client_credentials",
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "scope": "read,issues:create",
+            })
+            .to_string();
+            let bundle = crate::auth::oauth::CredentialBundle::parse(&credential).unwrap();
+            state.oauth_cache.insert(
+                crate::auth::oauth::cache_key(&bundle),
+                crate::auth::oauth::CachedOAuthToken {
+                    access_token: "cached-access-token".to_owned(),
+                    expires_at: crate::auth::oauth::unix_timestamp().unwrap() + 3_600,
+                    refresh_token: None,
+                },
+            );
+
+            let response = state.handle(DaemonRequest::OAuthAccessToken {
+                credential,
+                mode: crate::daemon::OAuthTokenMode::Refresh,
+            });
+            let request = server.join().unwrap();
+
+            assert!(response.ok);
+            assert_eq!(response.cache.as_deref(), Some("miss"));
+            assert_eq!(
+                response.value.as_ref().map(SecretValue::expose),
+                Some("fresh-access-token")
+            );
+            assert!(request.contains("grant_type=client_credentials"));
+        }
+
+        #[test]
+        fn prune_expired_keeps_rotated_oauth_refresh_tokens() {
+            let mut state = DaemonState::default();
+            state.oauth_cache.insert(
+                "oauth".to_owned(),
+                crate::auth::oauth::CachedOAuthToken {
+                    access_token: "expired-access-token".to_owned(),
+                    expires_at: 0,
+                    refresh_token: Some("rotated-refresh-token".to_owned()),
+                },
+            );
+
+            state.prune_expired();
+
+            assert_eq!(state.oauth_cache.len(), 1);
+            assert_eq!(
+                state
+                    .oauth_cache
+                    .values()
+                    .next()
+                    .and_then(|entry| entry.refresh_token.as_deref()),
+                Some("rotated-refresh-token")
+            );
+        }
+
+        fn token_server(response_body: String) -> (String, thread::JoinHandle<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let handle = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 8192];
+                let read = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                request
+            });
+
+            (format!("http://{address}/oauth/token"), handle)
         }
     }
 }
@@ -962,6 +1227,16 @@ mod imp {
         ))
     }
 
+    pub fn oauth_access_token(
+        _credential: &str,
+        _mode: super::OAuthTokenMode,
+    ) -> Result<SecretValue, ViaError> {
+        Err(ViaError::InvalidConfig(
+            "OAuth auth requires the via daemon, which is only supported on Unix-like platforms"
+                .to_owned(),
+        ))
+    }
+
     pub fn serve() -> Result<(), ViaError> {
         Err(ViaError::InvalidConfig(
             "via daemon cache is only supported on Unix-like platforms".to_owned(),
@@ -984,4 +1259,7 @@ mod imp {
     }
 }
 
-pub use imp::{clear, register_onepassword_refs, resolve_onepassword_secret, serve, status, stop};
+pub use imp::{
+    clear, oauth_access_token, register_onepassword_refs, resolve_onepassword_secret, serve,
+    status, stop,
+};
