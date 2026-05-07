@@ -781,6 +781,7 @@ credential = "oauth"
 
         let service = ServiceConfig {
             description: None,
+            hint: None,
             provider: "onepassword".to_owned(),
             secrets: BTreeMap::from([("token".to_owned(), "op://Private/GitHub/token".to_owned())]),
             commands: BTreeMap::<String, CommandConfig>::new(),
@@ -837,6 +838,7 @@ secret = "tenant"
         .unwrap();
         let service = ServiceConfig {
             description: None,
+            hint: None,
             provider: "onepassword".to_owned(),
             secrets: BTreeMap::from([
                 ("api_key".to_owned(), "op://Private/API/key".to_owned()),
@@ -893,6 +895,7 @@ credential = "oauth"
         .unwrap();
         let service = ServiceConfig {
             description: None,
+            hint: None,
             provider: "onepassword".to_owned(),
             secrets: BTreeMap::from([("oauth".to_owned(), "op://Private/Linear/oauth".to_owned())]),
             commands: BTreeMap::<String, CommandConfig>::new(),
@@ -954,6 +957,7 @@ private_key = "private_key"
         .unwrap();
         let service = ServiceConfig {
             description: None,
+            hint: None,
             provider: "onepassword".to_owned(),
             secrets: BTreeMap::from([
                 ("app".to_owned(), "op://Private/GitHub/app".to_owned()),

@@ -81,6 +81,7 @@ fn write_config(path: &Path, contents: &str) -> Result<(), ViaError> {
 
 struct ServiceSetup {
     service_name: String,
+    hint: String,
     secret_name: String,
     secret_reference: String,
     private_key_secret_name: Option<String>,
@@ -111,6 +112,7 @@ struct DelegatedSetup {
 
 fn prompt_service_setup() -> Result<ServiceSetup, ViaError> {
     let service_name = prompt_required("Service name", None)?;
+    let hint = prompt_optional("Example command hint")?;
     let secret_name = prompt_required("Secret name in via config", Some("token"))?;
     let secret_reference = prompt_secret_reference()?;
     let mode = prompt_service_mode()?;
@@ -121,6 +123,7 @@ fn prompt_service_setup() -> Result<ServiceSetup, ViaError> {
 
     Ok(ServiceSetup {
         service_name,
+        hint,
         secret_name,
         secret_reference,
         private_key_secret_name,
@@ -322,6 +325,9 @@ fn build_service_config(setup: ServiceSetup) -> String {
         "description = {}\n",
         toml_string(&format!("{} access", setup.service_name))
     ));
+    if !setup.hint.is_empty() {
+        output.push_str(&format!("hint = {}\n", toml_string(&setup.hint)));
+    }
     output.push_str("provider = \"onepassword\"\n\n");
     output.push_str(&format!(
         "[services.{}.secrets]\n",
@@ -478,6 +484,7 @@ mod tests {
     fn builds_generic_rest_config() {
         let config = build_service_config(ServiceSetup {
             service_name: "gitlab".to_owned(),
+            hint: "via gitlab api /projects".to_owned(),
             secret_name: "token".to_owned(),
             secret_reference: "op://Private/GitLab/token".to_owned(),
             private_key_secret_name: None,
@@ -492,6 +499,7 @@ mod tests {
         });
 
         assert!(config.contains("[services.\"gitlab\"]"));
+        assert!(config.contains("hint = \"via gitlab api /projects\""));
         assert!(config.contains("cache = \"daemon\""));
         assert!(config.contains("base_url = \"https://gitlab.example.com/api/v4\""));
         assert!(Config::from_toml_str(&config).is_ok());
@@ -501,6 +509,7 @@ mod tests {
     fn builds_github_app_rest_config() {
         let config = build_service_config(ServiceSetup {
             service_name: "github".to_owned(),
+            hint: String::new(),
             secret_name: "app".to_owned(),
             secret_reference: "op://Private/Example GitHub App/metadata".to_owned(),
             private_key_secret_name: Some("private_key".to_owned()),
@@ -527,6 +536,8 @@ mod tests {
     fn builds_oauth_rest_config() {
         let config = build_service_config(ServiceSetup {
             service_name: "linear".to_owned(),
+            hint: "via linear api POST /graphql --json '{\"query\":\"{ viewer { id name } }\"}'"
+                .to_owned(),
             secret_name: "oauth".to_owned(),
             secret_reference: "op://Private/Linear/oauth".to_owned(),
             private_key_secret_name: None,
@@ -541,6 +552,9 @@ mod tests {
         });
 
         assert!(config.contains("type = \"oauth\""));
+        assert!(config.contains(
+            "hint = \"via linear api POST /graphql --json '{\\\"query\\\":\\\"{ viewer { id name } }\\\"}'\""
+        ));
         assert!(config.contains("credential = \"oauth\""));
         assert!(Config::from_toml_str(&config).is_ok());
     }
@@ -566,6 +580,7 @@ mod tests {
     fn builds_generic_delegated_config() {
         let config = build_service_config(ServiceSetup {
             service_name: "deploy tool".to_owned(),
+            hint: String::new(),
             secret_name: "api token".to_owned(),
             secret_reference: "op://Private/Deploy/token".to_owned(),
             private_key_secret_name: None,

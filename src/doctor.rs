@@ -410,7 +410,10 @@ fn check_onepassword_provider(
 fn print_onepassword_cache(cache: OnePasswordCacheMode, cache_ttl_seconds: u64) {
     match cache {
         OnePasswordCacheMode::Daemon => {
-            println!("  cache: daemon enabled (ttl {cache_ttl_seconds}s)")
+            println!("  cache: daemon enabled (ttl {cache_ttl_seconds}s)");
+            println!(
+                "  config reload: automatic on each via invocation; use `via daemon clear` to drop cached secret and OAuth state"
+            );
         }
         OnePasswordCacheMode::Off => println!("  cache: off"),
     }

@@ -1,6 +1,6 @@
 # Linear OAuth App-Actor Setup
 
-This guide configures Linear OAuth for a via REST capability. The local via config contains no secret values: it points to one 1Password field that stores the OAuth client and token material.
+This guide configures Linear OAuth for a via capability. The local via config contains no secret values: it points to one 1Password field that stores the OAuth client and token material.
 
 via uses Linear's REST OAuth token endpoint:
 
@@ -10,6 +10,8 @@ Content-Type: application/x-www-form-urlencoded
 ```
 
 via does not use GraphQL for OAuth token minting or refresh.
+
+Linear's documented public workspace API is GraphQL. via still models the Linear command as `mode = "rest"` because it sends plain HTTP requests, but normal Linear operations are expected to call `POST /graphql`. The REST-only requirement here applies to OAuth token minting and refresh, not to Linear's workspace API shape.
 
 ## 1. Create The Linear OAuth App
 
@@ -34,7 +36,7 @@ Create a 1Password item in the vault you want via to read from, for example:
 
 ```text
 Vault: Private
-Item: Linear OAuth
+Item: Example Linear OAuth
 Field: credential
 ```
 
@@ -54,7 +56,7 @@ Store JSON like:
 The 1Password reference should look like:
 
 ```text
-op://Private/Linear OAuth/credential
+op://Private/Example Linear OAuth/credential
 ```
 
 This setup does not store or require a refresh token. via asks the daemon to mint an access token from the Linear REST `/oauth/token` endpoint, then keeps that access token only in daemon memory until it expires or the daemon exits. If the daemon loses the token, via can mint another one from the same 1Password client credentials without touching Linear setup again.
@@ -91,10 +93,11 @@ cache = "daemon"
 
 [services.linear]
 description = "Linear app-actor API access through OAuth"
+hint = "via linear api POST /graphql --json '{\"query\":\"{ viewer { id name } }\"}'"
 provider = "onepassword"
 
 [services.linear.secrets]
-oauth = "op://Private/Linear OAuth/credential"
+oauth = "op://Private/Example Linear OAuth/credential"
 
 [services.linear.commands.api]
 description = "Call configured Linear API endpoints with an app-actor OAuth bearer token."
@@ -122,5 +125,13 @@ via login
 via config doctor linear
 via capabilities
 ```
+
+Then make a small authenticated Linear API request:
+
+```sh
+via linear api POST /graphql --json '{"query":"{ viewer { id name } }"}'
+```
+
+This verifies that via can read the 1Password credential bundle, mint a Linear `client_credentials` token through the REST `/oauth/token` endpoint, attach it as a bearer token, and have Linear accept it as the app actor.
 
 If doctor reports an invalid OAuth bundle, fix the JSON stored in 1Password. Do not paste OAuth tokens, client secrets, or refresh tokens into terminal output, issue comments, or prompts.

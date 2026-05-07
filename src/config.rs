@@ -41,6 +41,8 @@ pub enum OnePasswordCacheMode {
 pub struct ServiceConfig {
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub hint: Option<String>,
     pub provider: String,
     #[serde(default)]
     pub secrets: BTreeMap<String, String>,
@@ -357,6 +359,7 @@ type = "1password"
 
 [services.github]
 description = "GitHub access"
+hint = "via github api /user"
 provider = "onepassword"
 
 [services.github.secrets]
@@ -386,6 +389,10 @@ secret = "token"
         let config = Config::from_toml_str(VALID).unwrap();
 
         assert_eq!(config.version, 1);
+        assert_eq!(
+            config.services["github"].hint.as_deref(),
+            Some("via github api /user")
+        );
         assert!(config.services["github"].commands.contains_key("api"));
         assert!(config.services["github"].commands.contains_key("gh"));
     }

@@ -29,6 +29,9 @@ pub fn render(config: &Config) -> String {
             Some(description) => output.push_str(&format!("- `{service_name}`: {description}\n")),
             None => output.push_str(&format!("- `{service_name}`\n")),
         }
+        if let Some(hint) = &service.hint {
+            output.push_str(&format!("  - Example: `{hint}`.\n"));
+        }
         for (command_name, command) in &service.commands {
             let usage = match command.mode() {
                 CapabilityMode::Rest => format!("via {service_name} {command_name} <path>"),
@@ -62,6 +65,7 @@ type = "1password"
 
 [services.github]
 description = "GitHub access"
+hint = "via github api /user"
 provider = "onepassword"
 
 [services.github.secrets]
@@ -88,6 +92,7 @@ program = "gh"
         assert!(output.contains("Never ask the user for tokens"));
         assert!(output.contains("Never call the underlying secret provider directly"));
         assert!(output.contains("via login"));
+        assert!(output.contains("Example: `via github api /user`."));
         assert!(output.contains("via github api <path>"));
         assert!(output.contains("via github gh <tool-args...>"));
         assert!(!output.contains("op://Private"));

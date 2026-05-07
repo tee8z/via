@@ -87,6 +87,7 @@ mod tests {
     fn service() -> ServiceConfig {
         ServiceConfig {
             description: None,
+            hint: None,
             provider: "onepassword".to_owned(),
             secrets: BTreeMap::from([("token".to_owned(), "op://Private/GitHub/token".to_owned())]),
             commands: BTreeMap::new(),

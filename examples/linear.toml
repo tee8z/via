@@ -6,10 +6,11 @@ cache = "daemon"
 
 [services.linear]
 description = "Linear app-actor API access through OAuth"
+hint = "via linear api POST /graphql --json '{\"query\":\"{ viewer { id name } }\"}'"
 provider = "onepassword"
 
 [services.linear.secrets]
-oauth = "op://Private/Linear OAuth/credential"
+oauth = "op://Private/Example Linear OAuth/credential"
 
 [services.linear.commands.api]
 description = "Call configured Linear API endpoints with an app-actor OAuth bearer token."

@@ -201,6 +201,7 @@ cache = "daemon"
 
 [services.github]
 description = "GitHub REST API access through a GitHub App installation"
+hint = "via github api /user"
 provider = "onepassword"
 
 [services.github.secrets]
@@ -225,7 +226,11 @@ X-GitHub-Api-Version = "2022-11-28"
 
 REST capabilities accept paths, not arbitrary absolute URLs. The configured `base_url` is the trust boundary for that service.
 
+Service-level `hint` values are optional example commands shown by `via capabilities` and `via skill print`. They should demonstrate a safe, minimal call for the configured service without embedding secrets.
+
 `cache = "daemon"` is the default on macOS and Linux. `via` auto-starts a per-user local daemon that owns `op read` calls and caches resolved 1Password secrets in memory for a short TTL. There is no separate service to install or manage for normal use. Use `via daemon status`, `via daemon clear`, and `via daemon stop` to inspect, clear, or stop it; the next command auto-starts it again. Set `cache = "off"` to always call `op read` directly. See [docs/daemon-architecture.md](docs/daemon-architecture.md) for the daemon flow, commands, and verification steps.
+
+Config changes do not require a daemon reload. Each `via` invocation reads the config file again and registers the current allowed secret references with the daemon. Discovery commands such as `via capabilities` and `via skill print` show config-only changes immediately. If you changed a secret value in 1Password or want to drop cached OAuth/token state, run `via daemon clear`; use `via daemon stop` to restart the daemon completely on the next command.
 
 On Windows, the cache currently defaults to `off` because the daemon needs a named-pipe backend that is not implemented yet. The config shape is already feature-ready: once Windows daemon support exists, `cache = "daemon"` can use the same provider setting.
 
