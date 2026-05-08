@@ -79,14 +79,13 @@ fn build_authenticated_request(
 ) -> Result<RequestBuilder, ViaError> {
     let url = build_url(&context.config.base_url, &request.path, &request.query)?;
     let builder = context.client.request(request.method.clone(), url);
-    let builder = with_auth_headers(builder, context)?;
+    let mut headers = authenticated_headers(context)?;
+    apply_body_content_type(&mut headers, request.body.as_deref());
+    let builder = builder.headers(headers);
     Ok(with_body(builder, request.body.as_deref()))
 }
 
-fn with_auth_headers(
-    builder: RequestBuilder,
-    context: &mut RestRequestBuildContext<'_>,
-) -> Result<RequestBuilder, ViaError> {
+fn authenticated_headers(context: &mut RestRequestBuildContext<'_>) -> Result<HeaderMap, ViaError> {
     let auth_span = crate::timing::span("rest auth headers");
     let headers = match build_headers_with_oauth_mode(
         Some(context.client),
@@ -106,14 +105,18 @@ fn with_auth_headers(
             return Err(error);
         }
     };
-    Ok(builder.headers(headers))
+    Ok(headers)
+}
+
+fn apply_body_content_type(headers: &mut HeaderMap, body: Option<&str>) {
+    if body.is_some() && !headers.contains_key(CONTENT_TYPE) {
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
 }
 
 fn with_body(builder: RequestBuilder, body: Option<&str>) -> RequestBuilder {
     match body {
-        Some(body) => builder
-            .header(CONTENT_TYPE, "application/json")
-            .body(body.to_owned()),
+        Some(body) => builder.body(body.to_owned()),
         None => builder,
     }
 }
@@ -617,6 +620,20 @@ fn read_body_arg(value: &str) -> Result<String, ViaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::thread;
+
+    use crate::config::CommandConfig;
+    use crate::secrets::SecretValue;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const JSON_BODY: &str = r#"{"query":"query { viewer { id } }"}"#;
 
     fn rest_config() -> RestCommandConfig {
         toml::from_str(
@@ -756,6 +773,223 @@ credential = "oauth"
             &bearer_config,
             reqwest::StatusCode::UNAUTHORIZED
         ));
+    }
+
+    #[test]
+    fn sends_json_body_with_default_content_type_header() {
+        crate::tls::install_crypto_provider();
+
+        let (base_url, server) = single_request_server();
+        let config: RestCommandConfig = toml::from_str(&format!(
+            r#"
+base_url = "{base_url}"
+"#
+        ))
+        .unwrap();
+
+        let raw_request = send_json_request(
+            config,
+            service_with_secrets([]),
+            &FakeProvider::empty(),
+            server,
+        );
+
+        assert_json_request_body(&raw_request);
+        assert_single_header(
+            &raw_request,
+            "content-type:",
+            Some("content-type: application/json"),
+        );
+    }
+
+    #[test]
+    fn sends_json_body_with_configured_content_type_without_duplicate() {
+        crate::tls::install_crypto_provider();
+
+        let (base_url, server) = single_request_server();
+        let config: RestCommandConfig = toml::from_str(&format!(
+            r#"
+base_url = "{base_url}"
+
+[headers]
+Content-Type = "application/json"
+"#
+        ))
+        .unwrap();
+
+        let raw_request = send_json_request(
+            config,
+            service_with_secrets([]),
+            &FakeProvider::empty(),
+            server,
+        );
+
+        assert_json_request_body(&raw_request);
+        assert_single_header(
+            &raw_request,
+            "content-type:",
+            Some("content-type: application/json"),
+        );
+    }
+
+    #[test]
+    fn sends_json_body_with_bearer_auth() {
+        crate::tls::install_crypto_provider();
+
+        let (base_url, server) = single_request_server();
+        let config: RestCommandConfig = toml::from_str(&format!(
+            r#"
+base_url = "{base_url}"
+
+[auth]
+type = "bearer"
+secret = "token"
+
+[headers]
+Content-Type = "application/json"
+"#
+        ))
+        .unwrap();
+        let service = service_with_secrets([("token", "op://Private/API/token")]);
+        let provider = FakeProvider::new([("op://Private/API/token", "bearer-token")]);
+
+        let raw_request = send_json_request(config, service, &provider, server);
+
+        assert_json_request_body(&raw_request);
+        assert_single_header(
+            &raw_request,
+            "authorization:",
+            Some("authorization: Bearer bearer-token"),
+        );
+        assert_single_header(
+            &raw_request,
+            "content-type:",
+            Some("content-type: application/json"),
+        );
+    }
+
+    #[test]
+    fn sends_json_body_with_secret_header_auth() {
+        crate::tls::install_crypto_provider();
+
+        let (base_url, server) = single_request_server();
+        let config: RestCommandConfig = toml::from_str(&format!(
+            r#"
+base_url = "{base_url}"
+
+[auth]
+type = "headers"
+
+[auth.headers.Authorization]
+secret = "api_key"
+prefix = "Token "
+
+[headers]
+Content-Type = "application/json"
+"#
+        ))
+        .unwrap();
+        let service = service_with_secrets([("api_key", "op://Private/API/key")]);
+        let provider = FakeProvider::new([("op://Private/API/key", "api-key")]);
+
+        let raw_request = send_json_request(config, service, &provider, server);
+
+        assert_json_request_body(&raw_request);
+        assert_single_header(
+            &raw_request,
+            "authorization:",
+            Some("authorization: Token api-key"),
+        );
+        assert_single_header(
+            &raw_request,
+            "content-type:",
+            Some("content-type: application/json"),
+        );
+    }
+
+    #[test]
+    fn sends_json_body_with_github_app_auth() {
+        crate::tls::install_crypto_provider();
+
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let cache_dir = temp_path("github-app-json-cache");
+        let _cache_env = EnvVarGuard::set("VIA_CACHE_DIR", cache_dir.as_os_str());
+        let (base_url, server) = github_app_request_server();
+        let config: RestCommandConfig = toml::from_str(&format!(
+            r#"
+base_url = "{base_url}"
+
+[auth]
+type = "github_app"
+credential = "app"
+private_key = "private_key"
+
+[headers]
+Content-Type = "application/json"
+"#
+        ))
+        .unwrap();
+        let service = service_with_secrets([
+            ("app", "op://Private/GitHub/app"),
+            ("private_key", "op://Private/GitHub/private_key"),
+        ]);
+        let github_app_metadata = serde_json::json!({
+            "type": "github_app",
+            "app_id": 42,
+            "installation_id": 123,
+        })
+        .to_string();
+        let provider = FakeProvider::new([
+            ("op://Private/GitHub/app", github_app_metadata.as_str()),
+            (
+                "op://Private/GitHub/private_key",
+                include_str!("../../tests/fixtures/rsa-private-key.pkcs1.pem"),
+            ),
+        ]);
+
+        let requests = send_json_request_collecting_all(config, service, &provider, server);
+        let api_request = requests.last().unwrap();
+
+        assert!(requests[0].starts_with("POST /app/installations/123/access_tokens "));
+        assert_json_request_body(api_request);
+        assert_single_header(
+            api_request,
+            "authorization:",
+            Some("authorization: Bearer github-app-token"),
+        );
+        assert_single_header(
+            api_request,
+            "content-type:",
+            Some("content-type: application/json"),
+        );
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn json_content_type_merge_preserves_oauth_authorization_header() {
+        let mut headers = HeaderMap::new();
+        insert_bearer_header(&mut headers, "oauth-access-token", "invalid oauth token").unwrap();
+
+        apply_body_content_type(&mut headers, Some(JSON_BODY));
+
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer oauth-access-token"
+        );
+        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
+    }
+
+    #[test]
+    fn reads_file_body_arg() {
+        let path = temp_path("json-body");
+        std::fs::write(&path, JSON_BODY).unwrap();
+
+        assert_eq!(
+            read_body_arg(&format!("@{}", path.display())).unwrap(),
+            JSON_BODY
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -982,5 +1216,193 @@ private_key = "private_key"
         assert!(
             matches!(error, ViaError::InvalidConfig(message) if message.contains("HTTP client"))
         );
+    }
+
+    struct FakeProvider {
+        values: BTreeMap<String, String>,
+    }
+
+    impl FakeProvider {
+        fn empty() -> Self {
+            Self {
+                values: BTreeMap::new(),
+            }
+        }
+
+        fn new<K, V>(values: impl IntoIterator<Item = (K, V)>) -> Self
+        where
+            K: AsRef<str>,
+            V: AsRef<str>,
+        {
+            Self {
+                values: values
+                    .into_iter()
+                    .map(|(reference, value)| {
+                        (reference.as_ref().to_owned(), value.as_ref().to_owned())
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    impl SecretProvider for FakeProvider {
+        fn resolve(&self, reference: &str) -> Result<SecretValue, ViaError> {
+            self.values
+                .get(reference)
+                .cloned()
+                .map(SecretValue::new)
+                .ok_or_else(|| {
+                    ViaError::InvalidConfig(format!("unexpected secret resolve {reference}"))
+                })
+        }
+    }
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    fn service_with_secrets(
+        secrets: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> ServiceConfig {
+        ServiceConfig {
+            description: None,
+            hint: None,
+            provider: "onepassword".to_owned(),
+            secrets: secrets
+                .into_iter()
+                .map(|(name, reference)| (name.to_owned(), reference.to_owned()))
+                .collect(),
+            commands: BTreeMap::<String, CommandConfig>::new(),
+        }
+    }
+
+    fn json_invocation() -> RestInvocation {
+        RestInvocation {
+            method: Method::POST,
+            path: "/graphql".to_owned(),
+            query: Vec::new(),
+            body: Some(JSON_BODY.to_owned()),
+        }
+    }
+
+    fn send_json_request(
+        config: RestCommandConfig,
+        service: ServiceConfig,
+        provider: &dyn SecretProvider,
+        server: thread::JoinHandle<Vec<String>>,
+    ) -> String {
+        send_json_request_collecting_all(config, service, provider, server)
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    fn send_json_request_collecting_all(
+        config: RestCommandConfig,
+        service: ServiceConfig,
+        provider: &dyn SecretProvider,
+        server: thread::JoinHandle<Vec<String>>,
+    ) -> Vec<String> {
+        let request = json_invocation();
+        let client = Client::new();
+        let mut redactor = Redactor::new();
+        let mut context = RestRequestBuildContext {
+            client: &client,
+            config: &config,
+            service_name: "linear",
+            service: &service,
+            provider,
+            redactor: &mut redactor,
+            oauth_token_mode: OAuthTokenMode::Cached,
+        };
+
+        let builder = build_authenticated_request(&mut context, &request).unwrap();
+        let response = send_rest_request(builder, &request.method, &request.path).unwrap();
+        assert!(response.status.is_success());
+
+        server.join().unwrap()
+    }
+
+    fn single_request_server() -> (String, thread::JoinHandle<Vec<String>>) {
+        request_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_owned(),
+        ])
+    }
+
+    fn github_app_request_server() -> (String, thread::JoinHandle<Vec<String>>) {
+        let token_body = serde_json::json!({
+            "token": "github-app-token",
+            "expires_at": "2099-01-01T00:00:00Z",
+        })
+        .to_string();
+        request_server(vec![
+            format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                token_body.len(),
+                token_body
+            ),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_owned(),
+        ])
+    }
+
+    fn request_server(responses: Vec<String>) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 8192];
+                let read = stream.read(&mut buffer).unwrap();
+                requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
+    fn assert_json_request_body(raw_request: &str) {
+        assert!(raw_request.starts_with("POST /graphql "));
+        assert!(raw_request.contains(JSON_BODY));
+    }
+
+    fn assert_single_header(raw_request: &str, prefix: &str, expected: Option<&str>) {
+        let prefix = prefix.to_ascii_lowercase();
+        let matching_headers = raw_request
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        assert_eq!(matching_headers.len(), 1);
+        if let Some(expected) = expected {
+            assert_eq!(matching_headers[0], expected);
+        }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "via-rest-{name}-{}-{}",
+            std::process::id(),
+            crate::auth::oauth::unix_timestamp().unwrap()
+        ))
     }
 }
