@@ -465,12 +465,34 @@ fn check_onepassword_account(account: Option<&str>, status: &mut DoctorStatus) -
         return true;
     };
 
-    let args = vec!["account".to_owned(), "get".to_owned(), account.to_owned()];
+    let args = vec![
+        "account".to_owned(),
+        "list".to_owned(),
+        "--format".to_owned(),
+        "json".to_owned(),
+    ];
     match run_command("op", &args) {
-        Ok(_) => {
-            println!("  account {account}: configured");
-            true
-        }
+        Ok(output) => match onepassword_account_list_contains(&output.stdout, account) {
+            Ok(true) => {
+                println!("  account {account}: configured");
+                true
+            }
+            Ok(false) => {
+                status.fail();
+                print_onepassword_account_failure(
+                    account,
+                    &ViaError::InvalidConfig(format!(
+                        "1Password account `{account}` was not found in `op account list`"
+                    )),
+                );
+                false
+            }
+            Err(error) => {
+                status.fail();
+                print_onepassword_account_failure(account, &error);
+                false
+            }
+        },
         Err(error) => {
             status.fail();
             print_onepassword_account_failure(account, &error);
@@ -490,6 +512,22 @@ fn print_onepassword_account_failure(account: &str, error: &ViaError) {
     print_agent_guidance(
         "Ask the user to fix the configured 1Password account, then rerun `via config doctor`.",
     );
+}
+
+fn onepassword_account_list_contains(raw: &str, account: &str) -> Result<bool, ViaError> {
+    let accounts: serde_json::Value = serde_json::from_str(raw)?;
+    let Some(accounts) = accounts.as_array() else {
+        return Err(ViaError::InvalidConfig(
+            "`op account list --format json` did not return an array".to_owned(),
+        ));
+    };
+
+    Ok(accounts.iter().any(|entry| {
+        ["url", "email", "user_uuid", "account_uuid", "shorthand"]
+            .iter()
+            .filter_map(|field| entry.get(field).and_then(serde_json::Value::as_str))
+            .any(|value| value == account)
+    }))
 }
 
 fn check_onepassword_authentication(account: Option<&str>, status: &mut DoctorStatus) -> bool {
@@ -782,6 +820,56 @@ base_url = "https://api.example.com"
         let output = run_command("sh", &["-c".to_owned(), "printf 'ready\\n'".to_owned()]).unwrap();
 
         assert_eq!(output.stdout, "ready");
+    }
+
+    #[test]
+    fn onepassword_account_list_matches_supported_identifiers() {
+        let raw = serde_json::json!([
+            {
+                "url": "team-example.1password.com",
+                "email": "austin@example.com",
+                "user_uuid": "Q36L6SJAOFGAHN75XMAJ2OFGNA",
+                "account_uuid": "KSO6WSJFY5BPNLCDOCBQATMOSU",
+                "shorthand": "team-example"
+            }
+        ])
+        .to_string();
+
+        for account in [
+            "team-example.1password.com",
+            "austin@example.com",
+            "Q36L6SJAOFGAHN75XMAJ2OFGNA",
+            "KSO6WSJFY5BPNLCDOCBQATMOSU",
+            "team-example",
+        ] {
+            assert!(onepassword_account_list_contains(&raw, account).unwrap());
+        }
+    }
+
+    #[test]
+    fn onepassword_account_list_rejects_unknown_account() {
+        let raw = serde_json::json!([
+            {
+                "url": "team-example.1password.com",
+                "email": "austin@example.com"
+            }
+        ])
+        .to_string();
+
+        assert!(!onepassword_account_list_contains(&raw, "example.1password.com").unwrap());
+    }
+
+    #[test]
+    fn onepassword_account_list_rejects_non_array_json() {
+        let raw = serde_json::json!({
+            "url": "team-example.1password.com"
+        })
+        .to_string();
+
+        assert!(matches!(
+            onepassword_account_list_contains(&raw, "team-example.1password.com"),
+            Err(ViaError::InvalidConfig(_))
+        ));
     }
 
     #[test]
