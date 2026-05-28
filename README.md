@@ -277,6 +277,26 @@ OAuth credential bundles use `type = "service_oauth"`, the service's REST OAuth 
 
 via asks the local daemon to mint OAuth access tokens through the provider's REST token endpoint, keeps access tokens and refresh-token state only in daemon memory while the daemon is running, and sends API requests with a bearer token. Nothing from the OAuth token exchange is written to disk. Use `refresh_token` only for services that need user-actor OAuth and cannot issue bot/app credentials. See [docs/linear-oauth-setup.md](docs/linear-oauth-setup.md) for the Linear app-actor setup flow.
 
+For bearer-token APIs such as Grafana service account tokens, use one service per environment:
+
+```toml
+[services.grafana-staging.secrets]
+token = "op://Private/Example Grafana Staging/service-account-token"
+
+[services.grafana-staging.commands.api.auth]
+type = "bearer"
+secret = "token"
+
+[services.grafana-prod.secrets]
+token = "op://Private/Example Grafana Prod/service-account-token"
+
+[services.grafana-prod.commands.api.auth]
+type = "bearer"
+secret = "token"
+```
+
+See [docs/grafana-service-account-setup.md](docs/grafana-service-account-setup.md) for a Grafana setup flow, including querying Loki and PostgreSQL data sources through Grafana's `/api/ds/query` endpoint.
+
 For APIs that need one or more secret-backed headers:
 
 ```toml
