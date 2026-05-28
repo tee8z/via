@@ -1,0 +1,47 @@
+version = 1
+
+[providers.onepassword]
+type = "1password"
+cache = "daemon"
+
+[services.grafana-staging]
+description = "Staging Grafana HTTP API access through a service account token"
+hint = "via grafana-staging api /api/org"
+provider = "onepassword"
+
+[services.grafana-staging.secrets]
+token = "op://Private/Example Grafana Staging/service-account-token"
+
+[services.grafana-staging.commands.api]
+description = "Call the staging Grafana HTTP API with a service account token."
+mode = "rest"
+base_url = "https://staging.grafana.example.com"
+method_default = "GET"
+
+[services.grafana-staging.commands.api.auth]
+type = "bearer"
+secret = "token"
+
+[services.grafana-staging.commands.api.headers]
+Accept = "application/json"
+
+[services.grafana-prod]
+description = "Production Grafana HTTP API access through a service account token"
+hint = "via grafana-prod api /api/org"
+provider = "onepassword"
+
+[services.grafana-prod.secrets]
+token = "op://Private/Example Grafana Prod/service-account-token"
+
+[services.grafana-prod.commands.api]
+description = "Call the production Grafana HTTP API with a service account token."
+mode = "rest"
+base_url = "https://grafana.example.com"
+method_default = "GET"
+
+[services.grafana-prod.commands.api.auth]
+type = "bearer"
+secret = "token"
+
+[services.grafana-prod.commands.api.headers]
+Accept = "application/json"
