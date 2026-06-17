@@ -25,8 +25,9 @@ mod imp {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::{Command, Output, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -37,7 +38,7 @@ mod imp {
     use crate::redaction::Redactor;
     use crate::secrets::SecretValue;
 
-    const CONNECT_WAIT: Duration = Duration::from_secs(2);
+    const CONNECT_WAIT: Duration = Duration::from_secs(5);
     const CONNECT_POLL: Duration = Duration::from_millis(50);
     const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
@@ -299,6 +300,55 @@ mod imp {
 
     fn start_daemon() -> Result<(), ViaError> {
         let exe = env::current_exe()?;
+        let path = socket_path()?;
+        let mut attempts = Vec::new();
+
+        match start_daemon_with_service_manager(&exe, &path) {
+            Ok(()) if wait_for_daemon(&path) => return Ok(()),
+            Ok(()) => attempts.push(StartAttempt {
+                name: service_manager_name(),
+                error: "started but socket did not become ready".to_owned(),
+            }),
+            Err(error) => attempts.push(error),
+        }
+
+        match start_daemon_with_direct_spawn(&exe, &path) {
+            Ok(()) if wait_for_daemon(&path) => return Ok(()),
+            Ok(()) => attempts.push(StartAttempt {
+                name: "direct spawn",
+                error: "started but socket did not become ready".to_owned(),
+            }),
+            Err(error) => attempts.push(error),
+        }
+
+        Err(ViaError::InvalidConfig(format!(
+            "timed out waiting for via daemon to start ({})",
+            format_start_attempts(&attempts)
+        )))
+    }
+
+    fn wait_for_daemon(path: &Path) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < CONNECT_WAIT {
+            if UnixStream::connect(path).is_ok() {
+                return true;
+            }
+            thread::sleep(CONNECT_POLL);
+        }
+
+        false
+    }
+
+    fn start_daemon_with_direct_spawn(exe: &Path, path: &Path) -> Result<(), StartAttempt> {
+        let mut command = daemon_command(exe, path);
+        command.process_group(0);
+        command.spawn().map(|_| ()).map_err(|error| StartAttempt {
+            name: "direct spawn",
+            error: error.to_string(),
+        })
+    }
+
+    fn daemon_command(exe: &Path, path: &Path) -> Command {
         let mut command = Command::new(exe);
         command
             .arg("daemon")
@@ -310,19 +360,232 @@ mod imp {
         } else {
             command.stderr(Stdio::null());
         }
-        command.spawn()?;
-
-        let started = Instant::now();
-        while started.elapsed() < CONNECT_WAIT {
-            if UnixStream::connect(socket_path()?).is_ok() {
-                return Ok(());
-            }
-            thread::sleep(CONNECT_POLL);
+        for (name, value) in daemon_environment(path) {
+            command.env(name, value);
         }
+        command
+    }
 
-        Err(ViaError::InvalidConfig(
-            "timed out waiting for via daemon to start".to_owned(),
-        ))
+    fn daemon_environment(path: &Path) -> Vec<(String, String)> {
+        let mut values = vec![
+            (
+                "VIA_DAEMON_SOCKET".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ),
+            (
+                "OP_BIOMETRIC_UNLOCK_ENABLED".to_owned(),
+                env::var("OP_BIOMETRIC_UNLOCK_ENABLED").unwrap_or_else(|_| "true".to_owned()),
+            ),
+        ];
+        for name in [
+            "PATH",
+            "HOME",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+        ] {
+            if let Ok(value) = env::var(name) {
+                if !value.is_empty() {
+                    values.push((name.to_owned(), value));
+                }
+            }
+        }
+        values
+    }
+
+    #[cfg(target_os = "linux")]
+    fn service_manager_name() -> &'static str {
+        "systemd user service"
+    }
+
+    #[cfg(target_os = "macos")]
+    fn service_manager_name() -> &'static str {
+        "launchd user agent"
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn service_manager_name() -> &'static str {
+        "user service manager"
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_daemon_with_service_manager(exe: &Path, path: &Path) -> Result<(), StartAttempt> {
+        let unit = format!("via-daemon-{}", socket_path_id(path));
+        let mut command = Command::new("systemd-run");
+        command
+            .arg("--user")
+            .arg("--collect")
+            .arg("--quiet")
+            .arg("--unit")
+            .arg(unit)
+            .arg("--description")
+            .arg("via daemon");
+        for (name, value) in daemon_environment(path) {
+            command.arg("--setenv").arg(format!("{name}={value}"));
+        }
+        command.arg(exe).arg("daemon").arg("serve");
+
+        run_start_command("systemd-run", command).map_err(|error| StartAttempt {
+            name: service_manager_name(),
+            error,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_daemon_with_service_manager(exe: &Path, path: &Path) -> Result<(), StartAttempt> {
+        let label = format!("dev.tee8z.via.daemon.{}", socket_path_id(path));
+        let plist_path = launch_agent_path(&label).map_err(|error| StartAttempt {
+            name: service_manager_name(),
+            error,
+        })?;
+        write_launch_agent_plist(&plist_path, &label, exe, path).map_err(|error| StartAttempt {
+            name: service_manager_name(),
+            error,
+        })?;
+
+        let domain = format!("gui/{}", effective_user_id());
+        let target = format!("{domain}/{label}");
+        let mut bootstrap = Command::new("launchctl");
+        bootstrap.arg("bootstrap").arg(&domain).arg(&plist_path);
+        match run_start_command("launchctl bootstrap", bootstrap) {
+            Ok(()) => Ok(()),
+            Err(bootstrap_error) => {
+                let mut kickstart = Command::new("launchctl");
+                kickstart.arg("kickstart").arg("-k").arg(&target);
+                run_start_command("launchctl kickstart", kickstart).map_err(|kickstart_error| {
+                    StartAttempt {
+                        name: service_manager_name(),
+                        error: format!("{bootstrap_error}; {kickstart_error}"),
+                    }
+                })
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn start_daemon_with_service_manager(_exe: &Path, _path: &Path) -> Result<(), StartAttempt> {
+        Err(StartAttempt {
+            name: service_manager_name(),
+            error: "not supported on this platform".to_owned(),
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn launch_agent_path(label: &str) -> Result<PathBuf, String> {
+        let home = env_path("HOME").ok_or_else(|| "HOME is not set".to_owned())?;
+        let directory = home.join("Library").join("LaunchAgents");
+        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        Ok(directory.join(format!("{label}.plist")))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_launch_agent_plist(
+        path: &Path,
+        label: &str,
+        exe: &Path,
+        socket_path: &Path,
+    ) -> Result<(), String> {
+        let mut environment = String::new();
+        for (name, value) in daemon_environment(socket_path) {
+            environment.push_str(&format!(
+                "<key>{}</key><string>{}</string>\n",
+                xml_escape(&name),
+                xml_escape(&value)
+            ));
+        }
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}</string>
+    <string>daemon</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    {}
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>/dev/null</string>
+</dict>
+</plist>
+"#,
+            xml_escape(label),
+            xml_escape(&exe.to_string_lossy()),
+            environment
+        );
+        fs::write(path, plist).map_err(|error| error.to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn xml_escape(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn effective_user_id() -> libc::uid_t {
+        unsafe { libc::geteuid() }
+    }
+
+    fn run_start_command(name: &'static str, mut command: Command) -> Result<(), String> {
+        let output = command.output().map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                format!("{name} not found")
+            } else {
+                format!("failed to start {name}: {error}")
+            }
+        })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format_command_failure(name, &output))
+        }
+    }
+
+    fn format_command_failure(name: &str, output: &Output) -> String {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if stderr.is_empty() {
+            format!("{name} exited with status {:?}", output.status.code())
+        } else {
+            format!(
+                "{name} exited with status {:?}: {stderr}",
+                output.status.code()
+            )
+        }
+    }
+
+    fn socket_path_id(path: &Path) -> String {
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in path.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    }
+
+    struct StartAttempt {
+        name: &'static str,
+        error: String,
+    }
+
+    fn format_start_attempts(attempts: &[StartAttempt]) -> String {
+        attempts
+            .iter()
+            .map(|attempt| format!("{}: {}", attempt.name, attempt.error))
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     fn handle_stream(
