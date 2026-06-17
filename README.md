@@ -225,6 +225,20 @@ X-GitHub-Api-Version = "2022-11-28"
 ```
 
 REST capabilities accept paths, not arbitrary absolute URLs. The configured `base_url` is the trust boundary for that service.
+If a service exposes authenticated file storage on a separate host, add exact
+hosts to `asset_hosts`. Absolute URLs are accepted only for those hosts and must
+be written with `--output` so binary responses are not printed to the terminal:
+
+```toml
+[services.linear.commands.api]
+mode = "rest"
+base_url = "https://api.linear.app"
+asset_hosts = ["uploads.linear.app"]
+```
+
+```sh
+via linear api GET "https://uploads.linear.app/WORKSPACE/OBJECT/FILE" --output /tmp/hero.jpg
+```
 
 Service-level `hint` values are optional example commands shown by `via capabilities` and `via skill print`. They should demonstrate a safe, minimal call for the configured service without embedding secrets.
 
@@ -233,6 +247,12 @@ Service-level `hint` values are optional example commands shown by `via capabili
 Config changes do not require a daemon reload. Each `via` invocation reads the config file again and registers the current allowed secret references with the daemon. Discovery commands such as `via capabilities` and `via skill print` show config-only changes immediately. If you changed a secret value in 1Password or want to drop cached OAuth/token state, run `via daemon clear`; use `via daemon stop` to restart the daemon completely on the next command.
 
 On Windows, the cache currently defaults to `off` because the daemon needs a named-pipe backend that is not implemented yet. The config shape is already feature-ready: once Windows daemon support exists, `cache = "daemon"` can use the same provider setting.
+
+For editors, IDEs, and AI agents, make sure the spawned tool process can find
+both `via` and the provider CLI, such as `op`, on `PATH`. Prefer 1Password
+desktop app integration over shell-local `op signin` session tokens so separate
+tool processes can authenticate without repeated login prompts. See
+[docs/agent-environment-setup.md](docs/agent-environment-setup.md).
 
 For GitHub App installation-token auth, store the app metadata and private key as separate 1Password secrets and use:
 
@@ -275,7 +295,7 @@ OAuth credential bundles use `type = "service_oauth"`, the service's REST OAuth 
 }
 ```
 
-via asks the local daemon to mint OAuth access tokens through the provider's REST token endpoint, keeps access tokens and refresh-token state only in daemon memory while the daemon is running, and sends API requests with a bearer token. Nothing from the OAuth token exchange is written to disk. Use `refresh_token` only for services that need user-actor OAuth and cannot issue bot/app credentials. See [docs/linear-oauth-setup.md](docs/linear-oauth-setup.md) for the Linear app-actor setup flow.
+via asks the local daemon to mint OAuth access tokens through the provider's REST token endpoint, keeps access tokens and refresh-token state only in daemon memory while the daemon is running, and sends API requests with a bearer token. Nothing from the OAuth token exchange is written to disk. Use `refresh_token` only for services that need user-actor OAuth and cannot issue bot/app credentials. For Linear client-credentials tokens, via retries once with a fresh token after a `401 Unauthorized` response. See [docs/linear-oauth-setup.md](docs/linear-oauth-setup.md) for the Linear app-actor setup flow.
 
 For bearer-token APIs such as Grafana service account tokens, use one service per environment:
 

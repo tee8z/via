@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::config::{CapabilityMode, Config};
+use crate::config::{CapabilityMode, CommandConfig, Config};
 use crate::error::ViaError;
 
 #[derive(Serialize)]
@@ -22,6 +22,8 @@ struct CapabilitySummary<'a> {
     name: &'a str,
     description: Option<&'a str>,
     mode: CapabilityMode,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    asset_hosts: Vec<&'a str>,
 }
 
 pub fn print(config: &Config, json: bool) -> Result<(), ViaError> {
@@ -46,6 +48,7 @@ pub fn render(config: &Config, json: bool) -> Result<String, ViaError> {
                             name: command_name,
                             description: command.description().map(String::as_str),
                             mode: command.mode(),
+                            asset_hosts: asset_hosts(command),
                         })
                         .collect(),
                 })
@@ -75,10 +78,21 @@ pub fn render(config: &Config, json: bool) -> Result<String, ViaError> {
                 )),
                 None => output.push_str(&format!("  {command_name} ({:?})\n", command.mode())),
             }
+            let asset_hosts = asset_hosts(command);
+            if !asset_hosts.is_empty() {
+                output.push_str(&format!("    asset hosts: {}\n", asset_hosts.join(", ")));
+            }
         }
     }
 
     Ok(output)
+}
+
+fn asset_hosts(command: &CommandConfig) -> Vec<&str> {
+    match command {
+        CommandConfig::Rest(rest) => rest.asset_hosts.iter().map(String::as_str).collect(),
+        CommandConfig::Delegated(_) => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -105,6 +119,7 @@ token = "op://Private/GitHub/token"
 description = "REST access"
 mode = "rest"
 base_url = "https://api.github.com"
+asset_hosts = ["uploads.linear.app"]
 
 [services.github.commands.api.auth]
 type = "bearer"
@@ -121,6 +136,7 @@ secret = "token"
         assert!(output.contains("github: GitHub access"));
         assert!(output.contains("hint: via github api /user"));
         assert!(output.contains("api (Rest): REST access"));
+        assert!(output.contains("asset hosts: uploads.linear.app"));
     }
 
     #[test]
@@ -130,6 +146,8 @@ secret = "token"
         assert!(output.contains("\"name\": \"github\""));
         assert!(output.contains("\"hint\": \"via github api /user\""));
         assert!(output.contains("\"mode\": \"rest\""));
+        assert!(output.contains("\"asset_hosts\""));
+        assert!(output.contains("\"uploads.linear.app\""));
         assert!(!output.contains("op://"));
     }
 }

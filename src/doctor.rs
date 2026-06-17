@@ -145,6 +145,7 @@ fn check_service_command(
     match command {
         CommandConfig::Rest(rest) => {
             println!("  capability {command_name}: rest");
+            print_rest_asset_hosts(rest);
             if service_provider_ready {
                 check_rest_auth(service_name, command_name, service, rest, providers, status)?;
             }
@@ -155,6 +156,14 @@ fn check_service_command(
     }
 
     Ok(())
+}
+
+fn print_rest_asset_hosts(rest: &RestCommandConfig) {
+    if rest.asset_hosts.is_empty() {
+        return;
+    }
+
+    println!("  asset hosts: {}", rest.asset_hosts.join(", "));
 }
 
 fn check_delegated_command(

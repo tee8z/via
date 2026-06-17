@@ -71,6 +71,8 @@ pub struct RestCommandConfig {
     #[serde(default)]
     pub description: Option<String>,
     pub base_url: String,
+    #[serde(default)]
+    pub asset_hosts: Vec<String>,
     #[serde(default = "default_method")]
     pub method_default: String,
     #[serde(default)]
@@ -220,6 +222,7 @@ impl CommandConfig {
                         "command `{service_name}.{command_name}` must set rest base_url"
                     )));
                 }
+                validate_asset_hosts(service_name, command_name, &rest.asset_hosts)?;
 
                 if let Some(auth) = &rest.auth {
                     match auth {
@@ -274,6 +277,30 @@ impl CommandConfig {
 
         Ok(())
     }
+}
+
+fn validate_asset_hosts(
+    service_name: &str,
+    command_name: &str,
+    asset_hosts: &[String],
+) -> Result<(), ViaError> {
+    for host in asset_hosts {
+        let trimmed = host.trim();
+        if trimmed.is_empty()
+            || trimmed != host
+            || trimmed.contains('/')
+            || trimmed.contains(':')
+            || trimmed.contains('*')
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+        {
+            return Err(ViaError::InvalidConfig(format!(
+                "command `{service_name}.{command_name}` asset host `{host}` must be an exact hostname without scheme, path, port, or wildcard"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_secret_name(
@@ -454,6 +481,39 @@ credential = "token""#,
         );
 
         assert!(Config::from_toml_str(&raw).is_ok());
+    }
+
+    #[test]
+    fn accepts_rest_asset_hosts() {
+        let raw = VALID.replace(
+            "base_url = \"https://api.github.com\"",
+            "base_url = \"https://api.github.com\"\nasset_hosts = [\"uploads.linear.app\"]",
+        );
+
+        assert!(Config::from_toml_str(&raw).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_rest_asset_hosts() {
+        for asset_hosts in [
+            "[\"https://uploads.linear.app\"]",
+            "[\"uploads.linear.app/path\"]",
+            "[\"uploads.linear.app:443\"]",
+            "[\"*.linear.app\"]",
+        ] {
+            let raw = VALID.replace(
+                "base_url = \"https://api.github.com\"",
+                &format!("base_url = \"https://api.github.com\"\nasset_hosts = {asset_hosts}"),
+            );
+
+            assert!(
+                matches!(
+                    Config::from_toml_str(&raw),
+                    Err(ViaError::InvalidConfig(message)) if message.contains("asset host")
+                ),
+                "expected invalid asset_hosts rejection for {asset_hosts}"
+            );
+        }
     }
 
     #[test]
