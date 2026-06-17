@@ -54,6 +54,22 @@ The normal hot path sends only `config_hash` and `ref_id` over the socket. Raw
 `op://` references are sent during registration so the daemon can enforce the
 allowlist and perform `op read` on cache misses.
 
+## Auto-Start
+
+Commands that need daemon-backed caching automatically start the daemon when
+the socket is unavailable. On Linux, `via` first uses the per-user systemd
+manager through `systemd-run --user`, when available. On macOS, `via` writes and
+starts a per-user LaunchAgent through `launchctl`. These managed starts keep the
+daemon alive after the invoking shell, editor task, or agent command exits.
+
+If the platform service manager is unavailable, `via` falls back to spawning a
+detached daemon process directly. The fallback covers minimal shells,
+containers, and SSH environments, but the managed path is preferred because some
+editors and agent runners clean up child process groups after each command.
+
+The daemon still exits automatically after 15 minutes without activity. A later
+`via` command starts it again with the same socket path.
+
 ## Socket And Lifetime
 
 The daemon listens on a Unix domain socket. The socket path is resolved in this

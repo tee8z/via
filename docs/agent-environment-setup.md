@@ -119,6 +119,12 @@ in memory, but the daemon still needs `op read` on cache misses. Keep
 `cache = "daemon"` enabled for editor and agent workflows, and use
 `via daemon status` to confirm the daemon remains warm during a session.
 
+On Linux and macOS, `via` auto-starts the daemon through the user service
+manager when possible: `systemd-run --user` on Linux and `launchctl` on macOS.
+That keeps the daemon alive after a one-shot editor task or agent command exits,
+so later `via` invocations can reuse the same daemon cache. If the service
+manager is unavailable, `via` falls back to a detached direct spawn.
+
 ## References
 
 - Zed environment model: <https://zed.dev/docs/environment>
