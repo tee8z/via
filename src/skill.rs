@@ -1,4 +1,4 @@
-use crate::config::{CapabilityMode, Config};
+use crate::config::{CapabilityMode, CommandConfig, Config};
 
 pub fn print(config: &Config) {
     print!("{}", render(config));
@@ -34,7 +34,7 @@ pub fn render(config: &Config) -> String {
         }
         for (command_name, command) in &service.commands {
             let usage = match command.mode() {
-                CapabilityMode::Rest => format!("via {service_name} {command_name} <path>"),
+                CapabilityMode::Rest => rest_usage(service_name, command_name, command),
                 CapabilityMode::Delegated => {
                     format!("via {service_name} {command_name} <tool-args...>")
                 }
@@ -49,6 +49,15 @@ pub fn render(config: &Config) -> String {
     }
 
     output
+}
+
+fn rest_usage(service_name: &str, command_name: &str, command: &CommandConfig) -> String {
+    match command {
+        CommandConfig::Rest(rest) if !rest.asset_hosts.is_empty() => format!(
+            "via {service_name} {command_name} <path> or via {service_name} {command_name} GET <asset-url> --output <file>"
+        ),
+        _ => format!("via {service_name} {command_name} <path>"),
+    }
 }
 
 #[cfg(test)]
@@ -75,6 +84,7 @@ token = "op://Private/GitHub/token"
 description = "REST access."
 mode = "rest"
 base_url = "https://api.github.com"
+asset_hosts = ["uploads.linear.app"]
 
 [services.github.commands.gh]
 description = "CLI access."
@@ -94,6 +104,7 @@ program = "gh"
         assert!(output.contains("via login"));
         assert!(output.contains("Example: `via github api /user`."));
         assert!(output.contains("via github api <path>"));
+        assert!(output.contains("via github api GET <asset-url> --output <file>"));
         assert!(output.contains("via github gh <tool-args...>"));
         assert!(!output.contains("op://Private"));
         assert!(!output.contains("op read"));

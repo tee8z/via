@@ -93,6 +93,7 @@ struct ServiceSetup {
 struct RestSetup {
     command_name: String,
     base_url: String,
+    asset_hosts: Vec<String>,
     method_default: String,
     auth: RestAuthSetup,
 }
@@ -203,11 +204,13 @@ fn prompt_rest_setup() -> Result<RestSetup, ViaError> {
     println!();
     println!("REST API capability");
     let (command_name, base_url, method_default) = prompt_rest_fields()?;
+    let asset_hosts = prompt_asset_hosts()?;
     let auth = prompt_rest_auth_setup()?;
 
     Ok(RestSetup {
         command_name,
         base_url,
+        asset_hosts,
         method_default,
         auth,
     })
@@ -231,6 +234,20 @@ fn prompt_rest_auth_setup() -> Result<RestAuthSetup, ViaError> {
         ],
         1,
     )?)
+}
+
+fn prompt_asset_hosts() -> Result<Vec<String>, ViaError> {
+    let raw = prompt_optional("Asset hosts for authenticated downloads, comma-separated")?;
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    Ok(raw
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 fn rest_auth_setup_from_choice(choice: usize) -> Result<RestAuthSetup, ViaError> {
@@ -361,6 +378,12 @@ fn build_service_config(setup: ServiceSetup) -> String {
             .push_str("description = \"Call the configured REST API. Prefer this for agents.\"\n");
         output.push_str("mode = \"rest\"\n");
         output.push_str(&format!("base_url = {}\n", toml_string(&rest.base_url)));
+        if !rest.asset_hosts.is_empty() {
+            output.push_str(&format!(
+                "asset_hosts = {}\n",
+                toml_array(&rest.asset_hosts)
+            ));
+        }
         output.push_str(&format!(
             "method_default = {}\n\n",
             toml_string(&rest.method_default)
@@ -492,6 +515,7 @@ mod tests {
             rest: Some(RestSetup {
                 command_name: "api".to_owned(),
                 base_url: "https://gitlab.example.com/api/v4".to_owned(),
+                asset_hosts: Vec::new(),
                 method_default: "GET".to_owned(),
                 auth: RestAuthSetup::Bearer,
             }),
@@ -519,6 +543,7 @@ mod tests {
             rest: Some(RestSetup {
                 command_name: "api".to_owned(),
                 base_url: "https://api.github.com".to_owned(),
+                asset_hosts: Vec::new(),
                 method_default: "GET".to_owned(),
                 auth: RestAuthSetup::GitHubApp,
             }),
@@ -545,6 +570,7 @@ mod tests {
             rest: Some(RestSetup {
                 command_name: "api".to_owned(),
                 base_url: "https://api.linear.app".to_owned(),
+                asset_hosts: vec!["uploads.linear.app".to_owned()],
                 method_default: "GET".to_owned(),
                 auth: RestAuthSetup::OAuth,
             }),
@@ -556,6 +582,7 @@ mod tests {
             "hint = \"via linear api POST /graphql --json '{\\\"query\\\":\\\"{ viewer { id name } }\\\"}'\""
         ));
         assert!(config.contains("credential = \"oauth\""));
+        assert!(config.contains("asset_hosts = [\"uploads.linear.app\"]"));
         assert!(Config::from_toml_str(&config).is_ok());
     }
 

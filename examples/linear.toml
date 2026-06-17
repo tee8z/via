@@ -16,6 +16,7 @@ oauth = "op://Private/Example Linear OAuth/credential"
 description = "Call configured Linear API endpoints with an app-actor OAuth bearer token."
 mode = "rest"
 base_url = "https://api.linear.app"
+asset_hosts = ["uploads.linear.app"]
 method_default = "GET"
 
 [services.linear.commands.api.auth]

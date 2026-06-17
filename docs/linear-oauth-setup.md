@@ -103,6 +103,7 @@ oauth = "op://Private/Example Linear OAuth/credential"
 description = "Call configured Linear API endpoints with an app-actor OAuth bearer token."
 mode = "rest"
 base_url = "https://api.linear.app"
+asset_hosts = ["uploads.linear.app"]
 method_default = "GET"
 
 [services.linear.commands.api.auth]
@@ -115,6 +116,11 @@ The `oauth` auth type resolves the configured credential bundle, asks the local 
 ```text
 Authorization: Bearer <access-token>
 ```
+
+Linear file storage lives on `uploads.linear.app`, outside the GraphQL API host.
+The `asset_hosts` allowlist lets the same REST capability fetch those URLs with
+the same internally managed OAuth bearer token, without exposing the token to the
+caller.
 
 ## 5. Verify
 
@@ -133,5 +139,25 @@ via linear api POST /graphql --json '{"query":"{ viewer { id name } }"}'
 ```
 
 This verifies that via can read the 1Password credential bundle, mint a Linear `client_credentials` token through the REST `/oauth/token` endpoint, attach it as a bearer token, and have Linear accept it as the app actor.
+
+To download a private Linear upload from markdown returned by the API, write the
+raw response to a file:
+
+```sh
+via linear api GET "https://uploads.linear.app/<workspace>/<object>/<file>" --output /tmp/linear-upload.bin
+```
+
+Linear also supports signed temporary file URLs in GraphQL responses. If a
+workflow only needs to parse issue descriptions or comments and then download the
+file separately, add this static header so Linear can sign returned file-storage
+URLs:
+
+```toml
+[services.linear.commands.api.headers]
+"public-file-urls-expire-in" = "300"
+```
+
+With that header, Linear can return file URLs that are temporarily accessible
+without forwarding the OAuth bearer token to the file-storage host.
 
 If doctor reports an invalid OAuth bundle, fix the JSON stored in 1Password. Do not paste OAuth tokens, client secrets, or refresh tokens into terminal output, issue comments, or prompts.

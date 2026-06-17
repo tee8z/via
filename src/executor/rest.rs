@@ -1,10 +1,12 @@
-use std::io::{self, Read};
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
 };
-use reqwest::Method;
+use reqwest::{Method, Url};
 
 use crate::config::{AuthConfig, RestCommandConfig, SecretHeaderConfig, ServiceConfig};
 use crate::error::ViaError;
@@ -20,7 +22,7 @@ pub fn execute(
 ) -> Result<(), ViaError> {
     let request = RestInvocation::parse(config, args)?;
     let mut redactor = Redactor::new();
-    let client = Client::new();
+    let client = http_client(&request)?;
     let builder = {
         let mut context = RestRequestBuildContext {
             client: &client,
@@ -50,17 +52,25 @@ pub fn execute(
         };
         response = send_rest_request(builder, &request.method, &request.path)?;
     }
-    let body = redactor.redact(&response.body);
 
-    ensure_success(response.status, &response.headers, &body)?;
-    println!("{body}");
+    if !response.status.is_success() {
+        let body = redactor.redact(&String::from_utf8_lossy(&response.body));
+        ensure_success(response.status, &response.headers, &body)?;
+    }
+
+    if let Some(output) = &request.output {
+        write_response_body(output, &response.body)?;
+    } else {
+        let body = redactor.redact(&String::from_utf8_lossy(&response.body));
+        println!("{body}");
+    }
     Ok(())
 }
 
 struct RestResponse {
     status: reqwest::StatusCode,
     headers: HeaderMap,
-    body: String,
+    body: Vec<u8>,
 }
 
 struct RestRequestBuildContext<'a> {
@@ -77,7 +87,7 @@ fn build_authenticated_request(
     context: &mut RestRequestBuildContext<'_>,
     request: &RestInvocation,
 ) -> Result<RequestBuilder, ViaError> {
-    let url = build_url(&context.config.base_url, &request.path, &request.query)?;
+    let url = build_url(context.config, &request.path, &request.query)?;
     let builder = context.client.request(request.method.clone(), url);
     let mut headers = authenticated_headers(context)?;
     apply_body_content_type(&mut headers, request.body.as_deref());
@@ -149,6 +159,16 @@ fn send_rest_request(
     })
 }
 
+fn http_client(request: &RestInvocation) -> Result<Client, ViaError> {
+    if request.absolute_url {
+        return Ok(Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?);
+    }
+
+    Ok(Client::new())
+}
+
 #[derive(Clone, Copy)]
 enum OAuthTokenMode {
     Cached,
@@ -160,18 +180,24 @@ fn should_retry_with_fresh_oauth(config: &RestCommandConfig, status: reqwest::St
         && matches!(config.auth, Some(AuthConfig::OAuth { .. }))
 }
 
-fn read_response_body(response: reqwest::blocking::Response) -> Result<String, ViaError> {
+fn read_response_body(response: reqwest::blocking::Response) -> Result<Vec<u8>, ViaError> {
     let body_span = crate::timing::span("rest response body");
-    match response.text() {
+    match response.bytes() {
         Ok(body) => {
             body_span.finish(format!("bytes={}", body.len()));
-            Ok(body)
+            Ok(body.to_vec())
         }
         Err(error) => {
             body_span.finish("failed");
             Err(error.into())
         }
     }
+}
+
+fn write_response_body(path: &Path, body: &[u8]) -> Result<(), ViaError> {
+    let mut file = File::create(path)?;
+    file.write_all(body)?;
+    Ok(())
 }
 
 fn ensure_success(
@@ -222,11 +248,14 @@ fn truncate_error_body(body: &str) -> String {
     }
 }
 
+#[derive(Debug)]
 struct RestInvocation {
     method: Method,
     path: String,
     query: Vec<(String, String)>,
     body: Option<String>,
+    output: Option<PathBuf>,
+    absolute_url: bool,
 }
 
 impl RestInvocation {
@@ -236,7 +265,7 @@ impl RestInvocation {
             .next()
             .ok_or_else(|| ViaError::MissingArgument("path".to_owned()))?;
 
-        let (method, path) = if first.starts_with('/') {
+        let (method, path) = if is_request_target(&first) {
             (parse_method(&config.method_default)?, first)
         } else {
             let path = args
@@ -247,6 +276,7 @@ impl RestInvocation {
 
         let mut query = Vec::new();
         let mut body = None;
+        let mut output = None;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -271,6 +301,12 @@ impl RestInvocation {
                         .ok_or_else(|| ViaError::MissingArgument("--data value".to_owned()))?;
                     body = Some(read_body_arg(&value)?);
                 }
+                "--output" | "-o" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| ViaError::MissingArgument("--output path".to_owned()))?;
+                    output = Some(PathBuf::from(value));
+                }
                 other => {
                     return Err(ViaError::InvalidArgument(format!(
                         "unknown rest argument `{other}`"
@@ -279,13 +315,30 @@ impl RestInvocation {
             }
         }
 
+        let absolute_url = is_absolute_http_url(&path);
+        if absolute_url && output.is_none() {
+            return Err(ViaError::InvalidArgument(
+                "absolute URL requests must use --output <path>".to_owned(),
+            ));
+        }
+
         Ok(Self {
             method,
             path,
             query,
             body,
+            output,
+            absolute_url,
         })
     }
+}
+
+fn is_request_target(value: &str) -> bool {
+    value.starts_with('/') || is_absolute_http_url(value)
+}
+
+fn is_absolute_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
 }
 
 fn parse_method(method: &str) -> Result<Method, ViaError> {
@@ -559,11 +612,14 @@ fn insert_bearer_header(headers: &mut HeaderMap, token: &str, error: &str) -> Re
     Ok(())
 }
 
-fn build_url(base_url: &str, path: &str, query: &[(String, String)]) -> Result<String, ViaError> {
+fn build_url(
+    config: &RestCommandConfig,
+    path: &str,
+    query: &[(String, String)],
+) -> Result<String, ViaError> {
     if path.starts_with("http://") || path.starts_with("https://") {
-        return Err(ViaError::InvalidArgument(
-            "REST capabilities only accept paths; absolute URLs are not allowed".to_owned(),
-        ));
+        validate_asset_url(config, path)?;
+        return Ok(append_query(path.to_owned(), query));
     }
 
     if !path.starts_with('/') {
@@ -572,7 +628,30 @@ fn build_url(base_url: &str, path: &str, query: &[(String, String)]) -> Result<S
         ));
     }
 
-    let mut url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    Ok(append_query(
+        format!("{}{}", config.base_url.trim_end_matches('/'), path),
+        query,
+    ))
+}
+
+fn validate_asset_url(config: &RestCommandConfig, url: &str) -> Result<(), ViaError> {
+    let parsed = Url::parse(url).map_err(|error| {
+        ViaError::InvalidArgument(format!("absolute REST URL is invalid: {error}"))
+    })?;
+    let host = parsed.host_str().ok_or_else(|| {
+        ViaError::InvalidArgument("absolute REST URL must include a host".to_owned())
+    })?;
+
+    if config.asset_hosts.iter().any(|allowed| allowed == host) {
+        return Ok(());
+    }
+
+    Err(ViaError::InvalidArgument(format!(
+        "REST absolute URL host `{host}` is not in this capability's asset_hosts allowlist"
+    )))
+}
+
+fn append_query(mut url: String, query: &[(String, String)]) -> String {
     if !query.is_empty() {
         let separator = if url.contains('?') { '&' } else { '?' };
         url.push(separator);
@@ -586,7 +665,7 @@ fn build_url(base_url: &str, path: &str, query: &[(String, String)]) -> Result<S
         }
     }
 
-    Ok(url)
+    url
 }
 
 fn percent_encode(value: &str) -> String {
@@ -680,6 +759,43 @@ Accept = "application/vnd.github+json"
         assert_eq!(invocation.path, "/repos/o/r/pulls");
         assert_eq!(invocation.query, [("state".to_owned(), "open".to_owned())]);
         assert_eq!(invocation.body.as_deref(), Some("{\"title\":\"x\"}"));
+        assert_eq!(invocation.output, None);
+        assert!(!invocation.absolute_url);
+    }
+
+    #[test]
+    fn parses_absolute_url_with_output() {
+        let invocation = RestInvocation::parse(
+            &rest_config(),
+            vec![
+                "GET".to_owned(),
+                "https://uploads.linear.app/workspace/object/file".to_owned(),
+                "--output".to_owned(),
+                "/tmp/hero.jpg".to_owned(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(invocation.method, Method::GET);
+        assert_eq!(
+            invocation.path,
+            "https://uploads.linear.app/workspace/object/file"
+        );
+        assert_eq!(invocation.output, Some(PathBuf::from("/tmp/hero.jpg")));
+        assert!(invocation.absolute_url);
+    }
+
+    #[test]
+    fn rejects_absolute_url_without_output() {
+        let error = RestInvocation::parse(
+            &rest_config(),
+            vec!["https://uploads.linear.app/workspace/object/file".to_owned()],
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ViaError::InvalidArgument(message) if message.contains("--output"))
+        );
     }
 
     #[test]
@@ -698,18 +814,41 @@ Accept = "application/vnd.github+json"
     }
 
     #[test]
-    fn rejects_absolute_urls() {
-        let error = build_url("https://api.github.com", "https://evil.test", &[]).unwrap_err();
+    fn rejects_unallowlisted_absolute_urls() {
+        let error = build_url(&rest_config(), "https://evil.test", &[]).unwrap_err();
 
         assert!(
-            matches!(error, ViaError::InvalidArgument(message) if message.contains("absolute URLs"))
+            matches!(error, ViaError::InvalidArgument(message) if message.contains("asset_hosts"))
+        );
+    }
+
+    #[test]
+    fn builds_allowlisted_absolute_url_with_percent_encoded_query() {
+        let config: RestCommandConfig = toml::from_str(
+            r#"
+base_url = "https://api.linear.app"
+asset_hosts = ["uploads.linear.app"]
+"#,
+        )
+        .unwrap();
+
+        let url = build_url(
+            &config,
+            "https://uploads.linear.app/workspace/object/file",
+            &[("name".to_owned(), "hero image.jpg".to_owned())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            url,
+            "https://uploads.linear.app/workspace/object/file?name=hero%20image.jpg"
         );
     }
 
     #[test]
     fn builds_url_with_percent_encoded_query() {
         let url = build_url(
-            "https://api.github.com/",
+            &rest_config(),
             "/search/issues",
             &[("q".to_owned(), "repo:owner/name bug fix".to_owned())],
         )
@@ -866,6 +1005,54 @@ Content-Type = "application/json"
             "content-type:",
             Some("content-type: application/json"),
         );
+    }
+
+    #[test]
+    fn writes_allowlisted_absolute_url_response_to_output_with_auth() {
+        crate::tls::install_crypto_provider();
+
+        let body = vec![0xff, 0xd8, 0xff, 0x00, 0x41, 0x42];
+        let (asset_base_url, server) = binary_request_server(body.clone());
+        let output = temp_path("linear-asset-output");
+        let config: RestCommandConfig = toml::from_str(
+            r#"
+base_url = "https://api.linear.app"
+asset_hosts = ["127.0.0.1"]
+
+[auth]
+type = "bearer"
+secret = "token"
+"#,
+        )
+        .unwrap();
+        let service = service_with_secrets([("token", "op://Private/API/token")]);
+        let provider = FakeProvider::new([("op://Private/API/token", "bearer-token")]);
+
+        execute(
+            "linear",
+            &service,
+            &config,
+            &provider,
+            vec![
+                "GET".to_owned(),
+                format!("{asset_base_url}/workspace/object/file"),
+                "--output".to_owned(),
+                output.display().to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&output).unwrap(), body);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /workspace/object/file "));
+        assert_single_header(
+            &requests[0],
+            "authorization:",
+            Some("authorization: Bearer bearer-token"),
+        );
+
+        let _ = std::fs::remove_file(output);
     }
 
     #[test]
@@ -1300,6 +1487,8 @@ private_key = "private_key"
             path: "/graphql".to_owned(),
             query: Vec::new(),
             body: Some(JSON_BODY.to_owned()),
+            output: None,
+            absolute_url: false,
         }
     }
 
@@ -1376,6 +1565,27 @@ private_key = "private_key"
                 stream.write_all(response.as_bytes()).unwrap();
             }
             requests
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
+    fn binary_request_server(body: Vec<u8>) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            stream.write_all(&response).unwrap();
+            vec![request]
         });
 
         (format!("http://{address}"), handle)
