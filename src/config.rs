@@ -641,8 +641,8 @@ provider = "onepassword"
 description = "Connect to a production node"
 mode = "ssh"
 profile = "production"
-user = "volt"
-hosts = ["btcd-*.internal", "2001:db8::*"]
+user = "deploy"
+hosts = ["server-*.example.com", "2001:db8::*"]
 port = 22
 "#;
 
@@ -669,9 +669,9 @@ port = 22
         assert!(profile.agent_socket.is_none());
         match &config.services["nodes"].commands["connect"] {
             CommandConfig::Ssh(ssh) => {
-                assert_eq!(ssh.user, "volt");
+                assert_eq!(ssh.user, "deploy");
                 assert_eq!(ssh.port, Some(22));
-                assert_eq!(ssh.hosts, ["btcd-*.internal", "2001:db8::*"]);
+                assert_eq!(ssh.hosts, ["server-*.example.com", "2001:db8::*"]);
             }
             _ => panic!("expected SSH command"),
         }
@@ -746,20 +746,24 @@ port = 22
     #[test]
     fn rejects_invalid_ssh_user_hosts_and_port() {
         for (old, new, expected) in [
-            ("user = \"volt\"", "user = \"-oProxyCommand=x\"", "SSH user"),
             (
-                "hosts = [\"btcd-*.internal\", \"2001:db8::*\"]",
+                "user = \"deploy\"",
+                "user = \"-oProxyCommand=x\"",
+                "SSH user",
+            ),
+            (
+                "hosts = [\"server-*.example.com\", \"2001:db8::*\"]",
                 "hosts = []",
                 "at least one SSH host pattern",
             ),
             (
-                "hosts = [\"btcd-*.internal\", \"2001:db8::*\"]",
+                "hosts = [\"server-*.example.com\", \"2001:db8::*\"]",
                 "hosts = [\"user@host\"]",
                 "invalid SSH host pattern",
             ),
             ("port = 22", "port = 0", "SSH port"),
             (
-                "hosts = [\"btcd-*.internal\", \"2001:db8::*\"]",
+                "hosts = [\"server-*.example.com\", \"2001:db8::*\"]",
                 "hosts = [\"host;unexpected\"]",
                 "invalid SSH host pattern",
             ),

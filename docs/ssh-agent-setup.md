@@ -51,13 +51,13 @@ desktop app:
 
 Create or import an SSH Key item in 1Password. Make the key available to the
 1Password SSH agent, then install its public key for the intended server user.
-For example, install the key in the `authorized_keys` file for `volt`.
+For example, install the key in the `authorized_keys` file for `deploy`.
 
 Keep the private key in 1Password. The via profile references the SSH Key
 item's `public key` field:
 
 ```text
-op://Private/Example BTCD SSH Key/public key
+op://Private/Example SSH Key/public key
 ```
 
 via resolves one OpenSSH public-key line from that reference. It validates the
@@ -93,21 +93,21 @@ version = 1
 [providers.onepassword]
 type = "1password"
 
-[ssh_profiles.btcd]
+[ssh_profiles.example]
 provider = "onepassword"
-public_key = "op://Private/Example BTCD SSH Key/public key"
+public_key = "op://Private/Example SSH Key/public key"
 
-[services.btcd]
-description = "SSH access to BTCD servers"
-hint = "via btcd shell btcd-01.internal.example.com"
+[services.example]
+description = "SSH access to example servers"
+hint = "via example shell server-01.example.com"
 provider = "onepassword"
 
-[services.btcd.commands.shell]
-description = "Open a public-key-only SSH session as volt."
+[services.example.commands.shell]
+description = "Open a public-key-only SSH session as deploy."
 mode = "ssh"
-profile = "btcd"
-user = "volt"
-hosts = ["btcd-*.internal.example.com", "192.0.2.10"]
+profile = "example"
+user = "deploy"
+hosts = ["server-*.example.com", "192.0.2.10"]
 port = 22
 ```
 
@@ -152,10 +152,10 @@ Examples:
 
 ```toml
 hosts = [
-  "btcd-01.internal.example.com", # Exact DNS name
-  "btcd-*.internal.example.com",  # Restricted wildcard
-  "192.0.2.10",                   # Exact IPv4 address
-  "2001:db8::10",                 # Exact IPv6 address
+  "server-01.example.com", # Exact DNS name
+  "server-*.example.com",  # Restricted wildcard
+  "192.0.2.10",            # Exact IPv4 address
+  "2001:db8::10",          # Exact IPv6 address
 ]
 ```
 
@@ -185,9 +185,9 @@ socket paths must be absolute. Do not use `~` or `$HOME`; via does not apply
 shell expansion to configured paths.
 
 ```toml
-[ssh_profiles.btcd]
+[ssh_profiles.example]
 provider = "onepassword"
-public_key = "op://Private/Example BTCD SSH Key/public key"
+public_key = "op://Private/Example SSH Key/public key"
 agent_socket = "/absolute/path/to/agent.sock"
 ```
 
@@ -215,9 +215,9 @@ both paths explicitly using absolute paths to binaries you trust. The two
 fields must be configured together and must use the same directory:
 
 ```toml
-[ssh_profiles.btcd]
+[ssh_profiles.example]
 provider = "onepassword"
-public_key = "op://Private/Example BTCD SSH Key/public key"
+public_key = "op://Private/Example SSH Key/public key"
 ssh_program = "/run/current-system/sw/bin/ssh"
 ssh_add_program = "/run/current-system/sw/bin/ssh-add"
 ```
@@ -267,7 +267,7 @@ offer only the private identity that matches the configured public key.
 Open an interactive remote shell:
 
 ```sh
-via btcd shell btcd-01.internal.example.com
+via example shell server-01.example.com
 ```
 
 via inherits terminal input, output, and error streams for the SSH process.
@@ -280,8 +280,8 @@ remote commands that print credentials or other sensitive values.
 Run one remote command by adding its arguments after the host:
 
 ```sh
-via btcd shell btcd-01.internal.example.com uname -a
-via btcd shell btcd-01.internal.example.com systemctl status btcd
+via example shell server-01.example.com uname -a
+via example shell server-01.example.com uptime
 ```
 
 OpenSSH combines the remaining arguments using its normal remote-command
@@ -302,7 +302,7 @@ and the OpenSSH tools:
 
 ```sh
 via login
-via config doctor btcd
+via config doctor example
 via capabilities
 ```
 
@@ -313,7 +313,7 @@ does not open an SSH network connection or print the agent's key list.
 Then run a small remote command against one allowed host:
 
 ```sh
-via btcd shell btcd-01.internal.example.com true
+via example shell server-01.example.com true
 ```
 
 If the host is new, OpenSSH can ask for host-key confirmation. Compare the
