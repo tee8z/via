@@ -2,11 +2,10 @@ version = 1
 
 [providers.onepassword]
 type = "1password"
-cache = "daemon"
 
 [services.github]
 description = "GitHub REST API access through a GitHub App installation"
-hint = "via github api /user"
+hint = "via github api /installation/repositories"
 provider = "onepassword"
 
 [services.github.secrets]

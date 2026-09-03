@@ -1,0 +1,21 @@
+version = 1
+
+[providers.onepassword]
+type = "1password"
+
+[ssh_profiles.btcd]
+provider = "onepassword"
+public_key = "op://Private/Example BTCD SSH Key/public key"
+
+[services.btcd]
+description = "SSH access to BTCD servers"
+hint = "via btcd shell btcd-01.internal.example.com"
+provider = "onepassword"
+
+[services.btcd.commands.shell]
+description = "Open a public-key-only SSH session as volt."
+mode = "ssh"
+profile = "btcd"
+user = "volt"
+hosts = ["btcd-*.internal.example.com", "192.0.2.10"]
+port = 22

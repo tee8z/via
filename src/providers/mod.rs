@@ -49,11 +49,19 @@ impl ProviderRegistry {
 }
 
 fn provider_secret_references(config: &Config, provider_name: &str) -> Vec<String> {
-    config
+    let service_references = config
         .services
         .values()
         .filter(|service| service.provider == provider_name)
-        .flat_map(|service| service.secrets.values().cloned())
+        .flat_map(|service| service.secrets.values().cloned());
+    let ssh_public_keys = config
+        .ssh_profiles
+        .values()
+        .filter(|profile| profile.provider == provider_name)
+        .map(|profile| profile.public_key.clone());
+
+    service_references
+        .chain(ssh_public_keys)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -92,6 +100,28 @@ type = "1password"
 
         assert!(
             matches!(error, ViaError::InvalidConfig(message) if message.contains("unknown provider"))
+        );
+    }
+
+    #[test]
+    fn includes_ssh_profile_public_keys_in_provider_allowlist() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[providers.onepassword]
+type = "1password"
+
+[ssh_profiles.production]
+provider = "onepassword"
+public_key = "op://Private/Production SSH/public key"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider_secret_references(&config, "onepassword"),
+            ["op://Private/Production SSH/public key"]
         );
     }
 }

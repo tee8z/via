@@ -2,7 +2,6 @@ version = 1
 
 [providers.onepassword]
 type = "1password"
-cache = "daemon"
 
 [services.grafana-staging]
 description = "Staging Grafana HTTP API access through a service account token"

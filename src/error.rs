@@ -43,6 +43,21 @@ pub enum ViaError {
         stderr: String,
     },
 
+    #[error("SSH command failed with status {status:?}")]
+    SshCommandFailed { status: Option<i32> },
+
+    #[error("SSH agent socket `{path}` is unavailable: {reason}")]
+    SshAgentUnavailable { path: PathBuf, reason: String },
+
+    #[error("resolved SSH public key is invalid: {0}")]
+    InvalidSshPublicKey(String),
+
+    #[error("configured SSH identity is not available from the selected agent")]
+    SshIdentityUnavailable,
+
+    #[error("SSH identity path cannot be passed safely to OpenSSH: {0}")]
+    InvalidSshIdentityPath(String),
+
     #[error("secret `{secret}` is not configured for service `{service}`")]
     UnknownSecret { service: String, secret: String },
 
@@ -69,6 +84,9 @@ impl ViaError {
                     0
                 }
             }
+            ViaError::SshCommandFailed { status: Some(code) } if (1..=255).contains(code) => {
+                *code as u8
+            }
             ViaError::InvalidCli(_)
             | ViaError::InvalidConfig(_)
             | ViaError::UnknownService(_)
@@ -81,6 +99,11 @@ impl ViaError {
             | ViaError::ParseConfig(_)
             | ViaError::MissingProgram { .. }
             | ViaError::ExternalCommandFailed { .. }
+            | ViaError::SshCommandFailed { .. }
+            | ViaError::SshAgentUnavailable { .. }
+            | ViaError::InvalidSshPublicKey(_)
+            | ViaError::SshIdentityUnavailable
+            | ViaError::InvalidSshIdentityPath(_)
             | ViaError::DoctorFailed
             | ViaError::Http(_)
             | ViaError::Json(_)
@@ -104,5 +127,22 @@ mod tests {
         let error = ViaError::ConfigNotFound("missing".to_owned());
 
         assert_eq!(error.exit_code(), 1);
+        assert_eq!(
+            ViaError::InvalidSshIdentityPath("unsafe path".to_owned()).exit_code(),
+            1
+        );
+    }
+
+    #[test]
+    fn ssh_errors_preserve_valid_child_exit_codes() {
+        assert_eq!(
+            ViaError::SshCommandFailed { status: Some(42) }.exit_code(),
+            42
+        );
+        assert_eq!(
+            ViaError::SshCommandFailed { status: Some(255) }.exit_code(),
+            255
+        );
+        assert_eq!(ViaError::SshCommandFailed { status: None }.exit_code(), 1);
     }
 }

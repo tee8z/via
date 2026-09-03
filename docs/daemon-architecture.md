@@ -1,12 +1,12 @@
 # Daemon Architecture
 
-`via` can cache 1Password reads in a small per-user daemon. The daemon is an
-implementation detail of the CLI: users do not install or configure a separate
-service.
+The `via` daemon reduces repeated 1Password reads. It stores resolved values
+and OAuth token state in per-user memory.
 
-On macOS and Linux, `cache = "daemon"` is the default for the 1Password
-provider. On Windows, the default is `cache = "off"` until the daemon has a
-named-pipe backend.
+The daemon is part of the CLI. Users do not install a separate service.
+
+On macOS and Linux, `cache = "daemon"` is the default for 1Password. On
+Windows, the default is `cache = "off"` until `via` has a named-pipe backend.
 
 ```toml
 [providers.onepassword]
@@ -15,120 +15,134 @@ cache = "daemon"
 cache_ttl_seconds = 300
 ```
 
-Set `cache = "off"` to make every CLI invocation call `op read` directly.
+Set `cache = "off"` to make each 1Password secret read call `op read`
+directly.
 
-## Flow
+## Request Flow
 
-```text
-first via invocation
-  |
-  | auto-starts, if needed
-  v
-via daemon serve
-  |
-  | REGISTER { config_hash, allowed_refs }
-  v
-daemon memory
-  - allowlist: config_hash -> ref_id -> op:// reference
-  - cache:     config_hash + ref_id -> secret value, expires_at
+Before a daemon-backed resolution, the client registers the references allowed
+by its configuration.
 
-normal secret resolve
-  |
-  | RESOLVE { config_hash, ref_id }
-  v
-daemon memory
-  |
-  | cache miss only
-  v
-op read op://...
-  |
-  v
-daemon cache
-  |
-  | secret value
-  v
-via command
+```mermaid
+sequenceDiagram
+    participant C as via command
+    participant D as via daemon
+    participant O as op CLI
+
+    C->>D: register { config_hash, account, refs }
+    D->>D: Store reference allowlist
+    C->>D: resolve { config_hash, ref_id, ttl_seconds }
+    alt Unexpired cache entry exists
+        D-->>C: Secret value (cache hit)
+    else Cache entry is absent or expired
+        D->>O: op read op://...
+        O-->>D: Secret value
+        D->>D: Cache value until TTL
+        D-->>C: Secret value (cache miss)
+    end
 ```
 
-The normal hot path sends only `config_hash` and `ref_id` over the socket. Raw
-`op://` references are sent during registration so the daemon can enforce the
-allowlist and perform `op read` on cache misses.
+The normal resolve request contains only `config_hash`, `ref_id`, and the
+configured time to live (TTL). The response contains the value that `via`
+needs.
 
-## Auto-Start
+Registration sends raw `op://` references. The daemon uses them to enforce the
+configuration allowlist and to run `op read` after a cache miss.
 
-Commands that need daemon-backed caching automatically start the daemon when
-the socket is unavailable. On Linux, `via` first uses the per-user systemd
-manager through `systemd-run --user`, when available. On macOS, `via` writes and
-starts a per-user LaunchAgent through `launchctl`. These managed starts keep the
-daemon alive after the invoking shell, editor task, or agent command exits.
+The daemon keeps these data structures in memory:
 
-If the platform service manager is unavailable, `via` falls back to spawning a
-detached daemon process directly. The fallback covers minimal shells,
-containers, and SSH environments, but the managed path is preferred because some
-editors and agent runners clean up child process groups after each command.
+| State | Key | Value | Removal condition |
+| --- | --- | --- | --- |
+| Reference allowlist | `config_hash` and `ref_id` | Configured `op://` reference | Clear, stop, idle exit, or restart |
+| Secret cache | `config_hash` and `ref_id` | Resolved value and expiry | TTL expiry, clear, stop, idle exit, or restart |
+| OAuth state | Credential-derived cache key | Access token and optional refresh state | Token expiry rules, clear, stop, idle exit, or restart |
 
-The daemon still exits automatically after 15 minutes without activity. A later
-`via` command starts it again with the same socket path.
+The default secret TTL is 300 seconds. The daemon removes expired entries
+before it handles each request.
 
-## Socket And Lifetime
+## Auto-Start And Lifetime
 
-The daemon listens on a Unix domain socket. The socket path is resolved in this
-order:
+A command that needs daemon-backed state starts the daemon when its socket is
+unavailable.
+
+On Linux, `via` first calls `systemd-run --user`. On macOS, `via` first creates
+and starts a per-user LaunchAgent through `launchctl`.
+
+These managed processes can survive the shell, editor task, or agent process
+that started them.
+
+If the user service manager is unavailable, `via` starts a detached daemon
+process. This fallback supports minimal shells, containers, and SSH sessions.
+
+The daemon exits after 15 minutes without a connection. A later command starts
+a new daemon at the same socket path.
+
+## Socket Location And Permissions
+
+The daemon listens on a Unix domain socket. `via` selects the first available
+location:
 
 1. `VIA_DAEMON_SOCKET`
 2. `$XDG_RUNTIME_DIR/via/daemon.sock`
-3. `/tmp/via-$UID/daemon.sock`
+3. `<system temporary directory>/via-<user-id>/daemon.sock`
 
-The socket directory is created with mode `0700`, and the socket file is set to
-`0600`. The daemon exits automatically after 15 minutes without activity.
+The fallback user ID is the nonempty `UID` value. If `UID` is unavailable,
+via uses the alphanumeric and underscore characters from `USER`. It uses
+`unknown` when neither value identifies the user.
 
-The cache is memory-only. Nothing is written to disk. 1Password secret cache
-entries expire after `cache_ttl_seconds`, defaulting to 300 seconds. OAuth
-access tokens and refresh-token state also live only in daemon memory while
-the daemon is running. `via daemon clear`, `via daemon stop`, daemon idle
-timeout, daemon restart, or machine reboot drops OAuth token state; for
-rotating-refresh-token services, complete OAuth setup again and update the
-configured 1Password credential bundle.
+`via` creates the socket directory with mode `0700`. It sets the socket file to
+mode `0600`.
 
-## Commands
+The daemon is unsupported on Windows. Windows daemon control commands report
+`via daemon: unsupported`.
+
+## Manage The Daemon
+
+Check its state:
 
 ```sh
 via daemon status
 ```
 
-Shows whether the daemon is running. If it is running, this also prints the
-number of cached memory entries.
+A running daemon reports `via daemon: running` and its cached entry count. An
+unavailable daemon reports `via daemon: stopped`.
+
+Clear all memory-held state:
 
 ```sh
 via daemon clear
 ```
 
-Clears cached secret values, OAuth token state, and registered allowlists. The
-daemon remains running. The next command invocation registers its configured
-refs again and repopulates the cache on demand.
+This command removes secret values, OAuth state, and registered allowlists. It
+keeps the daemon running.
+
+Stop the daemon:
 
 ```sh
 via daemon stop
 ```
 
-Stops the daemon. The next command that needs daemon caching auto-starts it
-again.
+The next command that needs daemon state starts it again.
 
-`via daemon serve` is an internal command used by auto-start. It is hidden from
-normal help output.
+`via daemon serve` is an internal auto-start command. Normal help output hides
+it.
 
-## Verifying Clear And Restart
+## Verify Cache Behavior
 
-Warm the daemon:
+Run a configured command twice with timing enabled:
 
 ```sh
 VIA_TIMING=1 via github api GET /repos/example-org/example-repo >/tmp/via.json
 VIA_TIMING=1 via github api GET /repos/example-org/example-repo >/tmp/via.json
 ```
 
-The second run should show `1password daemon resolve cache=hit` timing lines.
+The second run should include this timing result:
 
-Clear cached data without stopping the daemon:
+```text
+1password daemon resolve cache=hit
+```
+
+Clear the cache, then verify that the next request repopulates it:
 
 ```sh
 via daemon clear
@@ -136,10 +150,10 @@ via daemon status
 VIA_TIMING=1 via github api GET /repos/example-org/example-repo >/tmp/via.json
 ```
 
-After `clear`, `status` should show zero cached secrets. The next command should
-re-register refs and repopulate the cache.
+After `clear`, `status` should report zero cached entries. The next request
+should report a cache miss for each required value.
 
-Stop and auto-start:
+Stop the daemon, then verify auto-start:
 
 ```sh
 via daemon stop
@@ -148,39 +162,84 @@ VIA_TIMING=1 via github api GET /repos/example-org/example-repo >/tmp/via.json
 via daemon status
 ```
 
-After `stop`, `status` should report that the daemon is stopped. The next
-command that needs daemon caching starts it again.
+The first status should report `stopped`. The final status should report
+`running`.
 
-Validate the socket guard:
+## Verify The Socket Guard
+
+Run this executable-identity guard test only on Linux or macOS. Other Unix
+targets enforce socket permissions and reference registration without this
+peer-executable check.
+
+Choose a dedicated socket and start the daemon through a configured command.
+Keep the same variable set for the guard script:
 
 ```sh
-scripts/validate-daemon-socket-guard.sh
+guard_dir="$(mktemp -d)"
+guard_via="$(command -v via)"
+export VIA_DAEMON_SOCKET="$guard_dir/daemon.sock"
+VIA_TIMING=1 "$guard_via" github api GET /repos/example-org/example-repo >/tmp/via.json
+VIA_BIN="$guard_via" scripts/validate-daemon-socket-guard.sh
+"$guard_via" daemon stop
+rmdir "$guard_dir"
+unset VIA_DAEMON_SOCKET
 ```
 
-The script talks to the daemon as a raw non-`via` socket client and expects the
-daemon to reject the connection before handling any request. Set `VIA_BIN` or
-`VIA_DAEMON_SOCKET` if you are validating a non-default binary or socket.
+The script uses Python to connect as a raw, non-`via` socket client. It expects
+the daemon to reject each request before protocol handling. It requires
+`VIA_DAEMON_SOCKET` so the probe cannot derive a different platform default.
 
-## Security Notes
+The `VIA_BIN` value must match the executable that started the daemon.
 
-The daemon reduces repeated `op read` latency and avoids writing resolved
-1Password secrets to disk. Plaintext secrets still pass between the daemon and
-the requesting `via` process over the local socket because `via` needs the value
-to build headers, generate GitHub App tokens, or inject delegated command
-environment variables.
+A healthy run ends with:
 
-The socket permissions restrict access to the same local user. On macOS and
-Linux, the daemon also checks the connecting process executable before reading a
-request and only serves clients that resolve to the same `via` executable path
-or inode. This blocks a same-user script from casually speaking the daemon JSON
-protocol directly. The registration handshake protects normal operation by
-preventing arbitrary unregistered refs from being resolved through the hot path.
+```text
+PASS daemon still responds to via after raw-client probes
+```
 
-If you run agents that should not share secret access, run them under separate
-OS users, containers, or another sandbox with a separate `via` config and
-1Password session. The daemon executable check is defense in depth, not a full
-same-user sandbox: a process running as the same OS user can still run `via`
-itself, read local files available to that user, or invoke `op read` directly if
-the 1Password CLI session allows it. For untrusted same-user work, set
-`cache = "off"` or stop the daemon with `via daemon stop` before handing over
-execution.
+## Security Boundary
+
+Plaintext values pass through the local socket because the requesting process
+must build headers, generate tokens, or populate a delegated environment.
+
+The daemon never writes cached values to disk. OAuth access tokens and refresh
+state also remain in daemon memory.
+
+Socket permissions restrict connections to the local user. On Linux and
+macOS, the daemon also checks the peer process executable before reading its
+request.
+
+The daemon accepts a peer that matches its own `via` executable path or inode.
+The registration allowlist then blocks unregistered references on the normal
+resolve path.
+
+WARNING: Do not use the daemon as a security boundary between same-user
+processes. Use separate OS users, containers, or sandboxes for agents that must
+not share secret access.
+
+A same-user process can run `via`, read user-accessible files, or run `op read`
+when the 1Password session allows it. The executable check only adds defense in
+depth.
+
+For less 1Password secret retention, set `cache = "off"`. You can also run
+`via daemon stop` before handing execution to another process.
+
+These actions do not isolate a same-user process. That process can start the
+daemon again or use `op` directly.
+
+Rotating OAuth refresh tokens need additional care. A clear, stop, idle exit,
+restart, or reboot removes the newest in-memory refresh state.
+
+If that state disappears after rotation, complete OAuth setup again. Then
+update the configured 1Password credential bundle.
+
+## Troubleshoot From Observable Results
+
+| Result | Cause to check | Corrective action |
+| --- | --- | --- |
+| `via daemon status` reports `stopped` | No daemon-backed command has started the daemon. | Run a configured command that uses daemon state. |
+| Auto-start times out | The service manager and detached spawn both failed, or the socket never became ready. | Read the reported start attempts and fix the named executable or environment. |
+| Every timed request reports `cache=miss` | Entries expire, the daemon restarts, or the configuration hash changes. | Check `via daemon status`, the TTL, and recent config changes. |
+| `op read` fails after a cache miss | The daemon cannot find `op`, or 1Password authentication is unavailable. | Fix the daemon `PATH`, unlock 1Password, and run `op whoami`. |
+| A raw socket probe reaches the protocol on Linux or macOS | The executable guard did not reject the client. | Stop using the daemon and investigate the platform guard before continuing. |
+| OAuth stops after a daemon restart | A rotating refresh token existed only in daemon memory. | Repeat OAuth setup and update the 1Password credential bundle. |
