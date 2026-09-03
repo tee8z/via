@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::process::Command;
 
 use crate::config::{
     AuthConfig, CommandConfig, Config, OnePasswordCacheMode, ProviderConfig, RestCommandConfig,
-    ServiceConfig,
+    ServiceConfig, SshCommandConfig, SshProfileConfig,
 };
 use crate::error::ViaError;
 use crate::providers::ProviderRegistry;
@@ -14,16 +15,17 @@ pub fn run(config: &Config, only_service: Option<&str>) -> Result<(), ViaError> 
     let mut status = DoctorStatus::default();
     let provider_ready = check_providers(config, &mut status);
     let providers = ProviderRegistry::from_config(config)?;
+    let mut checked_ssh_profiles = BTreeSet::new();
+    let mut context = CommandCheckContext {
+        config,
+        provider_ready: &provider_ready,
+        providers: &providers,
+        checked_ssh_profiles: &mut checked_ssh_profiles,
+    };
 
     for (service_name, service) in &config.services {
         if should_check_service(service_name, only_service) {
-            check_service(
-                service_name,
-                service,
-                &provider_ready,
-                &providers,
-                &mut status,
-            )?;
+            check_service(&mut context, service_name, service, &mut status)?;
         }
     }
 
@@ -45,14 +47,14 @@ fn should_check_service(service_name: &str, only_service: Option<&str>) -> bool 
 }
 
 fn check_service(
+    context: &mut CommandCheckContext<'_>,
     service_name: &str,
     service: &ServiceConfig,
-    provider_ready: &BTreeMap<String, bool>,
-    providers: &ProviderRegistry,
     status: &mut DoctorStatus,
 ) -> Result<(), ViaError> {
     println!("service {service_name}: checking");
-    let service_provider_ready = provider_ready
+    let service_provider_ready = context
+        .provider_ready
         .get(&service.provider)
         .copied()
         .unwrap_or(false);
@@ -61,14 +63,14 @@ fn check_service(
         service_name,
         service,
         service_provider_ready,
-        providers,
+        context.providers,
         status,
     )?;
     check_service_commands(
+        context,
         service_name,
         service,
         service_provider_ready,
-        providers,
         status,
     )
 }
@@ -112,20 +114,20 @@ fn check_service_secrets(
 }
 
 fn check_service_commands(
+    context: &mut CommandCheckContext<'_>,
     service_name: &str,
     service: &ServiceConfig,
     service_provider_ready: bool,
-    providers: &ProviderRegistry,
     status: &mut DoctorStatus,
 ) -> Result<(), ViaError> {
     for (command_name, command) in &service.commands {
         check_service_command(
+            context,
             service_name,
             command_name,
             service,
             command,
             service_provider_ready,
-            providers,
             status,
         )?;
     }
@@ -133,13 +135,20 @@ fn check_service_commands(
     Ok(())
 }
 
+struct CommandCheckContext<'a> {
+    config: &'a Config,
+    provider_ready: &'a BTreeMap<String, bool>,
+    providers: &'a ProviderRegistry,
+    checked_ssh_profiles: &'a mut BTreeSet<String>,
+}
+
 fn check_service_command(
+    context: &mut CommandCheckContext<'_>,
     service_name: &str,
     command_name: &str,
     service: &ServiceConfig,
     command: &CommandConfig,
     service_provider_ready: bool,
-    providers: &ProviderRegistry,
     status: &mut DoctorStatus,
 ) -> Result<(), ViaError> {
     match command {
@@ -147,15 +156,244 @@ fn check_service_command(
             println!("  capability {command_name}: rest");
             print_rest_asset_hosts(rest);
             if service_provider_ready {
-                check_rest_auth(service_name, command_name, service, rest, providers, status)?;
+                check_rest_auth(
+                    service_name,
+                    command_name,
+                    service,
+                    rest,
+                    context.providers,
+                    status,
+                )?;
             }
         }
         CommandConfig::Delegated(delegated) => {
             check_delegated_command(command_name, &delegated.program, &delegated.check, status);
         }
+        CommandConfig::Ssh(ssh) => {
+            println!("  capability {command_name}: ssh");
+            if context.checked_ssh_profiles.insert(ssh.profile.clone()) {
+                check_ssh_command(
+                    context.config,
+                    service_name,
+                    &ssh.profile,
+                    ssh,
+                    context.provider_ready,
+                    context.providers,
+                    status,
+                )?;
+            } else {
+                println!("  SSH profile {}: already checked", ssh.profile);
+            }
+        }
     }
 
     Ok(())
+}
+
+fn check_ssh_command(
+    config: &Config,
+    service_name: &str,
+    profile_name: &str,
+    ssh: &SshCommandConfig,
+    provider_ready: &BTreeMap<String, bool>,
+    providers: &ProviderRegistry,
+    status: &mut DoctorStatus,
+) -> Result<(), ViaError> {
+    let Some(profile) = config.ssh_profiles.get(&ssh.profile) else {
+        status.fail();
+        println!("  SSH profile {}: not configured", ssh.profile);
+        print_agent_guidance(
+            "Ask the user to fix the configured SSH profile, then rerun `via config doctor`.",
+        );
+        return Ok(());
+    };
+    let (ssh_program, ssh_add_program) = crate::executor::ssh::resolve_ssh_programs(profile)?;
+    check_ssh_client(&ssh_program, status);
+
+    let public_key = check_ssh_public_key(
+        service_name,
+        profile_name,
+        profile,
+        provider_ready,
+        providers,
+        status,
+    )?;
+    check_ssh_agent(
+        service_name,
+        profile_name,
+        profile,
+        public_key.as_deref(),
+        &ssh_add_program,
+        status,
+    );
+    Ok(())
+}
+
+fn check_ssh_client(ssh_program: &Path, status: &mut DoctorStatus) {
+    match check_program_path(ssh_program, &["-V".to_owned()]) {
+        Ok(()) => println!("  OpenSSH client: ready"),
+        Err(error) => {
+            status.fail();
+            println!("  OpenSSH client: not ready");
+            print_error_hint(&error);
+            print_human_setup(&[
+                "Install the OpenSSH client at the configured trusted absolute path.",
+                "If OpenSSH is installed elsewhere, configure both `ssh_program` and `ssh_add_program`.",
+                "Rerun `via config doctor` after OpenSSH is available.",
+            ]);
+            print_agent_guidance(
+                "Ask the user to install or fix the OpenSSH client, then rerun `via config doctor`.",
+            );
+        }
+    }
+}
+
+fn check_ssh_public_key(
+    service_name: &str,
+    profile_name: &str,
+    profile: &SshProfileConfig,
+    provider_ready: &BTreeMap<String, bool>,
+    providers: &ProviderRegistry,
+    status: &mut DoctorStatus,
+) -> Result<Option<String>, ViaError> {
+    if !provider_ready
+        .get(&profile.provider)
+        .copied()
+        .unwrap_or(false)
+    {
+        status.fail();
+        println!(
+            "  SSH profile {profile_name} public key: skipped because provider `{}` is not ready",
+            profile.provider
+        );
+        print_agent_guidance(
+            "Ask the user to complete secret provider setup, then rerun `via config doctor`.",
+        );
+        return Ok(None);
+    }
+
+    let provider = providers.get(&profile.provider)?;
+    match provider.resolve(&profile.public_key) {
+        Ok(public_key) => match crate::executor::ssh::validate_public_key(public_key.expose()) {
+            Ok(public_key) => {
+                println!("  SSH profile {profile_name} public key: valid");
+                return Ok(Some(public_key));
+            }
+            Err(error) => {
+                status.fail();
+                println!("  SSH profile {profile_name} public key: invalid");
+                print_error_hint(&error);
+                print_ssh_public_key_setup(service_name);
+            }
+        },
+        Err(error) => {
+            status.fail();
+            println!("  SSH profile {profile_name} public key: not readable by via");
+            print_secret_error_hint(&error);
+            print_ssh_public_key_setup(service_name);
+        }
+    }
+
+    Ok(None)
+}
+
+fn print_ssh_public_key_setup(service_name: &str) {
+    print_human_setup(&[
+        "Confirm the SSH profile's `public_key` reference exists and is readable.",
+        "Store one OpenSSH public key line, such as `ssh-ed25519 <base64-data>`, at that reference.",
+        "Do not store or expose the corresponding private key in the via config.",
+        &format!(
+            "Rerun `via config doctor {service_name}` after fixing the SSH public key reference."
+        ),
+    ]);
+    print_agent_guidance(
+        "Ask the user to fix the SSH public key reference; do not ask for the private key.",
+    );
+}
+
+fn check_ssh_agent(
+    service_name: &str,
+    profile_name: &str,
+    profile: &SshProfileConfig,
+    public_key: Option<&str>,
+    ssh_add_program: &Path,
+    status: &mut DoctorStatus,
+) {
+    let socket = match crate::executor::ssh::resolve_agent_socket(profile) {
+        Ok(socket) => socket,
+        Err(error) => {
+            status.fail();
+            println!("  SSH profile {profile_name} agent: not configured");
+            print_error_hint(&error);
+            print_ssh_agent_setup(service_name);
+            return;
+        }
+    };
+
+    let Some(public_key) = public_key else {
+        println!(
+            "  SSH profile {profile_name} agent identity: skipped because the configured public key is not ready"
+        );
+        return;
+    };
+
+    let result = crate::executor::ssh::verify_agent_identity_with_program(
+        ssh_add_program,
+        &socket,
+        public_key,
+    );
+    report_ssh_agent_result(service_name, profile_name, result, status);
+}
+
+fn print_ssh_agent_setup(service_name: &str) {
+    print_human_setup(&[
+        "Open and unlock the 1Password desktop app.",
+        "Enable the 1Password SSH agent in the desktop app developer settings.",
+        "On Unix, if the profile uses `agent_socket`, confirm that it is the absolute path to a live agent socket.",
+        "Confirm the configured `ssh_add_program` exists when using custom OpenSSH paths.",
+        &format!("Rerun `via config doctor {service_name}` after the SSH agent is available."),
+    ]);
+    print_agent_guidance(
+        "Ask the user to enable or fix the configured SSH agent; do not ask for the private key.",
+    );
+}
+
+fn report_ssh_agent_result(
+    service_name: &str,
+    profile_name: &str,
+    result: Result<(), ViaError>,
+    status: &mut DoctorStatus,
+) {
+    match result {
+        Ok(()) => {
+            println!("  SSH profile {profile_name} agent socket: available");
+            println!("  SSH profile {profile_name} selected key: available");
+        }
+        Err(ViaError::SshIdentityUnavailable) => {
+            status.fail();
+            println!("  SSH profile {profile_name} agent socket: available");
+            println!("  SSH profile {profile_name} selected key: unavailable");
+            print_ssh_agent_setup(service_name);
+        }
+        Err(ViaError::MissingProgram { .. }) => {
+            status.fail();
+            println!("  SSH profile {profile_name} agent identity: not verified");
+            println!("  reason: the configured `ssh-add` program was not found");
+            print_ssh_agent_setup(service_name);
+        }
+        Err(ViaError::ExternalCommandFailed { status: code, .. }) => {
+            status.fail();
+            println!("  SSH profile {profile_name} agent identity: unavailable");
+            println!("  reason: `ssh-add -L` could not list identities; status {code:?}");
+            print_ssh_agent_setup(service_name);
+        }
+        Err(_) => {
+            status.fail();
+            println!("  SSH profile {profile_name} agent identity: unavailable");
+            println!("  reason: the configured SSH agent could not be queried");
+            print_ssh_agent_setup(service_name);
+        }
+    }
 }
 
 fn print_rest_asset_hosts(rest: &RestCommandConfig) {
@@ -371,6 +609,32 @@ fn check_program(program: &str, check: &[String]) -> Result<(), ViaError> {
     };
 
     run_command(program, &args).map(|_| ())
+}
+
+fn check_program_path(program: &Path, check: &[String]) -> Result<(), ViaError> {
+    let args = if check.is_empty() {
+        vec!["--version".to_owned()]
+    } else {
+        check.to_owned()
+    };
+    let display = program.display().to_string();
+
+    let mut command = Command::new(program);
+    command.args(&args).env_clear();
+    crate::executor::ssh::pass_safe_env(&mut command);
+
+    match command.output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(ViaError::ExternalCommandFailed {
+            program: display,
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        }),
+        Err(source) => Err(ViaError::MissingProgram {
+            program: display,
+            source,
+        }),
+    }
 }
 
 fn check_providers(config: &Config, status: &mut DoctorStatus) -> BTreeMap<String, bool> {
@@ -678,7 +942,7 @@ fn print_delegated_failure(command_name: &str, program: &str, error: &ViaError) 
 fn print_error_hint(error: &ViaError) {
     match error {
         ViaError::MissingProgram { program, .. } => {
-            println!("  reason: `{program}` was not found on PATH");
+            println!("  reason: `{program}` was not found or could not be started");
         }
         ViaError::ExternalCommandFailed { status, stderr, .. } => {
             println!("  reason: command exited with status {status:?}");
@@ -829,6 +1093,53 @@ base_url = "https://api.example.com"
         let output = run_command("sh", &["-c".to_owned(), "printf 'ready\\n'".to_owned()]).unwrap();
 
         assert_eq!(output.stdout, "ready");
+    }
+
+    #[test]
+    fn validates_openssh_public_key_wire_format() {
+        let key = test_public_key("ssh-ed25519");
+
+        assert!(crate::executor::ssh::validate_public_key(&key).is_ok());
+        assert!(crate::executor::ssh::validate_public_key(&format!("{key} workstation")).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_openssh_public_keys_with_shared_validator() {
+        let mismatched = test_public_key("ssh-ed25519").replacen("ssh-ed25519", "ssh-rsa", 1);
+
+        assert!(crate::executor::ssh::validate_public_key("not-a-public-key").is_err());
+        assert!(crate::executor::ssh::validate_public_key(&mismatched).is_err());
+        assert!(crate::executor::ssh::validate_public_key(&format!(
+            "{}\n{}",
+            test_public_key("ssh-ed25519"),
+            test_public_key("ssh-ed25519")
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn ssh_identity_failure_marks_doctor_check_failed() {
+        let mut status = DoctorStatus::default();
+
+        report_ssh_agent_result(
+            "example",
+            "production",
+            Err(ViaError::SshIdentityUnavailable),
+            &mut status,
+        );
+
+        assert!(matches!(status.into_result(), Err(ViaError::DoctorFailed)));
+    }
+
+    fn test_public_key(key_type: &str) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(key_type.len() as u32).to_be_bytes());
+        blob.extend_from_slice(key_type.as_bytes());
+        blob.extend_from_slice(&[1, 2, 3, 4]);
+        format!("{key_type} {}", STANDARD.encode(blob))
     }
 
     #[test]

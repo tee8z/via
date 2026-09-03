@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["tee8z <tee8z@protonmail.com>"]
 license = "MIT"
 repository = "https://github.com/tee8z/via"
-description = "Run commands and API requests with 1Password-backed credentials without exposing secrets to your shell"
+description = "Run commands, SSH sessions, and API requests with 1Password-backed credentials without exposing secrets to your shell"
 keywords = ["cli", "credentials"]
 categories = ["command-line-utilities"]
 
@@ -32,3 +32,6 @@ toml = { version = "1", default-features = false, features = ["parse", "serde", 
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }

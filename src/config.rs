@@ -13,6 +13,8 @@ pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
+    pub ssh_profiles: BTreeMap<String, SshProfileConfig>,
+    #[serde(default)]
     pub services: BTreeMap<String, ServiceConfig>,
 }
 
@@ -57,6 +59,8 @@ pub enum CommandConfig {
     Rest(RestCommandConfig),
     #[serde(rename = "delegated")]
     Delegated(DelegatedCommandConfig),
+    #[serde(rename = "ssh")]
+    Ssh(SshCommandConfig),
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -64,6 +68,32 @@ pub enum CommandConfig {
 pub enum CapabilityMode {
     Rest,
     Delegated,
+    Ssh,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshProfileConfig {
+    pub provider: String,
+    pub public_key: String,
+    #[serde(default)]
+    pub agent_socket: Option<PathBuf>,
+    #[serde(default)]
+    pub ssh_program: Option<PathBuf>,
+    #[serde(default)]
+    pub ssh_add_program: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshCommandConfig {
+    #[serde(default)]
+    pub description: Option<String>,
+    pub profile: String,
+    pub user: String,
+    pub hosts: Vec<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +192,10 @@ impl Config {
             )));
         }
 
+        for (profile_name, profile) in &self.ssh_profiles {
+            validate_ssh_profile(profile_name, profile, &self.providers)?;
+        }
+
         for (service_name, service) in &self.services {
             if !self.providers.contains_key(&service.provider) {
                 return Err(ViaError::InvalidConfig(format!(
@@ -179,7 +213,7 @@ impl Config {
             }
 
             for (command_name, command) in &service.commands {
-                command.validate(service_name, command_name, service)?;
+                command.validate(service_name, command_name, service, &self.ssh_profiles)?;
             }
         }
 
@@ -199,6 +233,7 @@ impl CommandConfig {
         match self {
             CommandConfig::Rest(config) => config.description.as_ref(),
             CommandConfig::Delegated(config) => config.description.as_ref(),
+            CommandConfig::Ssh(config) => config.description.as_ref(),
         }
     }
 
@@ -206,6 +241,7 @@ impl CommandConfig {
         match self {
             CommandConfig::Rest(_) => CapabilityMode::Rest,
             CommandConfig::Delegated(_) => CapabilityMode::Delegated,
+            CommandConfig::Ssh(_) => CapabilityMode::Ssh,
         }
     }
 
@@ -214,6 +250,7 @@ impl CommandConfig {
         service_name: &str,
         command_name: &str,
         service: &ServiceConfig,
+        ssh_profiles: &BTreeMap<String, SshProfileConfig>,
     ) -> Result<(), ViaError> {
         match self {
             CommandConfig::Rest(rest) => {
@@ -273,10 +310,150 @@ impl CommandConfig {
                     validate_secret_name(service_name, command_name, service, &binding.secret)?;
                 }
             }
+            CommandConfig::Ssh(ssh) => {
+                if !ssh_profiles.contains_key(&ssh.profile) {
+                    return Err(ViaError::InvalidConfig(format!(
+                        "command `{service_name}.{command_name}` references unknown SSH profile `{}`",
+                        ssh.profile
+                    )));
+                }
+                validate_ssh_user(service_name, command_name, &ssh.user)?;
+                if ssh.hosts.is_empty() {
+                    return Err(ViaError::InvalidConfig(format!(
+                        "command `{service_name}.{command_name}` must allow at least one SSH host pattern"
+                    )));
+                }
+                for pattern in &ssh.hosts {
+                    validate_ssh_host_pattern(service_name, command_name, pattern)?;
+                }
+                if ssh.port == Some(0) {
+                    return Err(ViaError::InvalidConfig(format!(
+                        "command `{service_name}.{command_name}` SSH port must be between 1 and 65535"
+                    )));
+                }
+            }
         }
 
         Ok(())
     }
+}
+
+fn validate_ssh_profile(
+    profile_name: &str,
+    profile: &SshProfileConfig,
+    providers: &BTreeMap<String, ProviderConfig>,
+) -> Result<(), ViaError> {
+    if profile_name.trim().is_empty() || profile_name.trim() != profile_name {
+        return Err(ViaError::InvalidConfig(
+            "SSH profile names must be non-empty and may not start or end with whitespace"
+                .to_owned(),
+        ));
+    }
+    if !providers.contains_key(&profile.provider) {
+        return Err(ViaError::InvalidConfig(format!(
+            "SSH profile `{profile_name}` references unknown provider `{}`",
+            profile.provider
+        )));
+    }
+    if !profile.public_key.starts_with("op://") {
+        return Err(ViaError::InvalidConfig(format!(
+            "SSH profile `{profile_name}` public_key must be an op:// reference"
+        )));
+    }
+    if let Some(agent_socket) = &profile.agent_socket {
+        if !agent_socket.is_absolute() {
+            return Err(ViaError::InvalidConfig(format!(
+                "SSH profile `{profile_name}` agent_socket must be an absolute path"
+            )));
+        }
+        #[cfg(windows)]
+        if agent_socket != Path::new(r"\\.\pipe\openssh-ssh-agent") {
+            return Err(ViaError::InvalidConfig(format!(
+                "SSH profile `{profile_name}` agent_socket must use the Windows OpenSSH agent pipe"
+            )));
+        }
+    }
+    for (field, program) in [
+        ("ssh_program", profile.ssh_program.as_ref()),
+        ("ssh_add_program", profile.ssh_add_program.as_ref()),
+    ] {
+        if program.is_some_and(|program| !program.is_absolute()) {
+            return Err(ViaError::InvalidConfig(format!(
+                "SSH profile `{profile_name}` {field} must be an absolute path"
+            )));
+        }
+    }
+    if profile.ssh_program.is_some() != profile.ssh_add_program.is_some() {
+        return Err(ViaError::InvalidConfig(format!(
+            "SSH profile `{profile_name}` must configure ssh_program and ssh_add_program together"
+        )));
+    }
+    if let (Some(ssh), Some(ssh_add)) = (&profile.ssh_program, &profile.ssh_add_program) {
+        if ssh.parent() != ssh_add.parent() {
+            return Err(ViaError::InvalidConfig(format!(
+                "SSH profile `{profile_name}` ssh_program and ssh_add_program must use the same directory"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_ssh_user(service_name: &str, command_name: &str, user: &str) -> Result<(), ViaError> {
+    let valid = !user.is_empty()
+        && user.len() <= 255
+        && !user.starts_with('-')
+        && user
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if valid {
+        return Ok(());
+    }
+
+    Err(ViaError::InvalidConfig(format!(
+        "command `{service_name}.{command_name}` SSH user must contain only letters, digits, `.`, `_`, or `-` and may not start with `-`"
+    )))
+}
+
+fn validate_ssh_host_pattern(
+    service_name: &str,
+    command_name: &str,
+    pattern: &str,
+) -> Result<(), ViaError> {
+    if valid_ssh_host_value(pattern, true) {
+        return Ok(());
+    }
+
+    Err(ViaError::InvalidConfig(format!(
+        "command `{service_name}.{command_name}` has invalid SSH host pattern `{pattern}`"
+    )))
+}
+
+pub(crate) fn valid_ssh_host_value(value: &str, allow_wildcards: bool) -> bool {
+    if value.is_empty()
+        || value.len() > 1024
+        || value.trim() != value
+        || value.starts_with('-')
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || value.contains('/')
+        || value.contains('@')
+        || value.contains('[')
+        || value.contains(']')
+        || (!allow_wildcards && (value.contains('*') || value.contains('?')))
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'-' | b'_' | b':' | b'%')
+                || (allow_wildcards && matches!(byte, b'*' | b'?'))
+        })
+    {
+        return false;
+    }
+
+    // A single colon is host:port syntax, not an IPv6 literal. Ports are fixed by
+    // the SSH capability instead of being accepted from the invocation.
+    value.bytes().filter(|byte| *byte == b':').count() != 1
 }
 
 fn validate_asset_hosts(
@@ -368,10 +545,46 @@ fn default_config_path() -> Result<PathBuf, ViaError> {
         return Ok(local);
     }
 
+    #[cfg(windows)]
+    let home = windows_config_home(
+        env::var_os("HOME").map(PathBuf::from),
+        env::var_os("USERPROFILE").map(PathBuf::from),
+        env::var_os("HOMEDRIVE").map(PathBuf::from),
+        env::var_os("HOMEPATH").map(PathBuf::from),
+    )
+    .ok_or_else(|| {
+        ViaError::ConfigNotFound(
+            "HOME or USERPROFILE must be set, or HOMEDRIVE and HOMEPATH must identify an absolute path"
+                .to_owned(),
+        )
+    })?;
+
+    #[cfg(not(windows))]
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| ViaError::ConfigNotFound("HOME is not set".to_owned()))?;
+
     Ok(home.join(".config").join("via").join("config.toml"))
+}
+
+#[cfg(windows)]
+fn windows_config_home(
+    home: Option<PathBuf>,
+    user_profile: Option<PathBuf>,
+    home_drive: Option<PathBuf>,
+    home_path: Option<PathBuf>,
+) -> Option<PathBuf> {
+    nonempty_path(home)
+        .or_else(|| nonempty_path(user_profile))
+        .or_else(|| {
+            let combined = nonempty_path(home_drive)?.join(nonempty_path(home_path)?);
+            combined.is_absolute().then_some(combined)
+        })
+}
+
+#[cfg(windows)]
+fn nonempty_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.filter(|path| !path.as_os_str().is_empty())
 }
 
 #[cfg(test)]
@@ -411,6 +624,28 @@ check = ["--version"]
 secret = "token"
 "#;
 
+    const SSH_VALID: &str = r#"
+version = 1
+
+[providers.onepassword]
+type = "1password"
+
+[ssh_profiles.production]
+provider = "onepassword"
+public_key = "op://Private/Production SSH/public key"
+
+[services.nodes]
+provider = "onepassword"
+
+[services.nodes.commands.connect]
+description = "Connect to a production node"
+mode = "ssh"
+profile = "production"
+user = "volt"
+hosts = ["btcd-*.internal", "2001:db8::*"]
+port = 22
+"#;
+
     #[test]
     fn parses_valid_config() {
         let config = Config::from_toml_str(VALID).unwrap();
@@ -422,6 +657,140 @@ secret = "token"
         );
         assert!(config.services["github"].commands.contains_key("api"));
         assert!(config.services["github"].commands.contains_key("gh"));
+    }
+
+    #[test]
+    fn parses_valid_ssh_profile_and_command() {
+        let config = Config::from_toml_str(SSH_VALID).unwrap();
+
+        let profile = &config.ssh_profiles["production"];
+        assert_eq!(profile.provider, "onepassword");
+        assert_eq!(profile.public_key, "op://Private/Production SSH/public key");
+        assert!(profile.agent_socket.is_none());
+        match &config.services["nodes"].commands["connect"] {
+            CommandConfig::Ssh(ssh) => {
+                assert_eq!(ssh.user, "volt");
+                assert_eq!(ssh.port, Some(22));
+                assert_eq!(ssh.hosts, ["btcd-*.internal", "2001:db8::*"]);
+            }
+            _ => panic!("expected SSH command"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_ssh_profile_provider_and_command_profile() {
+        let unknown_provider = SSH_VALID.replace(
+            "[ssh_profiles.production]\nprovider = \"onepassword\"",
+            "[ssh_profiles.production]\nprovider = \"missing\"",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&unknown_provider),
+            Err(ViaError::InvalidConfig(message)) if message.contains("unknown provider")
+        ));
+
+        let unknown_profile =
+            SSH_VALID.replace("profile = \"production\"", "profile = \"missing\"");
+        assert!(matches!(
+            Config::from_toml_str(&unknown_profile),
+            Err(ViaError::InvalidConfig(message)) if message.contains("unknown SSH profile")
+        ));
+    }
+
+    #[test]
+    fn rejects_plaintext_ssh_public_key_and_relative_agent_socket() {
+        let plaintext =
+            SSH_VALID.replace("op://Private/Production SSH/public key", "ssh-ed25519 AAAA");
+        assert!(matches!(
+            Config::from_toml_str(&plaintext),
+            Err(ViaError::InvalidConfig(message)) if message.contains("public_key must be an op://")
+        ));
+
+        let relative_socket = SSH_VALID.replace(
+            "public_key = \"op://Private/Production SSH/public key\"",
+            "public_key = \"op://Private/Production SSH/public key\"\nagent_socket = \"agent.sock\"",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&relative_socket),
+            Err(ViaError::InvalidConfig(message)) if message.contains("agent_socket must be an absolute path")
+        ));
+
+        for field in ["ssh_program", "ssh_add_program"] {
+            let relative_program = SSH_VALID.replace(
+                "public_key = \"op://Private/Production SSH/public key\"",
+                &format!(
+                    "public_key = \"op://Private/Production SSH/public key\"\n{field} = \"ssh\""
+                ),
+            );
+            assert!(matches!(
+                Config::from_toml_str(&relative_program),
+                Err(ViaError::InvalidConfig(message)) if message.contains(&format!("{field} must be an absolute path"))
+            ));
+        }
+
+        #[cfg(windows)]
+        let absolute_ssh = r"'C:\OpenSSH\ssh.exe'";
+        #[cfg(not(windows))]
+        let absolute_ssh = r#""/usr/bin/ssh""#;
+        let incomplete_programs = SSH_VALID.replace(
+            "public_key = \"op://Private/Production SSH/public key\"",
+            &format!(
+                "public_key = \"op://Private/Production SSH/public key\"\nssh_program = {absolute_ssh}"
+            ),
+        );
+        assert!(matches!(
+            Config::from_toml_str(&incomplete_programs),
+            Err(ViaError::InvalidConfig(message)) if message.contains("ssh_program and ssh_add_program together")
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_ssh_user_hosts_and_port() {
+        for (old, new, expected) in [
+            ("user = \"volt\"", "user = \"-oProxyCommand=x\"", "SSH user"),
+            (
+                "hosts = [\"btcd-*.internal\", \"2001:db8::*\"]",
+                "hosts = []",
+                "at least one SSH host pattern",
+            ),
+            (
+                "hosts = [\"btcd-*.internal\", \"2001:db8::*\"]",
+                "hosts = [\"user@host\"]",
+                "invalid SSH host pattern",
+            ),
+            ("port = 22", "port = 0", "SSH port"),
+            (
+                "hosts = [\"btcd-*.internal\", \"2001:db8::*\"]",
+                "hosts = [\"host;unexpected\"]",
+                "invalid SSH host pattern",
+            ),
+        ] {
+            let raw = SSH_VALID.replace(old, new);
+            assert!(
+                matches!(
+                    Config::from_toml_str(&raw),
+                    Err(ViaError::InvalidConfig(message)) if message.contains(expected)
+                ),
+                "expected `{expected}` rejection"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_security_fields_reject_typos() {
+        let profile_typo = SSH_VALID.replace(
+            "public_key = \"op://Private/Production SSH/public key\"",
+            "public_key = \"op://Private/Production SSH/public key\"\nagent_soket = \"/tmp/agent.sock\"",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&profile_typo),
+            Err(ViaError::ParseConfig(message)) if message.to_string().contains("unknown field")
+        ));
+
+        let command_typo = SSH_VALID.replace("port = 22", "port = 22\nporrt = 2222");
+        assert!(matches!(
+            Config::from_toml_str(&command_typo),
+            Err(ViaError::ParseConfig(message)) if message.to_string().contains("unknown field")
+        ));
     }
 
     #[test]
@@ -623,5 +992,60 @@ type = "headers""#,
             Config::from_toml_str(&raw),
             Err(ViaError::InvalidConfig(message)) if message.contains("delegated program")
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_home_prefers_home_then_user_profile() {
+        assert_eq!(
+            windows_config_home(
+                Some(PathBuf::from(r"C:\home")),
+                Some(PathBuf::from(r"C:\Users\via")),
+                Some(PathBuf::from("D:")),
+                Some(PathBuf::from(r"\Users\via")),
+            ),
+            Some(PathBuf::from(r"C:\home"))
+        );
+        assert_eq!(
+            windows_config_home(
+                Some(PathBuf::new()),
+                Some(PathBuf::from(r"C:\Users\via")),
+                Some(PathBuf::from("D:")),
+                Some(PathBuf::from(r"\Users\via")),
+            ),
+            Some(PathBuf::from(r"C:\Users\via"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_home_combines_home_drive_and_home_path() {
+        assert_eq!(
+            windows_config_home(
+                None,
+                Some(PathBuf::new()),
+                Some(PathBuf::from("D:")),
+                Some(PathBuf::from(r"\Users\via")),
+            ),
+            Some(PathBuf::from(r"D:\Users\via"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_home_rejects_incomplete_or_relative_fallbacks() {
+        assert_eq!(
+            windows_config_home(None, None, Some(PathBuf::from("D:")), None),
+            None
+        );
+        assert_eq!(
+            windows_config_home(
+                None,
+                None,
+                Some(PathBuf::from("D:")),
+                Some(PathBuf::from(r"Users\via")),
+            ),
+            None
+        );
     }
 }

@@ -1,46 +1,65 @@
 # Linear OAuth App-Actor Setup
 
-This guide configures Linear OAuth for a via capability. The local via config contains no secret values: it points to one 1Password field that stores the OAuth client and token material.
+Use this guide to give `via` app-actor access to the Linear API.
+The local config stores one 1Password reference, not OAuth tokens or secrets.
 
-via uses Linear's REST OAuth token endpoint:
+OAuth authentication requires the local via daemon and therefore works only
+on Unix-like platforms. It is unavailable on Windows.
 
-```text
-POST https://api.linear.app/oauth/token
-Content-Type: application/x-www-form-urlencoded
-```
+`via` uses two Linear endpoints for different purposes:
 
-via does not use GraphQL for OAuth token minting or refresh.
+| Purpose | Method and endpoint |
+| --- | --- |
+| Mint or refresh an OAuth token | `POST https://api.linear.app/oauth/token` |
+| Query or change workspace data | `POST https://api.linear.app/graphql` |
 
-Linear's documented public workspace API is GraphQL. via still models the Linear command as `mode = "rest"` because it sends plain HTTP requests, but normal Linear operations are expected to call `POST /graphql`. The REST-only requirement here applies to OAuth token minting and refresh, not to Linear's workspace API shape.
+OAuth token requests use `application/x-www-form-urlencoded` content.
+Workspace requests use Linear's GraphQL API.
+
+The capability uses `mode = "rest"` because `via` sends HTTP requests.
+The mode name does not change Linear's GraphQL workspace API.
+
+## Before You Start
+
+Confirm that you can create and configure a Linear OAuth2 application.
+Choose whether the workflow must act as the app or as a specific user.
+
+Use client credentials for an app actor.
+Use the refresh-token fallback only for a user actor.
 
 ## 1. Create The Linear OAuth App
 
-Create an OAuth2 application in Linear. For coding agents and bots, enable client credentials tokens on the OAuth app so Linear issues an app-actor token instead of a user-actor token.
+Create an OAuth2 application in Linear.
+Enable client credentials tokens in the application settings.
 
-Choose the smallest scope set the workflow needs. Linear supports scopes such as:
+Client credentials produce an app-actor token.
+Actions performed with that token appear as the app, not a user.
 
-```text
-read
-write
-issues:create
-comments:create
-timeSchedule:write
-admin
-```
+Grant the smallest scope set that covers the workflow:
 
-Avoid `admin` unless the configured workflow actually needs admin-level API access.
+| Scope | Use |
+| --- | --- |
+| `read` | Read workspace data |
+| `write` | Write workspace data |
+| `issues:create` | Create issues and their attachments |
+| `comments:create` | Create issue comments |
+| `timeSchedule:write` | Create or change time schedules |
+| `admin` | Access admin-level endpoints |
 
-## 2. Store The Credential In 1Password
+Do not grant `admin` unless the workflow requires admin-level access.
 
-Create a 1Password item in the vault you want via to read from, for example:
+## 2. Store The App Credential In 1Password
 
-```text
-Vault: Private
-Item: Example Linear OAuth
-Field: credential
-```
+Create a 1Password item in a vault that `via` can read.
+This guide uses these example names:
 
-Store JSON like:
+| 1Password location | Example name |
+| --- | --- |
+| Vault | `Private` |
+| Item | `Example Linear OAuth` |
+| Field | `credential` |
+
+Store this JSON in the `credential` field:
 
 ```json
 {
@@ -53,36 +72,27 @@ Store JSON like:
 }
 ```
 
-The 1Password reference should look like:
+The reference has this form:
 
 ```text
 op://Private/Example Linear OAuth/credential
 ```
 
-This setup does not store or require a refresh token. via asks the daemon to mint an access token from the Linear REST `/oauth/token` endpoint, then keeps that access token only in daemon memory until it expires or the daemon exits. If the daemon loses the token, via can mint another one from the same 1Password client credentials without touching Linear setup again.
+> **WARNING:** Keep `client_secret` and all OAuth tokens out of `via.toml`,
+> source control, shell history, issue comments, and prompts. Exposed material
+> can grant the configured Linear access.
 
-Linear allows one active client-credentials token per OAuth app. If another machine or daemon mints a token for the same app and Linear returns `401 Unauthorized` for the previous token, via retries the REST request once with a freshly minted daemon token.
+This client-credentials bundle does not contain a refresh token.
+The local `via` daemon mints and caches the access token in memory.
+If the daemon loses that token, it can mint another from the same credential.
 
-## 3. Optional User-Actor Fallback
+Linear allows multiple active client-credentials tokens when their scopes match.
+Requesting a token with different scopes revokes existing app-actor tokens.
+If Linear returns `401 Unauthorized`, `via` retries once with a fresh token.
 
-Use a refresh-token credential only when the workflow must act as a specific user rather than the Linear app. Complete Linear's authorization-code flow outside via, then store JSON like:
+## 3. Configure `via`
 
-```json
-{
-  "type": "service_oauth",
-  "token_url": "https://api.linear.app/oauth/token",
-  "grant_type": "refresh_token",
-  "client_id": "lin_client_id",
-  "client_secret": "lin_client_secret",
-  "refresh_token": "linear_refresh_token"
-}
-```
-
-Linear refresh tokens rotate. via keeps the newest access token and refresh token only in daemon memory while the daemon is running so future invocations can keep working after the original 1Password refresh token has been consumed. OAuth tokens are not written to disk. If the daemon idles out, is stopped, cleared, restarted, or the machine reboots after a refresh token has rotated, complete the Linear OAuth flow again and update the 1Password field with a fresh credential bundle.
-
-## 4. Configure via
-
-Use this local config shape:
+Add this service to `via.toml`:
 
 ```toml
 version = 1
@@ -111,20 +121,20 @@ type = "oauth"
 credential = "oauth"
 ```
 
-The `oauth` auth type resolves the configured credential bundle, asks the local via daemon to mint or refresh an access token through Linear's REST OAuth endpoint, then sends the request with:
+The `oauth` auth type performs these operations:
 
-```text
-Authorization: Bearer <access-token>
-```
+1. Resolve the credential bundle from 1Password.
+2. Ask the local `via` daemon for an access token.
+3. Mint or reuse a token through Linear's OAuth endpoint.
+4. Send the API request with `Authorization: Bearer <access-token>`.
 
-Linear file storage lives on `uploads.linear.app`, outside the GraphQL API host.
-The `asset_hosts` allowlist lets the same REST capability fetch those URLs with
-the same internally managed OAuth bearer token, without exposing the token to the
-caller.
+The `asset_hosts` setting permits absolute URLs only for
+`uploads.linear.app`. `via` can send the same OAuth bearer token to this
+allowlisted host without exposing the token to the caller.
 
-## 5. Verify
+## 4. Verify The App Actor
 
-Check local setup:
+Authenticate to 1Password and inspect the service:
 
 ```sh
 via login
@@ -132,32 +142,108 @@ via config doctor linear
 via capabilities
 ```
 
-Then make a small authenticated Linear API request:
+A healthy doctor result confirms that `via` can read and parse the OAuth bundle.
+
+Query the authenticated actor:
 
 ```sh
 via linear api POST /graphql --json '{"query":"{ viewer { id name } }"}'
 ```
 
-This verifies that via can read the 1Password credential bundle, mint a Linear `client_credentials` token through the REST `/oauth/token` endpoint, attach it as a bearer token, and have Linear accept it as the app actor.
+A successful response contains the Linear app actor in `data.viewer`.
+Also inspect the response for a GraphQL `errors` array.
 
-To download a private Linear upload from markdown returned by the API, write the
-raw response to a file:
+## 5. Download Linear Files
+
+Linear stores private uploads on `uploads.linear.app`.
+The configured `asset_hosts` entry allows authenticated downloads from that
+exact host.
+
+Write a private upload to a local file:
 
 ```sh
 via linear api GET "https://uploads.linear.app/<workspace>/<object>/<file>" --output /tmp/linear-upload.bin
 ```
 
-Linear also supports signed temporary file URLs in GraphQL responses. If a
-workflow only needs to parse issue descriptions or comments and then download the
-file separately, add this static header so Linear can sign returned file-storage
-URLs:
+Linear can also return signed temporary file URLs in GraphQL responses.
+Add this static header when a workflow needs those URLs:
 
 ```toml
 [services.linear.commands.api.headers]
 "public-file-urls-expire-in" = "300"
 ```
 
-With that header, Linear can return file URLs that are temporarily accessible
-without forwarding the OAuth bearer token to the file-storage host.
+The value is the signature lifetime in seconds.
+Download a signed URL with an unauthenticated client outside this capability
+to avoid forwarding the OAuth bearer token. The configured via capability
+adds OAuth authentication to every request, including allowlisted asset URLs.
 
-If doctor reports an invalid OAuth bundle, fix the JSON stored in 1Password. Do not paste OAuth tokens, client secrets, or refresh tokens into terminal output, issue comments, or prompts.
+## User-Actor Fallback
+
+Use this fallback only when the workflow must act as a specific user.
+Complete Linear's authorization-code flow outside `via`.
+
+Store the resulting refresh-token bundle in the same 1Password field:
+
+```json
+{
+  "type": "service_oauth",
+  "token_url": "https://api.linear.app/oauth/token",
+  "grant_type": "refresh_token",
+  "client_id": "lin_client_id",
+  "client_secret": "lin_client_secret",
+  "refresh_token": "linear_refresh_token"
+}
+```
+
+Linear rotates refresh tokens.
+`via` keeps the newest access and refresh tokens in daemon memory.
+It does not write OAuth tokens to disk.
+
+The daemon loses this state after a clear, stop, idle timeout, restart, or
+machine reboot. If Linear already rotated the stored refresh token, complete
+the authorization flow again. Then update the 1Password field.
+
+## Troubleshooting
+
+### Doctor Reports An Invalid OAuth Bundle
+
+Confirm that the JSON contains these fields:
+
+```text
+type = "service_oauth"
+token_url = "https://api.linear.app/oauth/token"
+grant_type = "client_credentials" or "refresh_token"
+client_id = "<Linear OAuth client ID>"
+```
+
+For client credentials, also confirm `client_secret` and `scope`.
+For a refresh grant, also confirm `refresh_token`.
+Then run `via config doctor linear` again.
+
+### Linear Continues To Return `401 Unauthorized`
+
+`via` already retries one request with a fresh token.
+If the retry fails, confirm the client ID and client secret in 1Password.
+Check whether the client secret or requested scopes changed.
+
+### GraphQL Returns HTTP `200` With An `errors` Array
+
+Treat the operation as incomplete or failed.
+Read each GraphQL error and correct the query, variables, or app scopes.
+
+### `via` Rejects A Linear Upload URL
+
+Confirm that the URL host is exactly `uploads.linear.app`.
+Confirm that `asset_hosts = ["uploads.linear.app"]` is in the command config.
+
+### A Signed File URL No Longer Works
+
+Request the GraphQL data again to get a new signed URL.
+Increase `public-file-urls-expire-in` only when the workflow needs more time.
+
+## References
+
+- [Linear OAuth 2.0 authentication](https://linear.app/developers/oauth-2-0-authentication)
+- [Linear GraphQL API](https://linear.app/developers/graphql)
+- [Linear file storage authentication](https://linear.app/developers/file-storage-authentication)

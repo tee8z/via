@@ -1,5 +1,7 @@
 version = 1
 
+# OAuth authentication requires the via daemon on a Unix-like platform.
+
 [providers.onepassword]
 type = "1password"
 cache = "daemon"

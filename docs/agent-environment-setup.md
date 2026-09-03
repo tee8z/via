@@ -1,42 +1,40 @@
 # Editor And Agent Environment Setup
 
-This guide is for using `via` from editors, IDEs, AI agents, scheduled jobs, and
-other tools that spawn their own command processes.
+Use this guide when an editor, agent, task runner, or scheduled job starts
+`via` in a separate process.
 
-## Recommended Pattern
-
-Install `via` and the configured secret-provider CLI in directories the spawned
-process can find on `PATH`. For the 1Password provider, that means the process
-must be able to run both:
+Each process must find `via` and the configured provider CLI on `PATH`. For
+1Password, each process must run both commands:
 
 ```sh
 via --version
 op --version
 ```
 
-Use 1Password desktop app integration for the `op` CLI. Classic `op signin`
-session tokens are shell-local; `via login` can run `op signin`, but it cannot
-export that shell-local session token into future processes created by an
-editor, agent, task runner, or daemon. With desktop app integration enabled, any
-`via` process can call `op read` as long as the 1Password app is running,
-unlocked, and allowed to service CLI requests.
+## Use Cross-Process 1Password Authentication
+
+Use 1Password desktop app integration for processes that do not share a shell.
+A classic `op signin` session token applies only to its current shell.
+
+`via login` can start `op signin`. It cannot export that shell-local token to
+future processes from an editor, agent, task runner, or daemon.
+
+With desktop integration, `op read` can authenticate through the unlocked
+1Password app. The app must allow CLI requests.
 
 1. Open and unlock the 1Password desktop app.
-2. Enable CLI integration:
-   - macOS or Windows: Settings > Developer > Integrate with 1Password CLI.
-   - Linux: Settings > Security > Unlock using system authentication, then
-     Settings > Developer > Integrate with 1Password CLI.
-3. If multiple 1Password accounts are available, set the provider account in
-   `via.toml`:
+2. Enable **Settings > Developer > Integrate with 1Password CLI**.
+3. On Linux, first enable **Settings > Security > Unlock using system authentication**.
+4. If you use multiple accounts, set the provider account in `via.toml`:
 
    ```toml
    [providers.onepassword]
    type = "1password"
-   cache = "daemon"
    account = "<account-id-or-sign-in-address>"
    ```
 
-4. From the same kind of process your editor or agent will spawn, verify:
+5. Open the same process type that will run `via`.
+6. Run these checks from that process:
 
    ```sh
    command -v via
@@ -45,19 +43,31 @@ unlocked, and allowed to service CLI requests.
    via config doctor
    ```
 
-Do not put `OP_SESSION_*`, `OP_SERVICE_ACCOUNT_TOKEN`, OAuth client secrets,
-access tokens, refresh tokens, or other secret values in editor settings. Those
-settings are not a secret store.
+On PowerShell, replace the first two checks with:
 
-## PATH Setup
+```powershell
+Get-Command via
+Get-Command op
+```
 
-If the tool works in your normal terminal but fails inside an editor or agent,
-the spawned process usually has a different `PATH`. Fix that by launching the
-editor from a configured shell, or by adding a non-secret PATH override to the
-editor's terminal/task/agent environment.
+CAUTION: Do not put credentials in editor or agent settings. These settings are
+not a secret store and can expose their contents to child processes.
 
-For example, if `via` is installed in `~/.local/bin` and `op` is available in a
-system or package-manager directory:
+Credentials include `OP_SESSION_*`, `OP_SERVICE_ACCOUNT_TOKEN`, OAuth client
+secrets, access tokens, and refresh tokens.
+
+## Configure `PATH`
+
+If commands work in a terminal but fail in a tool, compare the tool's `PATH`
+with the terminal's `PATH`.
+
+Use one of these methods:
+
+- Start the editor from a configured shell.
+- Add only required executable directories to the tool environment.
+- Configure the editor's terminal, task, or agent environment.
+
+For example, add these paths to a tool that expands `$HOME` and `$PATH`:
 
 ```json
 {
@@ -69,11 +79,12 @@ system or package-manager directory:
 }
 ```
 
-On NixOS, `op` may be exposed through `/run/wrappers/bin` and system packages
-through `/run/current-system/sw/bin`, so include those paths in editor-spawned
-tool environments when needed.
+On NixOS, `op` can be in `/run/wrappers/bin`. System packages can be in
+`/run/current-system/sw/bin`.
 
-If 1Password desktop integration needs to be forced on for spawned shells, set:
+Add those directories only when the spawned process requires them.
+
+If the process must enable desktop integration explicitly, set:
 
 ```json
 {
@@ -85,45 +96,69 @@ If 1Password desktop integration needs to be forced on for spawned shells, set:
 }
 ```
 
-## Zed Notes
+## Configure Zed
 
-Zed inherits environment variables when launched from the `zed` CLI. When
-launched from a window manager, Dock, or app launcher, Zed builds an environment
-from login shells and then passes that environment to terminals, tasks, language
-servers, and agent terminal tools.
-
-For Zed, either launch with:
+When you start Zed with `zed`, Zed inherits the calling shell environment:
 
 ```sh
 zed .
 ```
 
-from a shell where `command -v via` and `command -v op` both work, or add the
-needed PATH entries under `terminal.env` in Zed settings.
+Run that command from a shell where `command -v via` and `command -v op`
+succeed.
 
-## Why Repeated Login Prompts Happen
+When a window manager, Dock, or app launcher starts Zed, Zed builds its
+environment from login shells. It passes the applicable environment to
+terminals, tasks, language servers, and agent terminal tools.
 
-Repeated prompts usually mean one of these is true:
+If required, add executable directories under `terminal.env` in Zed settings.
+See [Zed Agent Setup](zed-agent-setup.md) for the focused procedure.
 
-- The editor or agent was launched without an environment that can find the same
-  `op` and `via` binaries as the user's terminal.
-- 1Password desktop app integration is not enabled, so `op signin` relies on a
-  shell-local session token that separate tool processes do not share.
-- The 1Password desktop app is locked, not running, or cannot service CLI
-  integration prompts.
-- Multiple 1Password accounts are configured and `via.toml` does not pin the
-  provider `account`.
+## Understand Daemon Caching
 
-`via`'s daemon helps by caching resolved 1Password secrets and OAuth token state
-in memory, but the daemon still needs `op read` on cache misses. Keep
-`cache = "daemon"` enabled for editor and agent workflows, and use
-`via daemon status` to confirm the daemon remains warm during a session.
+On Unix-like systems, keep `cache = "daemon"` enabled for editor and agent
+workflows. This platform default caches 1Password values and OAuth token state
+in memory.
 
-On Linux and macOS, `via` auto-starts the daemon through the user service
-manager when possible: `systemd-run --user` on Linux and `launchctl` on macOS.
-That keeps the daemon alive after a one-shot editor task or agent command exits,
-so later `via` invocations can reuse the same daemon cache. If the service
-manager is unavailable, `via` falls back to a detached direct spawn.
+On Windows, keep the default `cache = "off"`. The daemon and OAuth
+authentication are unavailable until via has a Windows named-pipe backend.
+
+The daemon still runs `op read` after a cache miss. Therefore, the daemon also
+needs a valid `PATH` and working desktop integration.
+
+On Linux and macOS, `via` tries to start the daemon through the user service
+manager. It uses `systemd-run --user` on Linux and `launchctl` on macOS.
+
+If the service manager is unavailable, `via` starts a detached daemon process.
+Check the current state with:
+
+```sh
+via daemon status
+```
+
+See [Daemon Architecture](daemon-architecture.md) for cache behavior and
+security boundaries.
+
+## Troubleshoot From Observable Results
+
+| Result | Cause to check | Corrective action |
+| --- | --- | --- |
+| `via` or `op` is not found | The spawned process has a different `PATH`. | Start the tool from a configured shell or update its non-secret `PATH`. |
+| `op whoami` reports no session | Desktop integration is disabled, or the app is unavailable. | Unlock 1Password and enable CLI integration. |
+| Authentication prompts repeat | Independent processes rely on shell-local `op signin` state. | Use 1Password desktop app integration. |
+| The wrong account is selected | Multiple accounts are available without a pinned provider account. | Set `[providers.onepassword] account` in `via.toml`. |
+| The first request works but later requests fail | The app locked, exited, or stopped servicing CLI requests. | Unlock or restart 1Password, then rerun `op whoami`. |
+| Daemon cache misses always occur | The daemon restarts or exits between commands. | Run `via daemon status`, then review the daemon setup guide. |
+
+After each correction, rerun:
+
+```sh
+op whoami
+via config doctor
+```
+
+A healthy result identifies the intended 1Password account and reports no
+provider error.
 
 ## References
 

@@ -123,7 +123,7 @@ fn parse_daemon_command(matches: &clap::ArgMatches) -> Result<DaemonCommand, Via
 
 fn command() -> ClapCommand {
     ClapCommand::new("via")
-        .about("Run commands and API requests with 1Password-backed credentials without exposing secrets to your shell")
+        .about("Run commands, SSH sessions, and API requests with 1Password-backed credentials without exposing secrets to your shell")
         .version(env!("CARGO_PKG_VERSION"))
         .disable_help_subcommand(true)
         .allow_external_subcommands(true)
@@ -161,7 +161,9 @@ fn command() -> ClapCommand {
                 .subcommand(ClapCommand::new("path").about("Print the resolved config path"))
                 .subcommand(
                     ClapCommand::new("doctor")
-                        .about("Check configuration, providers, secrets, and delegated tools")
+                        .about(
+                            "Check configuration, providers, secrets, delegated tools, and SSH profiles",
+                        )
                         .arg(Arg::new("service").help("Only check one service")),
                 ),
         )

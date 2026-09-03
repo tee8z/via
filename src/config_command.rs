@@ -33,7 +33,9 @@ pub fn run(path_override: Option<&Path>, command: ConfigCommand) -> Result<(), V
 fn configure(path: &Path) -> Result<(), ViaError> {
     if path.exists() {
         println!("via config: {}", path.display());
-        println!("Run `via config doctor` to check providers, secrets, and delegated tools.");
+        println!(
+            "Run `via config doctor` to check providers, secrets, delegated tools, and SSH profiles."
+        );
         return Ok(());
     }
 
@@ -335,8 +337,7 @@ fn build_service_config(setup: ServiceSetup) -> String {
     let mut output = String::new();
     output.push_str("version = 1\n\n");
     output.push_str("[providers.onepassword]\n");
-    output.push_str("type = \"1password\"\n");
-    output.push_str("cache = \"daemon\"\n\n");
+    output.push_str("type = \"1password\"\n\n");
     output.push_str(&format!("[services.{}]\n", toml_key(&setup.service_name)));
     output.push_str(&format!(
         "description = {}\n",
@@ -451,7 +452,6 @@ fn empty_config() -> &'static str {
 
 [providers.onepassword]
 type = "1password"
-cache = "daemon"
 
 "#
 }
@@ -524,7 +524,7 @@ mod tests {
 
         assert!(config.contains("[services.\"gitlab\"]"));
         assert!(config.contains("hint = \"via gitlab api /projects\""));
-        assert!(config.contains("cache = \"daemon\""));
+        assert!(!config.contains("cache ="));
         assert!(config.contains("base_url = \"https://gitlab.example.com/api/v4\""));
         assert!(Config::from_toml_str(&config).is_ok());
     }
@@ -551,7 +551,7 @@ mod tests {
         });
 
         assert!(config.contains("type = \"github_app\""));
-        assert!(config.contains("cache = \"daemon\""));
+        assert!(!config.contains("cache ="));
         assert!(config.contains("credential = \"app\""));
         assert!(config.contains("private_key = \"private_key\""));
         assert!(Config::from_toml_str(&config).is_ok());

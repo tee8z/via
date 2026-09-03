@@ -1,56 +1,75 @@
 # Grafana Service Account Setup
 
-This guide configures a Grafana HTTP API capability for via. The local via config contains no secret values: it points to one 1Password field that stores a Grafana service account token.
+Use this guide to give `via` access to the Grafana HTTP API.
+The local config stores a 1Password reference, not the service account token.
 
-Grafana service account tokens authenticate to the Grafana HTTP API with:
+Grafana accepts the token in this header:
 
 ```text
 Authorization: Bearer <service-account-token>
 ```
 
-That matches via's existing `bearer` REST auth type. No Grafana-specific auth code is needed.
+This header uses `via`'s existing `bearer` REST authentication.
+No Grafana-specific authentication code is required.
 
-## 1. Create The Grafana Service Account
+## Before You Start
 
-In Grafana, create a service account and add a token:
+Identify each Grafana environment that the workflow can access.
+Use a separate service account and token for each environment.
 
-1. Open Administration.
-2. Open Users and access.
-3. Open Service accounts.
-4. Add a service account, then add a service account token.
+Confirm that you can create service accounts in each Grafana organization.
 
-Use the smallest permissions that cover the workflow.
+## 1. Create A Grafana Service Account
 
-For read-only datasource queries, start with a `Viewer` organization role when that is acceptable for the Grafana instance. In Grafana Enterprise or Grafana Cloud, use datasource permissions or RBAC if you need tighter access. The token must be allowed to read and query the target datasource UIDs.
+Create the service account in the Grafana user interface:
+
+1. Open **Administration**.
+2. Open **Users and access**.
+3. Open **Service accounts**.
+4. Add a service account.
+5. Add a token to the new service account.
+
+Grant the smallest permissions that cover the workflow.
+For read-only datasource queries, start with the `Viewer` organization role
+when that role is acceptable.
+
+Grafana Enterprise and Grafana Cloud support tighter datasource permissions or
+role-based access control (RBAC). The account must have query access to each
+target datasource unique identifier (UID).
 
 ## 2. Store The Token In 1Password
 
-Create a 1Password item in the vault you want via to read from, for example:
+Create a 1Password item in a vault that `via` can read.
+This guide uses these example names:
 
-```text
-Vault: Private
-Item: Example Grafana
-Field: service-account-token
-```
+| 1Password location | Example name |
+| --- | --- |
+| Vault | `Private` |
+| Item | `Example Grafana` |
+| Field | `service-account-token` |
 
-The 1Password reference should look like:
+The reference has this form:
 
 ```text
 op://Private/Example Grafana/service-account-token
 ```
 
-Do not store the token in `via.toml`, shell history, issue comments, prompts, or checked-in files.
+> **WARNING:** Do not store the token in `via.toml`, shell history, source
+> control, issue comments, or prompts. An exposed token grants its service
+> account permissions until the token expires or is revoked.
 
-## 3. Configure via
+## 3. Configure `via`
 
-Use one service per Grafana environment. Keep staging and production on separate Grafana service accounts and separate 1Password token fields:
+Keep staging and production in separate services.
+Use separate 1Password items or fields for their tokens.
+
+Add this configuration to `via.toml`:
 
 ```toml
 version = 1
 
 [providers.onepassword]
 type = "1password"
-cache = "daemon"
 
 [services.grafana-staging]
 description = "Staging Grafana HTTP API access through a service account token"
@@ -95,7 +114,12 @@ secret = "token"
 Accept = "application/json"
 ```
 
-For Grafana Cloud, set each `base_url` to that environment's stack URL, for example:
+Omitting `cache` uses the platform default. Unix-like systems use the daemon,
+while Windows resolves each 1Password reference directly.
+
+### Grafana Cloud URLs
+
+For Grafana Cloud, set each `base_url` to its stack URL:
 
 ```toml
 [services.grafana-staging.commands.api]
@@ -105,7 +129,9 @@ base_url = "https://example-staging.grafana.net"
 base_url = "https://example.grafana.net"
 ```
 
-If you need to address a specific Grafana organization in a multi-org instance, add the optional organization header:
+### Multi-Organization Instances
+
+If a request must target one Grafana organization, add its organization header:
 
 ```toml
 [services.grafana-prod.commands.api.headers]
@@ -113,9 +139,9 @@ Accept = "application/json"
 X-Grafana-Org-Id = "2"
 ```
 
-## 4. Verify
+## 4. Verify The Setup
 
-Check local setup:
+Authenticate to 1Password and inspect both services:
 
 ```sh
 via login
@@ -124,18 +150,20 @@ via config doctor grafana-prod
 via capabilities
 ```
 
-Then make a small authenticated Grafana API request to each environment:
+A healthy doctor result confirms that `via` can resolve each token reference.
+
+Make a small authenticated request to each environment:
 
 ```sh
 via grafana-staging api /api/org
 via grafana-prod api /api/org
 ```
 
-This verifies that via can read the 1Password token, attach it as a bearer token, and have Grafana accept it.
+Successful responses confirm the base URLs, tokens, and organization access.
 
-## 5. Query Grafana Data Sources
+## 5. Inspect Grafana Data Sources
 
-Grafana exposes datasource management endpoints such as:
+Use these read requests to find and inspect datasource UIDs:
 
 ```sh
 via grafana-staging api /api/datasources
@@ -146,17 +174,23 @@ via grafana-staging api /api/datasources/uid/<datasource-uid>/health
 via grafana-prod api /api/datasources/uid/<datasource-uid>/health
 ```
 
-To query backend data sources through Grafana, call:
+## 6. Query A Data Source
+
+Send backend datasource queries to this endpoint:
 
 ```text
 POST /api/ds/query
 ```
 
-The body is Grafana's datasource query model. Each query includes the target datasource UID and datasource-specific properties. Grafana's docs recommend using the browser Developer Tools network panel against Explore or a panel query to capture the exact `/api/ds/query` payload for a specific datasource plugin.
+The JSON body uses Grafana's datasource query model.
+Each query identifies a datasource UID and adds plugin-specific properties.
+
+For an exact payload, run the query in Explore or a panel.
+Then inspect the `/api/ds/query` request in browser Developer Tools.
 
 ### Loki Example
 
-Create a local request body such as `loki-query.json`:
+Create `loki-query.json`:
 
 ```json
 {
@@ -178,7 +212,7 @@ Create a local request body such as `loki-query.json`:
 }
 ```
 
-Run:
+Run the query against the intended environment:
 
 ```sh
 via grafana-staging api POST /api/ds/query --json @loki-query.json
@@ -187,7 +221,7 @@ via grafana-prod api POST /api/ds/query --json @loki-query.json
 
 ### PostgreSQL Example
 
-Create a local request body such as `postgres-query.json`:
+Create `postgres-query.json`:
 
 ```json
 {
@@ -209,20 +243,56 @@ Create a local request body such as `postgres-query.json`:
 }
 ```
 
-Run:
+Run the query against the intended environment:
 
 ```sh
 via grafana-staging api POST /api/ds/query --json @postgres-query.json
 via grafana-prod api POST /api/ds/query --json @postgres-query.json
 ```
 
-Keep SQL read-only unless the Grafana datasource and database account are intentionally scoped for writes. via protects the Grafana service token, but Grafana and the underlying datasource still decide what the query is allowed to do.
+> **CAUTION:** Keep SQL read-only unless the datasource and database account
+> intentionally permit writes. Grafana and the database enforce query access;
+> `via` protects only the Grafana service token.
 
-## Notes
+## API Compatibility Notes
 
-- Grafana is deprecating legacy `/api` endpoints in favor of newer `/apis` endpoints, but the datasource query endpoint is still documented under the legacy API and remains available.
-- Direct Loki HTTP API access is a different setup. A Grafana service account token authenticates to Grafana, not necessarily to Loki itself. Querying Loki through `/api/ds/query` lets Grafana use the configured Loki datasource and its permissions.
-- If Grafana returns `403`, inspect the service account permissions and datasource permissions. The token needs permission to query the selected datasource UID.
+Grafana is moving legacy `/api` endpoints to newer `/apis` endpoints.
+The legacy endpoints remain available, but Grafana no longer updates them.
+Grafana still documents `/api/ds/query` for backend datasource queries.
+
+A Grafana service account token authenticates to Grafana.
+It does not necessarily authenticate directly to Loki or another datasource.
+Using `/api/ds/query` lets Grafana apply the configured datasource credentials.
+Direct Loki HTTP API access requires a separate setup.
+
+## Troubleshooting
+
+### Grafana Returns `401 Unauthorized`
+
+Confirm that the token belongs to the configured Grafana environment.
+Confirm that the token has not expired or been revoked.
+Update the 1Password field after rotating the token.
+
+### Grafana Returns `403 Access Denied`
+
+Inspect the service account and datasource permissions.
+Confirm that the account can query the selected datasource UID.
+For multi-organization instances, confirm `X-Grafana-Org-Id`.
+
+### Grafana Returns `404 Not Found`
+
+Confirm the service `base_url` and datasource UID.
+Confirm that the target datasource plugin is available in that environment.
+
+### `/api/ds/query` Returns `400 Bad Request`
+
+Compare the JSON body with a working browser request.
+Check the content type, datasource UID, time range, and plugin-specific fields.
+
+### Doctor Cannot Resolve A Token
+
+Confirm the vault, item, and field in the `op://` reference.
+Run `via login`, then run the doctor command again.
 
 ## References
 

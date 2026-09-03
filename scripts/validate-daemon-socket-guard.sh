@@ -3,6 +3,14 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+case "$(uname -s)" in
+  Linux | Darwin) ;;
+  *)
+    echo "This executable-identity guard test supports only Linux and macOS." >&2
+    exit 2
+    ;;
+esac
+
 if [[ -n "${VIA_BIN:-}" ]]; then
   via_bin="$VIA_BIN"
 elif [[ -x "$repo_root/target/release/via" ]]; then
@@ -13,14 +21,17 @@ else
   via_bin="via"
 fi
 
-if [[ -n "${VIA_DAEMON_SOCKET:-}" ]]; then
-  socket_path="$VIA_DAEMON_SOCKET"
-elif [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
-  socket_path="$XDG_RUNTIME_DIR/via/daemon.sock"
-else
-  uid="${UID:-$(id -u 2>/dev/null || printf unknown)}"
-  socket_path="/tmp/via-$uid/daemon.sock"
+if [[ -z "${VIA_DAEMON_SOCKET:-}" ]]; then
+  cat >&2 <<'EOF'
+VIA_DAEMON_SOCKET must name the exact socket used by the test daemon.
+
+Start a daemon-backed command with VIA_DAEMON_SOCKET set, then rerun this
+script with the same exported value.
+EOF
+  exit 2
 fi
+
+socket_path="$VIA_DAEMON_SOCKET"
 
 if [[ ! -S "$socket_path" ]]; then
   cat >&2 <<EOF

@@ -24,6 +24,17 @@ struct CapabilitySummary<'a> {
     mode: CapabilityMode,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     asset_hosts: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh: Option<SshCapabilitySummary<'a>>,
+}
+
+#[derive(Serialize)]
+struct SshCapabilitySummary<'a> {
+    profile: &'a str,
+    user: &'a str,
+    hosts: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
 }
 
 pub fn print(config: &Config, json: bool) -> Result<(), ViaError> {
@@ -49,6 +60,7 @@ pub fn render(config: &Config, json: bool) -> Result<String, ViaError> {
                             description: command.description().map(String::as_str),
                             mode: command.mode(),
                             asset_hosts: asset_hosts(command),
+                            ssh: ssh_summary(command),
                         })
                         .collect(),
                 })
@@ -82,6 +94,7 @@ pub fn render(config: &Config, json: bool) -> Result<String, ViaError> {
             if !asset_hosts.is_empty() {
                 output.push_str(&format!("    asset hosts: {}\n", asset_hosts.join(", ")));
             }
+            print_ssh_summary(&mut output, command);
         }
     }
 
@@ -91,7 +104,33 @@ pub fn render(config: &Config, json: bool) -> Result<String, ViaError> {
 fn asset_hosts(command: &CommandConfig) -> Vec<&str> {
     match command {
         CommandConfig::Rest(rest) => rest.asset_hosts.iter().map(String::as_str).collect(),
-        CommandConfig::Delegated(_) => Vec::new(),
+        CommandConfig::Delegated(_) | CommandConfig::Ssh(_) => Vec::new(),
+    }
+}
+
+fn ssh_summary(command: &CommandConfig) -> Option<SshCapabilitySummary<'_>> {
+    let CommandConfig::Ssh(ssh) = command else {
+        return None;
+    };
+
+    Some(SshCapabilitySummary {
+        profile: &ssh.profile,
+        user: &ssh.user,
+        hosts: ssh.hosts.iter().map(String::as_str).collect(),
+        port: ssh.port,
+    })
+}
+
+fn print_ssh_summary(output: &mut String, command: &CommandConfig) {
+    let Some(ssh) = ssh_summary(command) else {
+        return;
+    };
+
+    output.push_str(&format!("    SSH profile: {}\n", ssh.profile));
+    output.push_str(&format!("    SSH user: {}\n", ssh.user));
+    output.push_str(&format!("    allowed hosts: {}\n", ssh.hosts.join(", ")));
+    if let Some(port) = ssh.port {
+        output.push_str(&format!("    SSH port: {port}\n"));
     }
 }
 
@@ -99,8 +138,17 @@ fn asset_hosts(command: &CommandConfig) -> Vec<&str> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    const SSH_RUNTIME_PATHS: &str = r"agent_socket = '\\.\pipe\openssh-ssh-agent'
+ssh_program = 'C:\Windows\System32\OpenSSH\ssh.exe'
+ssh_add_program = 'C:\Windows\System32\OpenSSH\ssh-add.exe'";
+    #[cfg(not(windows))]
+    const SSH_RUNTIME_PATHS: &str = r#"agent_socket = "/tmp/onepassword-agent.sock"
+ssh_program = "/trusted/bin/ssh"
+ssh_add_program = "/trusted/bin/ssh-add""#;
+
     fn config() -> Config {
-        Config::from_toml_str(
+        Config::from_toml_str(&format!(
             r#"
 version = 1
 
@@ -124,8 +172,22 @@ asset_hosts = ["uploads.linear.app"]
 [services.github.commands.api.auth]
 type = "bearer"
 secret = "token"
+
+[ssh_profiles.production]
+provider = "onepassword"
+public_key = "op://Private/SSH/public key"
+{}
+
+[services.github.commands.shell]
+description = "SSH access"
+mode = "ssh"
+profile = "production"
+user = "volt"
+hosts = ["btcd.example.com"]
+port = 2222
 "#,
-        )
+            SSH_RUNTIME_PATHS
+        ))
         .unwrap()
     }
 
@@ -137,6 +199,14 @@ secret = "token"
         assert!(output.contains("hint: via github api /user"));
         assert!(output.contains("api (Rest): REST access"));
         assert!(output.contains("asset hosts: uploads.linear.app"));
+        assert!(output.contains("shell (Ssh): SSH access"));
+        assert!(output.contains("SSH profile: production"));
+        assert!(output.contains("SSH user: volt"));
+        assert!(output.contains("allowed hosts: btcd.example.com"));
+        assert!(output.contains("SSH port: 2222"));
+        assert!(!output.contains("op://Private/SSH"));
+        assert!(!output.contains("onepassword-agent.sock"));
+        assert!(!output.contains("/trusted/bin"));
     }
 
     #[test]
@@ -148,6 +218,16 @@ secret = "token"
         assert!(output.contains("\"mode\": \"rest\""));
         assert!(output.contains("\"asset_hosts\""));
         assert!(output.contains("\"uploads.linear.app\""));
+        assert!(output.contains("\"mode\": \"ssh\""));
+        assert!(output.contains("\"profile\": \"production\""));
+        assert!(output.contains("\"user\": \"volt\""));
+        assert!(output.contains("\"btcd.example.com\""));
+        assert!(output.contains("\"port\": 2222"));
         assert!(!output.contains("op://"));
+        assert!(!output.contains("onepassword-agent.sock"));
+        assert!(!output.contains("\"public_key\""));
+        assert!(!output.contains("\"agent_socket\""));
+        assert!(!output.contains("ssh_program"));
+        assert!(!output.contains("ssh_add_program"));
     }
 }

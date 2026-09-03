@@ -4,6 +4,7 @@ use crate::providers::ProviderRegistry;
 
 mod delegated;
 mod rest;
+pub(crate) mod ssh;
 
 pub fn invoke(
     config: &Config,
@@ -24,12 +25,24 @@ pub fn invoke(
                 service: service_name.to_owned(),
                 capability: capability_name.to_owned(),
             })?;
-    let provider = providers.get(&service.provider)?;
-
     match command {
-        CommandConfig::Rest(rest) => rest::execute(service_name, service, rest, provider, args),
+        CommandConfig::Rest(rest) => {
+            let provider = providers.get(&service.provider)?;
+            rest::execute(service_name, service, rest, provider, args)
+        }
         CommandConfig::Delegated(delegated) => {
+            let provider = providers.get(&service.provider)?;
             delegated::execute(service_name, service, delegated, provider, args)
+        }
+        CommandConfig::Ssh(ssh_config) => {
+            let profile = config.ssh_profiles.get(&ssh_config.profile).ok_or_else(|| {
+                ViaError::InvalidConfig(format!(
+                    "command `{service_name}.{capability_name}` references unknown SSH profile `{}`",
+                    ssh_config.profile
+                ))
+            })?;
+            let provider = providers.get(&profile.provider)?;
+            ssh::execute(ssh_config, profile, provider, args)
         }
     }
 }
