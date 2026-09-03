@@ -182,8 +182,8 @@ public_key = "op://Private/SSH/public key"
 description = "SSH access"
 mode = "ssh"
 profile = "production"
-user = "volt"
-hosts = ["btcd.example.com"]
+user = "deploy"
+hosts = ["server.example.com"]
 port = 2222
 "#,
             SSH_RUNTIME_PATHS
@@ -201,8 +201,8 @@ port = 2222
         assert!(output.contains("asset hosts: uploads.linear.app"));
         assert!(output.contains("shell (Ssh): SSH access"));
         assert!(output.contains("SSH profile: production"));
-        assert!(output.contains("SSH user: volt"));
-        assert!(output.contains("allowed hosts: btcd.example.com"));
+        assert!(output.contains("SSH user: deploy"));
+        assert!(output.contains("allowed hosts: server.example.com"));
         assert!(output.contains("SSH port: 2222"));
         assert!(!output.contains("op://Private/SSH"));
         assert!(!output.contains("onepassword-agent.sock"));
@@ -220,8 +220,8 @@ port = 2222
         assert!(output.contains("\"uploads.linear.app\""));
         assert!(output.contains("\"mode\": \"ssh\""));
         assert!(output.contains("\"profile\": \"production\""));
-        assert!(output.contains("\"user\": \"volt\""));
-        assert!(output.contains("\"btcd.example.com\""));
+        assert!(output.contains("\"user\": \"deploy\""));
+        assert!(output.contains("\"server.example.com\""));
         assert!(output.contains("\"port\": 2222"));
         assert!(!output.contains("op://"));
         assert!(!output.contains("onepassword-agent.sock"));

@@ -227,8 +227,8 @@ via github gh issue list --repo OWNER/REPO --state open --limit 10 --json number
 Pass one allowed host. Add remote-command arguments after the host:
 
 ```sh
-via btcd shell btcd-01.internal.example.com
-via btcd shell btcd-01.internal.example.com systemctl status btcd
+via example shell server-01.example.com
+via example shell server-01.example.com uptime
 ```
 
 Pass only a hostname or IP address. Do not pass an OpenSSH option,
@@ -304,21 +304,21 @@ version = 1
 [providers.onepassword]
 type = "1password"
 
-[ssh_profiles.btcd]
+[ssh_profiles.example]
 provider = "onepassword"
-public_key = "op://Private/Example BTCD SSH Key/public key"
+public_key = "op://Private/Example SSH Key/public key"
 
-[services.btcd]
-description = "SSH access to BTCD servers"
-hint = "via btcd shell btcd-01.internal.example.com"
+[services.example]
+description = "SSH access to example servers"
+hint = "via example shell server-01.example.com"
 provider = "onepassword"
 
-[services.btcd.commands.shell]
-description = "Open a public-key-only SSH session as volt."
+[services.example.commands.shell]
+description = "Open a public-key-only SSH session as deploy."
 mode = "ssh"
-profile = "btcd"
-user = "volt"
-hosts = ["btcd-*.internal.example.com", "192.0.2.10"]
+profile = "example"
+user = "deploy"
+hosts = ["server-*.example.com", "192.0.2.10"]
 port = 22
 ```
 

@@ -142,8 +142,8 @@ public_key = "op://Private/SSH/public key"
 description = "SSH access."
 mode = "ssh"
 profile = "production"
-user = "volt"
-hosts = ["btcd.example.com"]
+user = "deploy"
+hosts = ["server.example.com"]
 port = 2222
 "#,
             SSH_RUNTIME_PATHS
@@ -163,8 +163,8 @@ port = 2222
         assert!(output.contains("via github api GET <asset-url> --output <file>"));
         assert!(output.contains("via github gh <tool-args...>"));
         assert!(output.contains("For SSH capabilities, use a listed host"));
-        assert!(output.contains("Connect as `volt` on port `2222`"));
-        assert!(output.contains("Allowed hosts: `btcd.example.com`"));
+        assert!(output.contains("Connect as `deploy` on port `2222`"));
+        assert!(output.contains("Allowed hosts: `server.example.com`"));
         assert!(output.contains("via github shell <host> [remote-command...]"));
         assert!(!output.contains("op://Private"));
         assert!(!output.contains("op read"));

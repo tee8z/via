@@ -683,7 +683,7 @@ mod tests {
         SshCommandConfig {
             description: None,
             profile: "production".to_owned(),
-            user: "volt".to_owned(),
+            user: "deploy".to_owned(),
             hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
             port: Some(2222),
         }
@@ -790,9 +790,9 @@ mod tests {
     #[test]
     fn parses_allowed_host_and_preserves_remote_arguments() {
         let invocation = SshInvocation::parse(
-            &ssh_config(&["btcd-*.internal", "2001:db8::*"]),
+            &ssh_config(&["server-*.example.com", "2001:db8::*"]),
             vec![
-                "BTCD-12.Internal".to_owned(),
+                "SERVER-12.EXAMPLE.COM".to_owned(),
                 "printf".to_owned(),
                 "%s\\n".to_owned(),
                 "hello world".to_owned(),
@@ -800,7 +800,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(invocation.host, "BTCD-12.Internal");
+        assert_eq!(invocation.host, "SERVER-12.EXAMPLE.COM");
         assert_eq!(invocation.remote_args, ["printf", "%s\\n", "hello world"]);
     }
 
@@ -938,7 +938,7 @@ mod tests {
                 "-o".into(),
                 "HostbasedAuthentication=no".into(),
                 "-l".into(),
-                "volt".into(),
+                "deploy".into(),
                 "-p".into(),
                 "2222".into(),
                 "--".into(),
