@@ -61,8 +61,11 @@ caller so that a key can be revoked alone.
 
 ### 1. Create a broker account and config
 
-Create a dedicated account with no other duties, such as `via-broker`. Store
-the config where the caller's requests cannot change it:
+Create a dedicated account with no other duties, such as `via-broker`. sshd
+starts a forced command through the account's login shell, so the account
+needs a working shell such as `/bin/sh`. Disable its password.
+
+Store the config where the caller's requests cannot change it:
 
 ```sh
 sudo install -d -m 0755 /etc/via
@@ -175,7 +178,9 @@ Use an absolute path for both the via binary and the config. `--caller` is a
 label of your choice. via writes it to every audit record from this key.
 
 If an interactive session through an `ssh` capability needs a terminal, add
-`pty` after `restrict`.
+`pty` after `restrict`. Grant `pty` only to a key that needs it: with a
+terminal, a disconnect or an interrupt key can end via before it writes the
+audit record of the running request.
 
 Harden sshd for the broker account:
 
@@ -512,6 +517,10 @@ via writes the record after the request, so a record that cannot be written
 at that point cannot undo the request. via then exits with status `1` and
 reports the audit failure, even if the request succeeded. Watch for that
 error, and keep the audit file's volume from filling up.
+
+A caller that disconnects early does not avoid its record. Without a
+terminal, via finishes the request, fails to write the response to the closed
+connection, and records the request with its status and an `io_error` reason.
 
 ## Configuration Reference
 

@@ -75,13 +75,13 @@ pub fn execute(
     match &request.output {
         Some(OutputTarget::File(path)) => write_response_body(path, &response.body)?,
         Some(OutputTarget::Stdout) => {
-            write_response_to_stdout(&trace.redactor.redact_bytes(&response.body))?;
+            crate::output::write_stdout(&trace.redactor.redact_bytes(&response.body))?;
         }
         None => {
             let body = trace
                 .redactor
                 .redact(&String::from_utf8_lossy(&response.body));
-            println!("{body}");
+            crate::output::write_stdout(format!("{body}\n").as_bytes())?;
         }
     }
     Ok(())
@@ -345,13 +345,6 @@ fn read_response_body(response: reqwest::blocking::Response) -> Result<Vec<u8>, 
 fn write_response_body(path: &Path, body: &[u8]) -> Result<(), ViaError> {
     let mut file = File::create(path)?;
     file.write_all(body)?;
-    Ok(())
-}
-
-fn write_response_to_stdout(body: &[u8]) -> Result<(), ViaError> {
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(body)?;
-    stdout.flush()?;
     Ok(())
 }
 

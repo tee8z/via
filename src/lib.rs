@@ -11,6 +11,7 @@ pub mod doctor;
 pub mod error;
 pub mod executor;
 pub mod login;
+mod output;
 pub mod providers;
 pub mod redaction;
 mod rules;

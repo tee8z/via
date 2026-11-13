@@ -2,6 +2,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
@@ -64,15 +65,27 @@ fn run_request(
 
     let mut record = AuditRecord::new(invocation.caller.clone(), client_address(connection));
     let mut trace = InvocationTrace::default();
-    let result = serve(
-        &config,
-        &invocation.request,
-        original_command,
-        &mut record,
-        &mut trace,
-    );
+    // A panic must not skip the audit record, so it becomes a failed request.
+    let served = panic::catch_unwind(AssertUnwindSafe(|| {
+        serve(
+            &config,
+            &invocation.request,
+            original_command,
+            &mut record,
+            &mut trace,
+        )
+    }));
+    let panicked = served.is_err();
+    let result = served.unwrap_or_else(|_| {
+        Err(ViaError::Io(io::Error::other(
+            "via broker: the request handler stopped unexpectedly",
+        )))
+    });
 
     complete_record(&mut record, &result, &trace, started.elapsed());
+    if panicked {
+        record.reason = Some("internal_error".to_owned());
+    }
     sink.write(&record)?;
     result
 }
@@ -135,14 +148,13 @@ fn serve(
     let context = ExecutionContext::broker();
     match request {
         BrokerRequest::Capabilities { json } => {
-            print!(
-                "{}",
-                crate::capabilities::render_with_context(config, json, &context)?
-            );
+            let output = crate::capabilities::render_with_context(config, json, &context)?;
+            crate::output::write_stdout(output.as_bytes())?;
             Ok(())
         }
         BrokerRequest::SkillPrint => {
-            print!("{}", crate::skill::render_with_context(config, &context));
+            let output = crate::skill::render_with_context(config, &context);
+            crate::output::write_stdout(output.as_bytes())?;
             Ok(())
         }
         BrokerRequest::Run {
