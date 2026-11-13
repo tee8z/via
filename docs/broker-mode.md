@@ -160,7 +160,32 @@ via daemon, which the broker account must be able to start. The daemon keeps
 OAuth state only in memory, so prefer a `client_credentials` bundle. A rotated
 refresh token is lost when the daemon exits.
 
-### 3. Force the command for the caller's key
+### 3. Prepare SSH capabilities
+
+Skip this step if the broker config has no `ssh` capability.
+
+An `ssh` capability needs an SSH agent on the broker host that holds the
+private key. Set the profile's `agent_socket` to that agent's socket, and
+store the matching public key as a credential file:
+
+```toml
+[ssh_profiles.deploy]
+provider = "files"
+public_key = "cred://deploy-ssh-public-key"
+agent_socket = "/run/via-broker/ssh-agent.sock"
+```
+
+via reads only the public key. It asks the agent for that one identity, so
+the private key never enters via or the caller's session.
+
+via keeps host-key verification on, and a broker session cannot answer a
+host-key prompt. Add each allowed host's key to the broker account's
+`known_hosts` file before the first request.
+
+OpenSSH joins the remote command's arguments with spaces and the remote
+shell parses the result, as it does for a local `ssh` command.
+
+### 4. Force the command for the caller's key
 
 Add the caller's public key to the broker account's `authorized_keys` with a
 forced command and `restrict`:

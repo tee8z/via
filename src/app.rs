@@ -176,6 +176,42 @@ mod tests {
     }
 
     #[test]
+    fn broker_exec_serves_a_request_passed_after_the_separator() {
+        if std::env::var_os("SSH_ORIGINAL_COMMAND").is_some() {
+            // The request would arrive from two sources, which via refuses.
+            return;
+        }
+
+        let directory = crate::test_support::TempDir::create("app-broker-exec");
+        let audit_path = directory.join("audit.jsonl");
+        let config = format!(
+            "version = 1\n\n[audit]\nsink = \"file\"\npath = '{}'\n",
+            audit_path.display()
+        );
+        let config_path = directory.write_private("broker.toml", config.as_bytes());
+
+        let code = run([
+            OsString::from("via"),
+            OsString::from("broker"),
+            OsString::from("exec"),
+            OsString::from("--config"),
+            config_path.into_os_string(),
+            OsString::from("--caller"),
+            OsString::from("local-test"),
+            OsString::from("--"),
+            OsString::from("capabilities"),
+            OsString::from("--json"),
+        ]);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let audit = std::fs::read_to_string(audit_path).unwrap();
+        assert_eq!(audit.lines().count(), 1);
+        assert!(audit.contains("\"caller\":\"local-test\""));
+        assert!(audit.contains("\"request\":\"capabilities\""));
+        assert!(audit.contains("\"outcome\":\"ok\""));
+    }
+
+    #[test]
     fn maps_success_result_to_exit_code() {
         let code = exit_code_from_result(Ok(ExitCode::SUCCESS));
 
