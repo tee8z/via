@@ -1215,8 +1215,10 @@ mod imp {
 
         #[test]
         fn listener_recovers_a_stale_socket_and_refuses_a_live_one() {
-            let directory = crate::test_support::TempDir::create("daemon-listener");
-            let path = directory.join("private/daemon.sock");
+            // Short names keep the socket path within the platform limit,
+            // which is 104 bytes on macOS, below a long TMPDIR.
+            let directory = crate::test_support::TempDir::create("dl");
+            let path = directory.join("s/d.sock");
             let listener = bind_listener(&path).unwrap();
             assert_eq!(
                 fs::metadata(path.parent().unwrap())

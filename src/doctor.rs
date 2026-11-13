@@ -1184,6 +1184,12 @@ public_key = "cred://public-key"
     #[test]
     fn ssh_public_key_check_skips_an_unready_provider() {
         let directory = crate::test_support::TempDir::create("doctor-public-key-unready");
+        // The key is readable and valid, so only the provider state can make
+        // the check fail.
+        directory.write_private(
+            "public-key",
+            b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        );
         let config = ssh_doctor_config(directory.path());
         let providers = ProviderRegistry::from_config(&config).unwrap();
         let mut status = DoctorStatus::default();

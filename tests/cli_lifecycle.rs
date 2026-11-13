@@ -2,6 +2,8 @@ use std::fs;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+// The unit tests own this module. A helper that only they use is not dead code.
+#[allow(dead_code)]
 #[path = "../src/test_support.rs"]
 mod test_support;
 use test_support::TempDir;
@@ -62,6 +64,10 @@ fn command(directory: &TempDir) -> Command {
         .current_dir(directory.path())
         .env_remove("VIA_CONFIG")
         .env_remove("SSH_ORIGINAL_COMMAND")
+        // With timing output on, an autostarted daemon keeps the standard
+        // error pipe open and the test would wait for the daemon to exit.
+        .env_remove("VIA_TIMING")
+        .env_remove("VIA_DEBUG_TIMING")
         .env("HOME", directory.path())
         .env("USERPROFILE", directory.path());
     command
@@ -80,7 +86,11 @@ fn success(command: &mut Command) -> String {
 #[test]
 fn config_path_uses_explicit_environment_local_and_home_precedence() {
     let directory = TempDir::create("config-path");
-    let expected = directory.join(".config/via/config.toml");
+    let expected = directory
+        .path()
+        .join(".config")
+        .join("via")
+        .join("config.toml");
     assert_eq!(
         success(command(&directory).args(["config", "path"])).trim(),
         expected.to_str().unwrap()
@@ -168,7 +178,7 @@ case "$1" in
   read)
     printf '%s|%s|%s\n' "$2" "$3" "$4" >> "$VIA_TEST_OP_LOG"
     if [ -f "$VIA_TEST_OP_FAIL" ]; then printf 'test provider failure\n' >&2; exit 9; fi
-    printf '  test-secret-value\n'
+    printf '  secret-for-%s\n' "${2##*/}"
     ;;
   *) exit 2 ;;
 esac
@@ -227,10 +237,8 @@ secret = "token"
             let mut command = command(&self.directory);
             command
                 .env("PATH", self.directory.join("bin"))
-                .env(
-                    "VIA_DAEMON_SOCKET",
-                    self.directory.join("socket/daemon.sock"),
-                )
+                // Short, to fit the socket path limit below a long TMPDIR.
+                .env("VIA_DAEMON_SOCKET", self.directory.join("s/d.sock"))
                 .env("VIA_TEST_OP_LOG", self.directory.join("op.log"))
                 .env("VIA_TEST_OP_FAIL", self.directory.join("fail-op"));
             command
@@ -243,17 +251,37 @@ secret = "token"
 
     impl Drop for Environment {
         fn drop(&mut self) {
-            // Autostart may have detached a child. Stop only this fixture's socket.
-            let _ = Process::spawn(self.command().args(["daemon", "stop"])).output();
+            // Autostart may have detached a child. Stop only this fixture's
+            // socket. Do not panic: this also runs while a failed test unwinds.
+            let stop = self
+                .command()
+                .args(["daemon", "stop"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            if let Ok(mut stop) = stop {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while matches!(stop.try_wait(), Ok(None)) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let _ = stop.kill();
+                let _ = stop.wait();
+            }
         }
+    }
+
+    // The tool prints both injected secrets, and the fake provider returns a
+    // different value for each reference. Both must be replaced.
+    fn assert_redacted(output: &str) {
+        assert_eq!(output.trim_end(), "token=[REDACTED] other=[REDACTED]");
     }
 
     #[test]
     fn direct_provider_passes_account_redacts_output_and_reports_failures() {
         let environment = Environment::new("off");
         let output = success(environment.command().args(["test", "cli"]));
-        assert!(!output.contains("test-secret-value"));
-        assert!(output.contains("[REDACTED]"));
+        assert_redacted(&output);
         assert_eq!(environment.reads().lines().count(), 2);
         assert!(environment
             .reads()
@@ -296,9 +324,7 @@ secret = "token"
     fn daemon_autostart_cache_clear_and_stop_preserve_resolution_and_redaction() {
         let environment = Environment::new("daemon");
         for _ in 0..2 {
-            let output = success(environment.command().args(["test", "cli"]));
-            assert!(!output.contains("test-secret-value"));
-            assert!(output.contains("[REDACTED]"));
+            assert_redacted(&success(environment.command().args(["test", "cli"])));
         }
         assert_eq!(environment.reads().lines().count(), 2);
         assert!(
@@ -338,7 +364,10 @@ secret = "token"
         let path = directory.join("daemon.sock");
         let listener = UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
-        for response in ["\n", "not-json\n"] {
+        for (response, problem) in [
+            ("\n", "daemon returned an empty response"),
+            ("not-json\n", "json error"),
+        ] {
             let child = Process::spawn(
                 command(&directory)
                     .env("VIA_DAEMON_SOCKET", &path)
@@ -355,6 +384,9 @@ secret = "token"
                     Err(error) => panic!("accept failed: {error}"),
                 }
             };
+            // Some platforms hand out a non-blocking stream from a
+            // non-blocking listener.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -368,7 +400,8 @@ secret = "token"
             drop(stream);
             let output = child.output();
             assert!(!output.status.success());
-            assert!(!output.stderr.is_empty());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(problem), "{stderr}");
         }
     }
 }
