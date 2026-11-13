@@ -28,6 +28,7 @@ pub fn render_with_context(config: &Config, context: &ExecutionContext) -> Strin
         output.push_str(
             "- Redirects are not followed. A redirected request fails and reports its target.\n",
         );
+        output.push_str("- Write request paths in normal form: no `.` or `..` segments, `//`, backslashes or plain whitespace. Percent-encode special characters, such as `%20` for a space.\n");
         output.push_str("- If a capability fails with a credential or configuration error, report it to the user instead of retrying.\n");
     } else {
         output.push_str(
@@ -243,6 +244,7 @@ port = 2222
         assert!(output.contains("runs on a remote broker host"));
         assert!(output.contains("`@file` bodies and `--output <file>` are refused"));
         assert!(output.contains("Redirects are not followed"));
+        assert!(output.contains("Write request paths in normal form"));
         assert!(output.contains("via github api GET <asset-url> --output -`"));
         assert!(output.contains("via github shell <host> [remote-command...]"));
         assert!(!output.contains("via github gh"));

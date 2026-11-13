@@ -308,6 +308,9 @@ Other differences from a local via:
 - The config comes only from `--config` in the forced command. via ignores
   `VIA_CONFIG`, `./via.toml` and the default config location.
 - A service name must be a single path component.
+- Every REST request path must be in [normal form](#path-normal-form), even
+  for a capability without rules. A path such as `/../other` cannot leave the
+  path of `base_url`, and the audit record names the path that via sent.
 
 `--output -` writes the raw response bytes to standard output. via redacts
 known secret values from those bytes. An absolute asset URL still needs
@@ -361,8 +364,14 @@ Write a literal segment in its decoded form. via does not decode a pattern:
 `/files/a b` matches the request path `/files/a%20b`, and `/files/a%20b`
 does not.
 
-Patterns apply to the request path relative to `base_url`. For an absolute
-asset URL, they apply to the URL's path.
+Patterns apply to the request path relative to `base_url`. An absolute URL
+on the `base_url` host whose path starts with the `base_url` path is the same
+request, so via matches it the same way: against the part after the
+`base_url` path. For any other absolute asset URL, patterns apply to the whole
+URL path. Add an asset host only if every allowed pattern is also safe on
+that host.
+
+A pattern may not contain `?` or `#`.
 
 ### Finer rules
 
@@ -404,8 +413,8 @@ via evaluates a request in this order:
 ### Path normal form
 
 Rules only mean something if the path that via checks is the path that the
-service acts on. When any rule field is set, via refuses a request target
-that a client or server could rewrite:
+service acts on. When any rule field is set, and for every request in broker
+mode, via refuses a request target that a client or server could rewrite:
 
 - A `.` or `..` segment, written plainly or percent-encoded, such as `%2e%2e`.
 - An empty segment, such as `//`.
@@ -547,7 +556,8 @@ Every field is always present. A field that does not apply is `null`.
 | `invalid_service_name` | The service name was not a single path component. |
 | `delegated_not_allowed` | The capability is delegated. |
 | `local_file_input`, `local_file_output` | The request used `@file` or `--output <path>`. |
-| `method_not_allowed`, `path_denied`, `path_not_allowed`, `path_not_normalized` | A method or path rule refused the request. |
+| `method_not_allowed`, `path_denied`, `path_not_allowed` | A method or path rule refused the request. |
+| `path_not_normalized` | The request path is not in normal form. |
 | `asset_host_not_allowed`, `ssh_host_not_allowed` | The host is not listed for the capability. |
 | `asset_origin_not_allowed` | An asset URL uses an unapproved scheme, port, or user information. |
 | `body_too_large`, `body_timeout` | Standard input exceeds 8 MiB or does not finish within 30 seconds. |

@@ -70,10 +70,16 @@ impl RestRules {
 
     // `raw_path` is the path component of the request target: no query
     // string and no fragment.
+    #[cfg(test)]
     pub(crate) fn check(&self, method: &str, raw_path: &str) -> Result<(), ViaError> {
-        let method = method.to_ascii_uppercase();
         let path = RequestPath::parse(raw_path)
             .map_err(|problem| refused("path_not_normalized", problem))?;
+        self.check_path(method, &path)
+    }
+
+    // `path` is the request path relative to the capability's `base_url`.
+    pub(crate) fn check_path(&self, method: &str, path: &RequestPath) -> Result<(), ViaError> {
+        let method = method.to_ascii_uppercase();
 
         if let Some(methods) = &self.methods {
             if !methods.contains(&method) {
@@ -84,11 +90,11 @@ impl RestRules {
             }
         }
 
-        let denied = self.deny_paths.iter().any(|pattern| pattern.matches(&path))
+        let denied = self.deny_paths.iter().any(|pattern| pattern.matches(path))
             || self
                 .rules
                 .iter()
-                .any(|rule| rule.effect == RuleEffect::Deny && rule.applies(&method, &path));
+                .any(|rule| rule.effect == RuleEffect::Deny && rule.applies(&method, path));
         if denied {
             return Err(refused("path_denied", "the path is denied"));
         }
@@ -102,14 +108,11 @@ impl RestRules {
             return Ok(());
         }
 
-        let allowed = self
-            .allow_paths
-            .iter()
-            .any(|pattern| pattern.matches(&path))
+        let allowed = self.allow_paths.iter().any(|pattern| pattern.matches(path))
             || self
                 .rules
                 .iter()
-                .any(|rule| rule.effect == RuleEffect::Allow && rule.applies(&method, &path));
+                .any(|rule| rule.effect == RuleEffect::Allow && rule.applies(&method, path));
         if allowed {
             Ok(())
         } else {
@@ -303,6 +306,16 @@ impl RequestPath {
 
         Ok(Self { segments })
     }
+
+    // The rest of this path when it starts with every segment of `prefix`.
+    // Segments are compared after percent-decoding.
+    pub(crate) fn strip_prefix(&self, prefix: &RequestPath) -> Option<RequestPath> {
+        self.segments
+            .strip_prefix(prefix.segments.as_slice())
+            .map(|rest| RequestPath {
+                segments: rest.to_vec(),
+            })
+    }
 }
 
 // Characters that URL parsers strip or rewrite. They are refused anywhere in
@@ -482,6 +495,27 @@ mod tests {
                 "expected pattern `{pattern}` to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn strips_a_prefix_by_decoded_segments() {
+        let path = |raw: &str| RequestPath::parse(raw).unwrap();
+        let base = path("/api/v3/");
+
+        assert_eq!(
+            path("/api/v3/repos/o/r").strip_prefix(&base),
+            Some(path("/repos/o/r"))
+        );
+        // An encoded spelling of the prefix is the same prefix.
+        assert_eq!(
+            path("/%61pi/v3/repos").strip_prefix(&base),
+            Some(path("/repos"))
+        );
+        assert_eq!(path("/api/v3").strip_prefix(&base), Some(path("/")));
+        assert_eq!(path("/api/v30/repos").strip_prefix(&base), None);
+        assert_eq!(path("/api").strip_prefix(&base), None);
+        assert_eq!(path("/repos/api/v3").strip_prefix(&base), None);
+        assert_eq!(path("/a/b").strip_prefix(&path("/")), Some(path("/a/b")));
     }
 
     #[test]

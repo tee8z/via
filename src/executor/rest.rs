@@ -14,7 +14,7 @@ use crate::error::ViaError;
 use crate::executor::{ExecutionContext, InvocationTrace};
 use crate::providers::SecretProvider;
 use crate::redaction::Redactor;
-use crate::rules::{self, RestRules};
+use crate::rules::{self, RequestPath, RestRules};
 
 const MAX_BROKER_BODY_BYTES: u64 = 8 * 1024 * 1024;
 const BROKER_BODY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -102,7 +102,7 @@ fn prepare_request(
             validate_broker_asset_origin(config, &request.path)?;
         }
     }
-    enforce_rules(config, &request)?;
+    enforce_rules(context, config, &request)?;
     // Validate the URL even without rules, before consuming caller input.
     build_url(config, &request.path, &request.query)?;
     request.body = request
@@ -281,33 +281,75 @@ fn unfollowed_redirect_error(response: &RestResponse, redactor: &Redactor) -> Op
     )))
 }
 
-fn enforce_rules(config: &RestCommandConfig, request: &RestInvocation) -> Result<(), ViaError> {
-    let Some(rest_rules) = RestRules::from_config(config)
-        .map_err(|problem| ViaError::InvalidConfig(format!("REST capability {problem}")))?
-    else {
+// Applies the capability's method and path rules. A capability with rules,
+// and every broker request, must also name its path in normal form: the path
+// that via checks and records is then the path that the service receives.
+fn enforce_rules(
+    context: &ExecutionContext,
+    config: &RestCommandConfig,
+    request: &RestInvocation,
+) -> Result<(), ViaError> {
+    let rest_rules = RestRules::from_config(config)
+        .map_err(|problem| ViaError::InvalidConfig(format!("REST capability {problem}")))?;
+    if rest_rules.is_none() && !context.is_broker() {
         return Ok(());
-    };
+    }
 
-    rules::check_raw_target(&request.path)
-        .map_err(|problem| rules::refused("path_not_normalized", problem))?;
+    rules::check_raw_target(&request.path).map_err(|problem| not_normalized(config, problem))?;
     let raw_path = target_path(&request.path);
-    rest_rules.check(request.method.as_str(), raw_path)?;
+    let path = RequestPath::parse(raw_path).map_err(|problem| not_normalized(config, problem))?;
+    if let Some(rest_rules) = rest_rules {
+        let path = path_for_rules(config, request, path);
+        rest_rules.check_path(request.method.as_str(), &path)?;
+    }
     ensure_sent_path_is_checked_path(config, request, raw_path)
 }
 
-// The rules were evaluated against `raw_path`. Refuse the request unless the
-// URL parser sends exactly that path to the expected host.
+fn not_normalized(config: &RestCommandConfig, problem: &str) -> ViaError {
+    if config.has_rules() {
+        rules::refused("path_not_normalized", problem)
+    } else {
+        ViaError::denied(
+            "path_not_normalized",
+            format!("request refused in broker mode: {problem}"),
+        )
+    }
+}
+
+// Patterns are written relative to `base_url`. An absolute URL on the
+// `base_url` host and below its path is the same resource as the relative
+// request, so the rules see the same path for both. Without this, a deny
+// pattern would not match the absolute spelling of a path that it denies.
+// Any other absolute URL is matched by its whole path.
+fn path_for_rules(
+    config: &RestCommandConfig,
+    request: &RestInvocation,
+    path: RequestPath,
+) -> RequestPath {
+    if !request.absolute_url {
+        return path;
+    }
+    let (Ok(base), Ok(target)) = (Url::parse(&config.base_url), Url::parse(&request.path)) else {
+        return path;
+    };
+    if base.host_str() != target.host_str() {
+        return path;
+    }
+
+    match RequestPath::parse(base.path()) {
+        Ok(base_path) => path.strip_prefix(&base_path).unwrap_or(path),
+        Err(_) => path,
+    }
+}
+
+// The path was checked as `raw_path`. Refuse the request unless the URL
+// parser sends exactly that path to the expected host.
 fn ensure_sent_path_is_checked_path(
     config: &RestCommandConfig,
     request: &RestInvocation,
     raw_path: &str,
 ) -> Result<(), ViaError> {
-    let changed = || {
-        rules::refused(
-            "path_not_normalized",
-            "the request URL does not preserve the checked path",
-        )
-    };
+    let changed = || not_normalized(config, "the request URL does not preserve the checked path");
     let url = build_url(config, &request.path, &request.query)?;
     let sent = Url::parse(&url).map_err(|_| changed())?;
     let mut expected = Vec::new();
@@ -1549,7 +1591,11 @@ asset_hosts = ["uploads.linear.app"]
     }
 
     fn rule_denial(config: &RestCommandConfig, args: &[&str]) -> &'static str {
-        match enforce_rules(config, &invocation(config, args)) {
+        match enforce_rules(
+            &ExecutionContext::direct(),
+            config,
+            &invocation(config, args),
+        ) {
             Err(ViaError::Denied { reason, .. }) => reason,
             Err(error) => panic!("expected a denial for {args:?}, got {error}"),
             Ok(()) => panic!("expected a denial for {args:?}"),
@@ -1580,9 +1626,53 @@ asset_hosts = ["uploads.linear.app"]
             &["/a b"],
         ] {
             assert!(
-                enforce_rules(&config, &invocation(&config, args)).is_ok(),
+                enforce_rules(
+                    &ExecutionContext::direct(),
+                    &config,
+                    &invocation(&config, args)
+                )
+                .is_ok(),
                 "{args:?}"
             );
+        }
+    }
+
+    #[test]
+    fn broker_requests_without_rules_must_use_a_normal_path() {
+        let config = rules_config("https://api.example.com/v1/projects/42", "");
+        let check = |args: &[&str]| {
+            enforce_rules(
+                &ExecutionContext::broker(),
+                &config,
+                &invocation(&config, args),
+            )
+        };
+
+        // Without rules the method and path are still unrestricted.
+        assert!(check(&["/user"]).is_ok());
+        assert!(check(&["DELETE", "/repos/o/r"]).is_ok());
+        assert!(check(&["/files/a%20b", "--query", "ref=a/../b"]).is_ok());
+
+        // A path that the URL parser rewrites would leave `base_url`, and
+        // the audit record would name a path that was not requested.
+        for target in [
+            "/../43/secrets",
+            "/a/../b",
+            "/a/%2e%2e/b",
+            "/a//b",
+            "/a b",
+            "/a\tb",
+            "/a\\b",
+            "/a%2fb",
+            "/%zz",
+        ] {
+            match check(&[target]) {
+                Err(ViaError::Denied { reason, message }) => {
+                    assert_eq!(reason, "path_not_normalized", "target `{target}`");
+                    assert!(message.contains("broker mode"), "{message}");
+                }
+                other => panic!("expected `{target}` to be refused, got {other:?}"),
+            }
         }
     }
 
@@ -1590,8 +1680,18 @@ asset_hosts = ["uploads.linear.app"]
     fn method_rules_refuse_other_methods() {
         let config = rules_config("https://api.example.com", "methods = [\"GET\", \"POST\"]");
 
-        assert!(enforce_rules(&config, &invocation(&config, &["/user"])).is_ok());
-        assert!(enforce_rules(&config, &invocation(&config, &["post", "/user"])).is_ok());
+        assert!(enforce_rules(
+            &ExecutionContext::direct(),
+            &config,
+            &invocation(&config, &["/user"])
+        )
+        .is_ok());
+        assert!(enforce_rules(
+            &ExecutionContext::direct(),
+            &config,
+            &invocation(&config, &["post", "/user"])
+        )
+        .is_ok());
         // The request carries the method that the rules allowed, not the
         // caller's spelling of it.
         assert_eq!(invocation(&config, &["post", "/user"]).method, Method::POST);
@@ -1621,7 +1721,12 @@ asset_hosts = ["uploads.linear.app"]
             &["/repos/owner/repo/a%20b"],
         ] {
             assert!(
-                enforce_rules(&config, &invocation(&config, args)).is_ok(),
+                enforce_rules(
+                    &ExecutionContext::direct(),
+                    &config,
+                    &invocation(&config, args)
+                )
+                .is_ok(),
                 "{args:?}"
             );
         }
@@ -1691,6 +1796,7 @@ asset_hosts = ["uploads.linear.app"]
         };
 
         assert!(enforce_rules(
+            &ExecutionContext::direct(),
             &config,
             &invocation(
                 &config,
@@ -1731,9 +1837,73 @@ asset_hosts = ["uploads.linear.app"]
 
         let unlisted = invocation(&config, &args("https://evil.example/files/a.png", None));
         assert!(matches!(
-            enforce_rules(&config, &unlisted),
+            enforce_rules(&ExecutionContext::direct(), &config, &unlisted),
             Err(ViaError::InvalidArgument(message)) if message.contains("asset_hosts")
         ));
+    }
+
+    #[test]
+    fn absolute_urls_below_base_url_match_rules_like_the_relative_request() {
+        let config = rules_config(
+            "https://ghe.example.com/api/v3",
+            "asset_hosts = [\"ghe.example.com\"]\nallow_paths = [\"/repos/owner/**\"]\ndeny_paths = [\"/repos/*/*/actions/secrets/**\"]",
+        );
+        let absolute = |target: &'static str| vec![target, "--output", "-"];
+
+        // The relative request and its absolute spellings get one answer.
+        assert_eq!(
+            rule_denial(&config, &["/repos/owner/repo/actions/secrets"]),
+            "path_denied"
+        );
+        for target in [
+            "https://ghe.example.com/api/v3/repos/owner/repo/actions/secrets",
+            "https://ghe.example.com/api/v3/repos/owner/repo/actions/secrets/NAME?x=1",
+            "https://ghe.example.com/%61pi/v3/repos/owner/repo/actions/secrets",
+            "https://ghe.example.com/api/v3/repos/owner/repo/actions/%73ecrets",
+            // Another scheme or port does not move the path out of reach.
+            "http://ghe.example.com/api/v3/repos/owner/repo/actions/secrets",
+            "https://ghe.example.com:8443/api/v3/repos/owner/repo/actions/secrets",
+        ] {
+            assert_eq!(
+                rule_denial(&config, &absolute(target)),
+                "path_denied",
+                "target `{target}`"
+            );
+        }
+        assert!(enforce_rules(
+            &ExecutionContext::direct(),
+            &config,
+            &invocation(
+                &config,
+                &absolute("https://ghe.example.com/api/v3/repos/owner/repo/issues")
+            )
+        )
+        .is_ok());
+        assert_eq!(
+            rule_denial(
+                &config,
+                &absolute("https://ghe.example.com/api/v3/repos/other/repo")
+            ),
+            "path_not_allowed"
+        );
+
+        // Outside the base path, the patterns apply to the whole URL path.
+        assert!(enforce_rules(
+            &ExecutionContext::direct(),
+            &config,
+            &invocation(
+                &config,
+                &absolute("https://ghe.example.com/repos/owner/repo/archive.tar.gz")
+            )
+        )
+        .is_ok());
+        assert_eq!(
+            rule_denial(
+                &config,
+                &absolute("https://ghe.example.com/api/v30/repos/owner/repo")
+            ),
+            "path_not_allowed"
+        );
     }
 
     #[test]
@@ -1741,7 +1911,7 @@ asset_hosts = ["uploads.linear.app"]
         let config = rules_config("https://api.example.com", "allow_paths = [\"user\"]");
 
         assert!(matches!(
-            enforce_rules(&config, &invocation(&config, &["/user"])),
+            enforce_rules(&ExecutionContext::direct(), &config, &invocation(&config, &["/user"])),
             Err(ViaError::InvalidConfig(message)) if message.contains("invalid path pattern")
         ));
     }
