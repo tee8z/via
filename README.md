@@ -7,13 +7,21 @@ via runs configured commands, SSH sessions, and API requests with credentials
 from a secret provider. It does not expose those credentials to the caller's
 shell.
 
-For credential fields, store only `op://` references in the config. via
-resolves each required value at runtime and applies the selected execution
-boundary.
+For credential fields, store only secret references, such as `op://` or
+`cred://`, in the config. via resolves each required value at runtime and
+applies the selected execution boundary.
 
-via is an early project. It currently supports 1Password through the official
-1Password CLI and SSH agent. The crates.io package is `via-cli`; the installed
-binary is `via`.
+via is an early project. It supports two secret providers:
+
+| Provider | `type` | References | Use it for |
+| --- | --- | --- | --- |
+| 1Password | `1password` | `op://...` | A workstation with the official 1Password CLI and SSH agent. |
+| Credential directory | `directory` | `cred://<name>` | A headless host that keeps each credential in a file, such as systemd credentials. |
+
+The crates.io package is `via-cli`; the installed binary is `via`.
+
+via can also serve an untrusted caller on another machine or VM. See
+[Broker mode](#broker-mode).
 
 ## Choose an execution mode
 
@@ -23,7 +31,7 @@ Each capability uses one execution mode:
 | --- | --- | --- |
 | `rest` | Supported HTTP APIs | via sends the request. The resolved secret stays in the via process. |
 | `delegated` | A trusted binary whose native behavior is required | The child process receives only its configured secrets. via redacts known secret values from captured output. |
-| `ssh` | Direct SSH sessions and remote commands | OpenSSH receives one selected public identity and its agent endpoint. The private key remains in 1Password. |
+| `ssh` | Direct SSH sessions and remote commands | OpenSSH receives one selected public identity and its agent endpoint. The private key remains in the SSH agent, such as 1Password. |
 
 Prefer `rest` for AI agents when the service provides a suitable API. Use
 `delegated` only when you trust the configured child binary.
@@ -90,6 +98,9 @@ cargo install via-cli
 ```
 
 ## Set up 1Password
+
+This section covers the 1Password provider. For a headless host, use the
+`directory` provider described in [Broker Mode](docs/broker-mode.md) instead.
 
 Before you configure via, prepare these components:
 
@@ -214,6 +225,10 @@ via github api GET /repos/OWNER/REPO/issues --query state=open
 via github api POST /repos/OWNER/REPO/pulls --json @pull-request.json
 ```
 
+`--json` and `--data` accept an inline body, `@file`, or `@-` for standard
+input. `--output <file>` writes the raw response to a file, and `--output -`
+writes it to standard output.
+
 ### Run a delegated capability
 
 Pass remaining arguments to the configured trusted binary:
@@ -294,6 +309,26 @@ via linear api GET "https://uploads.linear.app/WORKSPACE/OBJECT/FILE" --output /
 The optional service-level `hint` appears in `via capabilities` and
 `via skill print`. Use a safe, minimal command that contains no secrets.
 
+#### Method and path rules
+
+Narrow a REST capability to the methods and paths that its task needs:
+
+```toml
+[services.github.commands.api]
+mode = "rest"
+base_url = "https://api.github.com"
+methods = ["GET"]
+allow_paths = ["/user", "/repos/OWNER/**"]
+deny_paths = ["/repos/*/*/actions/secrets/**"]
+```
+
+`*` matches one path segment and a trailing `**` matches the rest. Deny wins
+over allow. When any rule is set, via refuses paths that could be rewritten
+into another path, such as `/a/../b`, `%2e%2e`, `//` and `%2f`, and does not
+follow redirects. See
+[Method And Path Rules](docs/broker-mode.md#method-and-path-rules) for the
+pattern syntax, finer per-method rules, and the evaluation order.
+
 ### SSH through the 1Password agent
 
 Configure a reusable profile and an SSH capability:
@@ -330,11 +365,44 @@ increase the server's `MaxAuthTries` value. See the
 [complete example](examples/ssh.toml) and
 [SSH setup guide](docs/ssh-agent-setup.md).
 
+## Broker mode
+
+Broker mode runs via on a trusted host for an untrusted caller on another
+machine or VM, such as an AI agent in a sandbox. The caller holds an SSH key
+whose `authorized_keys` entry forces one command:
+
+```text
+command="/usr/local/bin/via broker exec --config /etc/via/broker.toml --caller sandbox-1",restrict ssh-ed25519 AAAA...
+```
+
+The caller sends its via argument list as a JSON array. via runs the
+capability on the trusted host and returns only the result:
+
+```sh
+ssh via-broker@broker.example.com '["github","api","/repos/OWNER/REPO/issues"]'
+```
+
+In broker mode, via:
+
+- Reads credentials from a `directory` provider, with no desktop app or login.
+- Serves only `capabilities`, `skill print`, and `rest` and `ssh`
+  capabilities. It refuses delegated capabilities, `config`, `login` and
+  `daemon` commands, `@file` bodies, and `--output <path>`.
+- Applies each capability's method and path rules.
+- Honors a kill switch directory that disables one service or everything.
+- Writes one audit record per request to journald or a file, and refuses
+  requests when it cannot.
+
+Follow the [Broker Mode](docs/broker-mode.md) guide for the threat model,
+setup, and record format. Start from
+[examples/broker.toml](examples/broker.toml).
+
 ## Provider cache
 
-On macOS and Linux, `cache = "daemon"` is the default. via automatically starts
-a per-user daemon and caches resolved 1Password secrets in memory for a short
-time-to-live (TTL).
+On macOS and Linux, `cache = "daemon"` is the default for 1Password. via
+automatically starts a per-user daemon and caches resolved 1Password secrets
+in memory for a short time-to-live (TTL). The `directory` provider reads its
+files directly and does not use the cache.
 
 No separate service installation is necessary. Manage the daemon with:
 

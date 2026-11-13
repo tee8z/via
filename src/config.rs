@@ -1291,6 +1291,32 @@ effect = "allow"
     #[cfg(not(windows))]
     const ABSOLUTE_DIRECTORY: &str = r#""/var/lib/via""#;
 
+    #[cfg(unix)]
+    #[test]
+    fn broker_example_is_a_valid_config() {
+        let config = Config::from_toml_str(include_str!("../examples/broker.toml")).unwrap();
+
+        assert!(matches!(
+            &config.providers["files"],
+            ProviderConfig::Directory { path: Some(_) }
+        ));
+        assert!(config.broker.as_ref().unwrap().disable_dir.is_some());
+        assert_eq!(config.audit.as_ref().unwrap().sink, AuditSinkKind::Journald);
+        match &config.services["github"].commands["api"] {
+            CommandConfig::Rest(rest) => {
+                assert!(rest.has_rules());
+                assert_eq!(rest.rules.len(), 4);
+                assert!(rest.allow_paths.is_empty());
+                assert!(!rest.deny_paths.is_empty());
+            }
+            _ => panic!("expected REST command"),
+        }
+        assert!(matches!(
+            &config.services["servers"].commands["shell"],
+            CommandConfig::Ssh(_)
+        ));
+    }
+
     #[test]
     fn configs_without_broker_tables_leave_them_unset() {
         let config = Config::from_toml_str(VALID).unwrap();

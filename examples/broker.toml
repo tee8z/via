@@ -1,0 +1,94 @@
+# Broker mode: via runs on a trusted host for an untrusted caller that
+# connects over SSH with a forced command. See docs/broker-mode.md.
+#
+#   command="/usr/local/bin/via broker exec --config /etc/via/broker.toml --caller sandbox-1",restrict ssh-ed25519 AAAA...
+version = 1
+
+# Each credential is one file in this directory, readable only by the broker
+# account. Omit `path` to use the CREDENTIALS_DIRECTORY environment variable.
+[providers.files]
+type = "directory"
+path = "/run/credentials/via-broker-credentials.service"
+
+# Kill switch: `touch /etc/via/disabled/all` refuses every request, and
+# `touch /etc/via/disabled/github` refuses one service.
+[broker]
+disable_dir = "/etc/via/disabled"
+
+# Required by `via broker exec`. One JSON record per request.
+[audit]
+sink = "journald"
+# sink = "file"
+# path = "/var/log/via/audit.jsonl"
+
+[services.github]
+description = "GitHub REST API for the OWNER organization"
+hint = "via github api /repos/OWNER/REPO/issues --query state=open"
+provider = "files"
+
+[services.github.secrets]
+token = "cred://github-token"
+
+[services.github.commands.api]
+description = "Read OWNER repositories. Create and update issues and pull requests."
+mode = "rest"
+base_url = "https://api.github.com"
+method_default = "GET"
+methods = ["GET", "POST", "PATCH"]
+# Responses from these endpoints contain credentials.
+deny_paths = [
+  "/repos/*/*/actions/secrets/**",
+  "/repos/*/*/actions/runners/registration-token",
+  "/repos/*/*/actions/runners/remove-token",
+  "/repos/*/*/dependabot/secrets/**",
+  "/repos/*/*/hooks/**",
+  "/repos/*/*/keys/**",
+]
+
+[[services.github.commands.api.rules]]
+methods = ["GET"]
+path = "/user"
+effect = "allow"
+
+[[services.github.commands.api.rules]]
+methods = ["GET"]
+path = "/repos/OWNER/**"
+effect = "allow"
+
+[[services.github.commands.api.rules]]
+methods = ["POST", "PATCH"]
+path = "/repos/OWNER/*/issues/**"
+effect = "allow"
+
+[[services.github.commands.api.rules]]
+methods = ["POST", "PATCH"]
+path = "/repos/OWNER/*/pulls/**"
+effect = "allow"
+
+[services.github.commands.api.auth]
+type = "bearer"
+secret = "token"
+
+[services.github.commands.api.headers]
+Accept = "application/vnd.github+json"
+X-GitHub-Api-Version = "2022-11-28"
+
+# The private key stays in an SSH agent on the broker host. via reads only
+# the public key, to select that one identity.
+[ssh_profiles.deploy]
+provider = "files"
+public_key = "cred://deploy-ssh-public-key"
+agent_socket = "/run/via-broker/ssh-agent.sock"
+
+[services.servers]
+description = "SSH access to application servers"
+hint = "via servers shell app-01.example.com uptime"
+provider = "files"
+
+[services.servers.commands.shell]
+description = "Run a command as deploy."
+mode = "ssh"
+profile = "deploy"
+user = "deploy"
+hosts = ["app-*.example.com"]
+port = 22
