@@ -357,6 +357,10 @@ A pattern is a list of `/`-separated segments:
 not match `/repos/OWNER-2`. One trailing slash is not significant:
 `/admin` and `/admin/` match the same patterns.
 
+Write a literal segment in its decoded form. via does not decode a pattern:
+`/files/a b` matches the request path `/files/a%20b`, and `/files/a%20b`
+does not.
+
 Patterns apply to the request path relative to `base_url`. For an absolute
 asset URL, they apply to the URL's path.
 
