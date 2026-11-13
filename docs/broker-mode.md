@@ -546,6 +546,11 @@ Every field is always present. A field that does not apply is `null`.
 | `status` | The HTTP status, or the exit code of the SSH client. |
 | `duration_ms` | Time spent on the request. |
 
+via cuts `ssh_command` at 512 bytes and every other text field at 2048 bytes.
+A cut value ends with `...[truncated; N bytes]`, where `N` is its full
+length. Treat a truncated `ssh_command` as unreviewed: the record does not
+show all of what ran.
+
 `denied` reasons:
 
 | Reason | Meaning |
