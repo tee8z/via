@@ -22,6 +22,10 @@ pub enum Command {
     Config(ConfigCommand),
     Daemon(DaemonCommand),
     SkillPrint,
+    BrokerExec {
+        caller: Option<String>,
+        request: Vec<String>,
+    },
     Invoke {
         service: String,
         capability: String,
@@ -50,7 +54,7 @@ pub fn print_help() {
 impl Cli {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, ViaError> {
         let matches = command().try_get_matches_from(args)?;
-        let config_path = matches.get_one::<PathBuf>("config_path").cloned();
+        let mut config_path = matches.get_one::<PathBuf>("config_path").cloned();
 
         let command = match matches.subcommand() {
             Some(("version", _)) => Command::Version,
@@ -69,6 +73,22 @@ impl Cli {
                         "expected `via skill print`".to_owned(),
                     ))
                 }
+            },
+            Some(("broker", submatches)) => match submatches.subcommand() {
+                Some(("exec", exec_matches)) => {
+                    // The forced command passes `--config` after `exec`.
+                    if let Ok(Some(path)) = exec_matches.try_get_one::<PathBuf>("config_path") {
+                        config_path = Some(path.clone());
+                    }
+                    Command::BrokerExec {
+                        caller: exec_matches.get_one::<String>("caller").cloned(),
+                        request: exec_matches
+                            .get_many::<String>("request")
+                            .map(|values| values.cloned().collect())
+                            .unwrap_or_default(),
+                    }
+                }
+                _ => return Err(ViaError::InvalidCli(BROKER_USAGE.to_owned())),
             },
             Some((service, submatches)) => {
                 let mut args = submatches
@@ -95,6 +115,9 @@ impl Cli {
         })
     }
 }
+
+pub const BROKER_USAGE: &str =
+    "expected `via broker exec --config <ABSOLUTE_PATH> [--caller <LABEL>] [-- <args>...]`";
 
 fn parse_config_command(matches: &clap::ArgMatches) -> Result<ConfigCommand, ViaError> {
     match matches.subcommand() {
@@ -179,6 +202,29 @@ fn command() -> ClapCommand {
             ClapCommand::new("skill")
                 .about("Agent skill helpers")
                 .subcommand(ClapCommand::new("print").about("Print the via skill instructions")),
+        )
+        .subcommand(
+            ClapCommand::new("broker")
+                .about("Serve capabilities to a remote caller from a trusted host")
+                .subcommand(
+                    ClapCommand::new("exec")
+                        .about(
+                            "Run one request from SSH_ORIGINAL_COMMAND, or from arguments after `--`",
+                        )
+                        .arg(
+                            Arg::new("caller")
+                                .long("caller")
+                                .value_name("LABEL")
+                                .help("Label that identifies the caller in audit records"),
+                        )
+                        .arg(
+                            Arg::new("request")
+                                .value_name("ARGS")
+                                .num_args(1..)
+                                .last(true)
+                                .help("Request arguments, for local testing"),
+                        ),
+                ),
         )
         .arg_required_else_help(false)
 }
@@ -297,6 +343,90 @@ mod tests {
         let cli = parse(&["via", "skill", "print"]);
 
         assert!(matches!(cli.command, Command::SkillPrint));
+    }
+
+    #[test]
+    fn parses_broker_exec_as_a_forced_command() {
+        let cli = parse(&[
+            "via",
+            "broker",
+            "exec",
+            "--config",
+            "/etc/via/broker.toml",
+            "--caller",
+            "sandbox-1",
+        ]);
+
+        assert_eq!(
+            cli.config_path.unwrap(),
+            PathBuf::from("/etc/via/broker.toml")
+        );
+        match cli.command {
+            Command::BrokerExec { caller, request } => {
+                assert_eq!(caller.as_deref(), Some("sandbox-1"));
+                assert!(request.is_empty());
+            }
+            _ => panic!("expected broker exec"),
+        }
+    }
+
+    #[test]
+    fn parses_broker_exec_request_after_a_separator() {
+        let cli = parse(&[
+            "via",
+            "--config",
+            "/etc/via/broker.toml",
+            "broker",
+            "exec",
+            "--",
+            "github",
+            "api",
+            "POST",
+            "/user",
+            "--json",
+            "{}",
+            "--config",
+            "/tmp/other.toml",
+        ]);
+
+        assert_eq!(
+            cli.config_path.unwrap(),
+            PathBuf::from("/etc/via/broker.toml")
+        );
+        match cli.command {
+            Command::BrokerExec { caller, request } => {
+                assert_eq!(caller, None);
+                assert_eq!(
+                    request,
+                    [
+                        "github",
+                        "api",
+                        "POST",
+                        "/user",
+                        "--json",
+                        "{}",
+                        "--config",
+                        "/tmp/other.toml"
+                    ]
+                );
+            }
+            _ => panic!("expected broker exec"),
+        }
+    }
+
+    #[test]
+    fn rejects_broker_without_exec_and_requests_without_a_separator() {
+        for args in [
+            &["via", "broker"][..],
+            &["via", "broker", "serve"],
+            &["via", "broker", "exec", "capabilities"],
+            &["via", "broker", "exec", "--unknown"],
+        ] {
+            assert!(
+                Cli::parse(args.iter().map(OsString::from)).is_err(),
+                "expected {args:?} to be rejected"
+            );
+        }
     }
 
     #[test]

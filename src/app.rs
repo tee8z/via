@@ -47,6 +47,13 @@ fn run_cli(cli: Cli) -> Result<ExitCode, ViaError> {
         Command::Config(command) => run_config_command(config_path, command),
         Command::Daemon(command) => run_daemon_cli_command(command),
         Command::SkillPrint => run_skill_print_command(config_path),
+        Command::BrokerExec { caller, request } => {
+            crate::broker::run(crate::broker::BrokerInvocation {
+                config_path: config_path.map(Path::to_path_buf),
+                caller,
+                request,
+            })
+        }
         Command::Invoke {
             service,
             capability,
@@ -153,6 +160,55 @@ mod tests {
         ]);
 
         assert_eq!(code, ExitCode::from(1));
+    }
+
+    #[test]
+    fn broker_exec_without_config_returns_usage_error() {
+        let code = run([
+            OsString::from("via"),
+            OsString::from("broker"),
+            OsString::from("exec"),
+            OsString::from("--"),
+            OsString::from("capabilities"),
+        ]);
+
+        assert_eq!(code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn broker_exec_serves_a_request_passed_after_the_separator() {
+        if std::env::var_os("SSH_ORIGINAL_COMMAND").is_some() {
+            // The request would arrive from two sources, which via refuses.
+            return;
+        }
+
+        let directory = crate::test_support::TempDir::create("app-broker-exec");
+        let audit_path = directory.join("audit.jsonl");
+        let config = format!(
+            "version = 1\n\n[audit]\nsink = \"file\"\npath = '{}'\n",
+            audit_path.display()
+        );
+        let config_path = directory.write_private("broker.toml", config.as_bytes());
+
+        let code = run([
+            OsString::from("via"),
+            OsString::from("broker"),
+            OsString::from("exec"),
+            OsString::from("--config"),
+            config_path.into_os_string(),
+            OsString::from("--caller"),
+            OsString::from("local-test"),
+            OsString::from("--"),
+            OsString::from("capabilities"),
+            OsString::from("--json"),
+        ]);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let audit = std::fs::read_to_string(audit_path).unwrap();
+        assert_eq!(audit.lines().count(), 2);
+        assert!(audit.contains("\"caller\":\"local-test\""));
+        assert!(audit.contains("\"request\":\"capabilities\""));
+        assert!(audit.contains("\"outcome\":\"ok\""));
     }
 
     #[test]

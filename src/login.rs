@@ -79,6 +79,7 @@ fn onepassword_target(name: &str, provider: &ProviderConfig) -> Option<OnePasswo
             name: name.to_owned(),
             account: account.clone(),
         }),
+        ProviderConfig::Directory { .. } => None,
     }
 }
 
@@ -151,6 +152,24 @@ account = "example.1password.com"
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].name, "onepassword");
         assert_eq!(targets[0].account.as_deref(), Some("example.1password.com"));
+    }
+
+    #[test]
+    fn directory_providers_are_not_login_targets() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[providers.files]
+type = "directory"
+"#,
+        )
+        .unwrap();
+
+        assert!(onepassword_login_targets(&config, None).unwrap().is_empty());
+        assert!(onepassword_login_targets(&config, Some("files"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

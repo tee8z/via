@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ViaError;
 
+// Unknown top-level keys are rejected. A misspelled `[broker]` table would
+// otherwise load as a config without a kill switch.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
     #[serde(default)]
@@ -16,6 +19,33 @@ pub struct Config {
     pub ssh_profiles: BTreeMap<String, SshProfileConfig>,
     #[serde(default)]
     pub services: BTreeMap<String, ServiceConfig>,
+    // `broker` and `audit` are only consulted by `via broker exec`.
+    #[serde(default)]
+    pub broker: Option<BrokerConfig>,
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerConfig {
+    #[serde(default)]
+    pub disable_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    pub sink: AuditSinkKind,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditSinkKind {
+    Journald,
+    File,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +59,11 @@ pub enum ProviderConfig {
         cache: OnePasswordCacheMode,
         #[serde(default = "default_onepassword_cache_ttl_seconds")]
         cache_ttl_seconds: u64,
+    },
+    #[serde(rename = "directory")]
+    Directory {
+        #[serde(default)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -97,6 +132,7 @@ pub struct SshCommandConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestCommandConfig {
     #[serde(default)]
     pub description: Option<String>,
@@ -109,6 +145,53 @@ pub struct RestCommandConfig {
     pub auth: Option<AuthConfig>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "deserialize_methods")]
+    pub methods: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_paths: Vec<String>,
+    #[serde(default)]
+    pub deny_paths: Vec<String>,
+    #[serde(default)]
+    pub rules: Vec<RestRuleConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestRuleConfig {
+    #[serde(default, deserialize_with = "deserialize_methods")]
+    pub methods: Option<Vec<String>>,
+    pub path: String,
+    pub effect: RuleEffect,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleEffect {
+    Allow,
+    Deny,
+}
+
+impl RestCommandConfig {
+    pub fn has_rules(&self) -> bool {
+        self.methods.is_some()
+            || !self.allow_paths.is_empty()
+            || !self.deny_paths.is_empty()
+            || !self.rules.is_empty()
+    }
+}
+
+// HTTP methods in rules are stored in upper case.
+fn deserialize_methods<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let methods = Option::<Vec<String>>::deserialize(deserializer)?;
+    Ok(methods.map(|methods| {
+        methods
+            .into_iter()
+            .map(|method| method.to_ascii_uppercase())
+            .collect()
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,22 +275,33 @@ impl Config {
             )));
         }
 
+        if let Some(broker) = &self.broker {
+            broker.validate()?;
+        }
+        if let Some(audit) = &self.audit {
+            audit.validate()?;
+        }
+
+        for (provider_name, provider) in &self.providers {
+            provider.validate(provider_name)?;
+        }
+
         for (profile_name, profile) in &self.ssh_profiles {
             validate_ssh_profile(profile_name, profile, &self.providers)?;
         }
 
         for (service_name, service) in &self.services {
-            if !self.providers.contains_key(&service.provider) {
-                return Err(ViaError::InvalidConfig(format!(
+            let provider = self.providers.get(&service.provider).ok_or_else(|| {
+                ViaError::InvalidConfig(format!(
                     "service `{service_name}` references unknown provider `{}`",
                     service.provider
-                )));
-            }
+                ))
+            })?;
 
             for (secret_name, reference) in &service.secrets {
-                if !reference.starts_with("op://") {
+                if let Err(problem) = provider.validate_reference(reference) {
                     return Err(ViaError::InvalidConfig(format!(
-                        "secret `{service_name}.{secret_name}` must be an op:// reference"
+                        "secret `{service_name}.{secret_name}` {problem}"
                     )));
                 }
             }
@@ -226,6 +320,90 @@ pub fn resolve_path(path: Option<&Path>) -> Result<PathBuf, ViaError> {
         Some(path) => Ok(path.to_path_buf()),
         None => default_config_path(),
     }
+}
+
+impl BrokerConfig {
+    fn validate(&self) -> Result<(), ViaError> {
+        if self
+            .disable_dir
+            .as_deref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(ViaError::InvalidConfig(
+                "broker disable_dir must be an absolute path".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl AuditConfig {
+    fn validate(&self) -> Result<(), ViaError> {
+        match (self.sink, self.path.as_deref()) {
+            (AuditSinkKind::File, None) => Err(ViaError::InvalidConfig(
+                "audit sink `file` requires an absolute `path`".to_owned(),
+            )),
+            (AuditSinkKind::File, Some(path)) if !path.is_absolute() => Err(
+                ViaError::InvalidConfig("audit path must be an absolute path".to_owned()),
+            ),
+            (AuditSinkKind::Journald, Some(_)) => Err(ViaError::InvalidConfig(
+                "audit sink `journald` does not take a `path`".to_owned(),
+            )),
+            (AuditSinkKind::File, Some(_)) | (AuditSinkKind::Journald, None) => Ok(()),
+        }
+    }
+}
+
+const ONEPASSWORD_REFERENCE_SCHEME: &str = "op://";
+const DIRECTORY_REFERENCE_SCHEME: &str = "cred://";
+
+impl ProviderConfig {
+    fn validate(&self, provider_name: &str) -> Result<(), ViaError> {
+        match self {
+            ProviderConfig::OnePassword { .. } => Ok(()),
+            ProviderConfig::Directory { path } => {
+                if path.as_deref().is_some_and(|path| !path.is_absolute()) {
+                    return Err(ViaError::InvalidConfig(format!(
+                        "provider `{provider_name}` directory path must be an absolute path"
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // A reference must use the scheme of the provider that resolves it. The
+    // returned problem completes a sentence that names the offending field.
+    fn validate_reference(&self, reference: &str) -> Result<(), &'static str> {
+        match self {
+            ProviderConfig::OnePassword { .. } => {
+                if reference.starts_with(ONEPASSWORD_REFERENCE_SCHEME) {
+                    Ok(())
+                } else {
+                    Err("must be an op:// reference")
+                }
+            }
+            ProviderConfig::Directory { .. } => {
+                if !reference.starts_with(DIRECTORY_REFERENCE_SCHEME) {
+                    Err("must be a cred:// reference")
+                } else if directory_credential_name(reference).is_none() {
+                    Err("must be a cred://<name> reference that names a single file")
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn directory_credential_name(reference: &str) -> Option<&str> {
+    let name = reference.strip_prefix(DIRECTORY_REFERENCE_SCHEME)?;
+    valid_path_component(name).then_some(name)
+}
+
+pub(crate) fn valid_path_component(value: &str) -> bool {
+    !value.is_empty() && value != "." && value != ".." && !value.contains(['/', '\\', '\0'])
 }
 
 impl CommandConfig {
@@ -260,6 +438,11 @@ impl CommandConfig {
                     )));
                 }
                 validate_asset_hosts(service_name, command_name, &rest.asset_hosts)?;
+                crate::rules::RestRules::from_config(rest).map_err(|problem| {
+                    ViaError::InvalidConfig(format!(
+                        "command `{service_name}.{command_name}` {problem}"
+                    ))
+                })?;
 
                 if let Some(auth) = &rest.auth {
                     match auth {
@@ -349,15 +532,15 @@ fn validate_ssh_profile(
                 .to_owned(),
         ));
     }
-    if !providers.contains_key(&profile.provider) {
+    let Some(provider) = providers.get(&profile.provider) else {
         return Err(ViaError::InvalidConfig(format!(
             "SSH profile `{profile_name}` references unknown provider `{}`",
             profile.provider
         )));
-    }
-    if !profile.public_key.starts_with("op://") {
+    };
+    if let Err(problem) = provider.validate_reference(&profile.public_key) {
         return Err(ViaError::InvalidConfig(format!(
-            "SSH profile `{profile_name}` public_key must be an op:// reference"
+            "SSH profile `{profile_name}` public_key {problem}"
         )));
     }
     if let Some(agent_socket) = &profile.agent_socket {
@@ -910,6 +1093,7 @@ cache_ttl_seconds = 600"#,
                 assert_eq!(*cache, OnePasswordCacheMode::Daemon);
                 assert_eq!(*cache_ttl_seconds, 600);
             }
+            other => panic!("expected a 1Password provider, got {other:?}"),
         }
     }
 
@@ -929,6 +1113,7 @@ cache_ttl_seconds = 600"#,
                 assert_eq!(*cache, OnePasswordCacheMode::Off);
                 assert_eq!(*cache_ttl_seconds, 300);
             }
+            other => panic!("expected a 1Password provider, got {other:?}"),
         }
     }
 
@@ -996,6 +1181,388 @@ type = "headers""#,
             Config::from_toml_str(&raw),
             Err(ViaError::InvalidConfig(message)) if message.contains("delegated program")
         ));
+    }
+
+    #[test]
+    fn parses_rest_rules_and_stores_methods_in_upper_case() {
+        let raw = VALID.replace(
+            "base_url = \"https://api.github.com\"",
+            r#"base_url = "https://api.github.com"
+methods = ["get", "Post"]
+allow_paths = ["/repos/OWNER/**", "/user"]
+deny_paths = ["/repos/*/*/actions/secrets/**"]
+
+[[services.github.commands.api.rules]]
+methods = ["patch"]
+path = "/repos/OWNER/REPO/issues/*"
+effect = "allow"
+"#,
+        );
+        let config = Config::from_toml_str(&raw).unwrap();
+
+        match &config.services["github"].commands["api"] {
+            CommandConfig::Rest(rest) => {
+                assert!(rest.has_rules());
+                assert_eq!(
+                    rest.methods.as_deref(),
+                    Some(&["GET".to_owned(), "POST".to_owned()][..])
+                );
+                assert_eq!(rest.allow_paths, ["/repos/OWNER/**", "/user"]);
+                assert_eq!(rest.deny_paths, ["/repos/*/*/actions/secrets/**"]);
+                assert_eq!(rest.rules.len(), 1);
+                assert_eq!(
+                    rest.rules[0].methods.as_deref(),
+                    Some(&["PATCH".to_owned()][..])
+                );
+                assert_eq!(rest.rules[0].path, "/repos/OWNER/REPO/issues/*");
+                assert_eq!(rest.rules[0].effect, RuleEffect::Allow);
+            }
+            _ => panic!("expected REST command"),
+        }
+    }
+
+    #[test]
+    fn rest_commands_without_rule_fields_have_no_rules() {
+        let config = Config::from_toml_str(VALID).unwrap();
+
+        match &config.services["github"].commands["api"] {
+            CommandConfig::Rest(rest) => assert!(!rest.has_rules()),
+            _ => panic!("expected REST command"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_rest_rules() {
+        for (rules, expected) in [
+            ("methods = []", "at least one HTTP method"),
+            ("methods = [\"GE T\"]", "invalid HTTP method"),
+            (
+                "allow_paths = [\"repos\"]",
+                "invalid path pattern `repos` in allow_paths",
+            ),
+            (
+                "deny_paths = [\"/a/**/b\"]",
+                "invalid path pattern `/a/**/b` in deny_paths",
+            ),
+            ("allow_paths = [\"/a/../b\"]", "invalid path pattern"),
+        ] {
+            let raw = VALID.replace(
+                "base_url = \"https://api.github.com\"",
+                &format!("base_url = \"https://api.github.com\"\n{rules}"),
+            );
+
+            assert!(
+                matches!(
+                    Config::from_toml_str(&raw),
+                    Err(ViaError::InvalidConfig(message))
+                        if message.contains("command `github.api`") && message.contains(expected)
+                ),
+                "expected `{rules}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_misspelled_rest_policy_fields_instead_of_disabling_rules() {
+        for field in ["method", "allow_path", "deny_path", "rule"] {
+            let raw = VALID.replace(
+                "base_url = \"https://api.github.com\"",
+                &format!("base_url = \"https://api.github.com\"\n{field} = []"),
+            );
+            let error = Config::from_toml_str(&raw).unwrap_err();
+            assert!(matches!(error, ViaError::ParseConfig(_)));
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn rest_rule_tables_reject_unknown_fields_and_effects() {
+        let rule = |body: &str| {
+            VALID.replace(
+                "base_url = \"https://api.github.com\"",
+                &format!(
+                    "base_url = \"https://api.github.com\"\n\n[[services.github.commands.api.rules]]\n{body}\n"
+                ),
+            )
+        };
+
+        assert!(Config::from_toml_str(&rule("path = \"/user\"\neffect = \"allow\"")).is_ok());
+        assert!(matches!(
+            Config::from_toml_str(&rule("path = \"/user\"\neffect = \"permit\"")),
+            Err(ViaError::ParseConfig(_))
+        ));
+        assert!(matches!(
+            Config::from_toml_str(&rule(
+                "path = \"/user\"\neffect = \"allow\"\nmethod = \"GET\""
+            )),
+            Err(ViaError::ParseConfig(_))
+        ));
+        assert!(matches!(
+            Config::from_toml_str(&rule("effect = \"allow\"")),
+            Err(ViaError::ParseConfig(_))
+        ));
+    }
+
+    #[cfg(windows)]
+    const ABSOLUTE_DIRECTORY: &str = r"'C:\via\state'";
+    #[cfg(not(windows))]
+    const ABSOLUTE_DIRECTORY: &str = r#""/var/lib/via""#;
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_example_is_a_valid_config() {
+        let config = Config::from_toml_str(include_str!("../examples/broker.toml")).unwrap();
+
+        assert!(matches!(
+            &config.providers["files"],
+            ProviderConfig::Directory { path: Some(_) }
+        ));
+        assert!(config.broker.as_ref().unwrap().disable_dir.is_some());
+        assert_eq!(config.audit.as_ref().unwrap().sink, AuditSinkKind::Journald);
+        match &config.services["github"].commands["api"] {
+            CommandConfig::Rest(rest) => {
+                assert!(rest.has_rules());
+                assert_eq!(rest.rules.len(), 4);
+                assert!(rest.allow_paths.is_empty());
+                assert!(!rest.deny_paths.is_empty());
+            }
+            _ => panic!("expected REST command"),
+        }
+        assert!(matches!(
+            &config.services["servers"].commands["shell"],
+            CommandConfig::Ssh(_)
+        ));
+    }
+
+    #[test]
+    fn configs_without_broker_tables_leave_them_unset() {
+        let config = Config::from_toml_str(VALID).unwrap();
+
+        assert!(config.broker.is_none());
+        assert!(config.audit.is_none());
+    }
+
+    #[test]
+    fn parses_broker_and_audit_tables() {
+        let raw = format!(
+            "{VALID}\n[broker]\ndisable_dir = {ABSOLUTE_DIRECTORY}\n\n[audit]\nsink = \"file\"\npath = {ABSOLUTE_DIRECTORY}\n"
+        );
+        let config = Config::from_toml_str(&raw).unwrap();
+
+        assert!(config
+            .broker
+            .as_ref()
+            .and_then(|broker| broker.disable_dir.as_deref())
+            .is_some_and(Path::is_absolute));
+        let audit = config.audit.as_ref().unwrap();
+        assert_eq!(audit.sink, AuditSinkKind::File);
+        assert!(audit.path.as_deref().is_some_and(Path::is_absolute));
+
+        let journald = format!("{VALID}\n[audit]\nsink = \"journald\"\n");
+        let config = Config::from_toml_str(&journald).unwrap();
+        assert_eq!(config.audit.as_ref().unwrap().sink, AuditSinkKind::Journald);
+        assert!(config.broker.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_tables_instead_of_ignoring_them() {
+        for table in [
+            "[brokers]\ndisable_dir = \"/var/lib/via/disabled\"",
+            "[Broker]\ndisable_dir = \"/var/lib/via/disabled\"",
+            "[audits]\nsink = \"journald\"",
+            "[service.github]\nprovider = \"onepassword\"",
+        ] {
+            let error = Config::from_toml_str(&format!("{VALID}\n{table}\n")).unwrap_err();
+
+            assert!(
+                matches!(error, ViaError::ParseConfig(_)),
+                "expected `{table}` to fail to parse"
+            );
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_broker_and_audit_tables() {
+        for (tables, expected) in [
+            (
+                "[broker]\ndisable_dir = \"disabled\"".to_owned(),
+                "disable_dir must be an absolute path",
+            ),
+            (
+                "[audit]\nsink = \"file\"".to_owned(),
+                "requires an absolute `path`",
+            ),
+            (
+                "[audit]\nsink = \"file\"\npath = \"audit.jsonl\"".to_owned(),
+                "audit path must be an absolute path",
+            ),
+            (
+                format!("[audit]\nsink = \"journald\"\npath = {ABSOLUTE_DIRECTORY}"),
+                "does not take a `path`",
+            ),
+        ] {
+            let raw = format!("{VALID}\n{tables}\n");
+
+            assert!(
+                matches!(
+                    Config::from_toml_str(&raw),
+                    Err(ViaError::InvalidConfig(message)) if message.contains(expected)
+                ),
+                "expected `{expected}` rejection"
+            );
+        }
+
+        for tables in [
+            "[audit]\nsink = \"syslog\"",
+            "[audit]\npath = \"/var/log/via.jsonl\"",
+            "[audit]\nsink = \"journald\"\nidentifier = \"via\"",
+            "[broker]\ndisable_directory = \"/var/lib/via/disabled\"",
+        ] {
+            let raw = format!("{VALID}\n{tables}\n");
+
+            assert!(
+                matches!(Config::from_toml_str(&raw), Err(ViaError::ParseConfig(_))),
+                "expected `{tables}` to fail to parse"
+            );
+        }
+    }
+
+    const DIRECTORY_VALID: &str = r#"
+version = 1
+
+[providers.files]
+type = "directory"
+
+[ssh_profiles.deploy]
+provider = "files"
+public_key = "cred://deploy-ssh-public-key"
+
+[services.github]
+provider = "files"
+
+[services.github.secrets]
+token = "cred://github-token"
+
+[services.github.commands.api]
+mode = "rest"
+base_url = "https://api.github.com"
+
+[services.github.commands.api.auth]
+type = "bearer"
+secret = "token"
+"#;
+
+    #[test]
+    fn parses_directory_provider_with_cred_references() {
+        let config = Config::from_toml_str(DIRECTORY_VALID).unwrap();
+
+        assert!(matches!(
+            &config.providers["files"],
+            ProviderConfig::Directory { path: None }
+        ));
+        assert_eq!(
+            config.services["github"].secrets["token"],
+            "cred://github-token"
+        );
+        assert_eq!(
+            config.ssh_profiles["deploy"].public_key,
+            "cred://deploy-ssh-public-key"
+        );
+    }
+
+    #[test]
+    fn directory_provider_path_must_be_absolute() {
+        #[cfg(windows)]
+        let absolute = r"path = 'C:\via\credentials'";
+        #[cfg(not(windows))]
+        let absolute = r#"path = "/run/credentials/via""#;
+        let with_path = |path: &str| {
+            DIRECTORY_VALID.replace(
+                "type = \"directory\"",
+                &format!("type = \"directory\"\n{path}"),
+            )
+        };
+
+        let config = Config::from_toml_str(&with_path(absolute)).unwrap();
+        assert!(matches!(
+            &config.providers["files"],
+            ProviderConfig::Directory { path: Some(path) } if path.is_absolute()
+        ));
+
+        assert!(matches!(
+            Config::from_toml_str(&with_path("path = \"credentials\"")),
+            Err(ViaError::InvalidConfig(message)) if message.contains("must be an absolute path")
+        ));
+    }
+
+    #[test]
+    fn rejects_references_that_do_not_match_the_provider_type() {
+        let op_secret_for_directory =
+            DIRECTORY_VALID.replace("cred://github-token", "op://Private/GitHub/token");
+        assert!(matches!(
+            Config::from_toml_str(&op_secret_for_directory),
+            Err(ViaError::InvalidConfig(message))
+                if message.contains("secret `github.token` must be a cred:// reference")
+        ));
+
+        let op_public_key_for_directory = DIRECTORY_VALID.replace(
+            "cred://deploy-ssh-public-key",
+            "op://Private/Deploy SSH/public key",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&op_public_key_for_directory),
+            Err(ViaError::InvalidConfig(message))
+                if message.contains("public_key must be a cred:// reference")
+        ));
+
+        let cred_secret_for_onepassword =
+            VALID.replace("op://Private/GitHub/token", "cred://github-token");
+        assert!(matches!(
+            Config::from_toml_str(&cred_secret_for_onepassword),
+            Err(ViaError::InvalidConfig(message)) if message.contains("must be an op:// reference")
+        ));
+
+        let cred_public_key_for_onepassword = SSH_VALID.replace(
+            "op://Private/Production SSH/public key",
+            "cred://deploy-ssh-public-key",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&cred_public_key_for_onepassword),
+            Err(ViaError::InvalidConfig(message)) if message.contains("public_key must be an op://")
+        ));
+    }
+
+    #[test]
+    fn rejects_directory_references_that_are_not_a_single_file_name() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "nested/token",
+            "../token",
+            "/etc/passwd",
+            r"a\b",
+        ] {
+            let raw =
+                DIRECTORY_VALID.replace("\"cred://github-token\"", &format!("'cred://{name}'"));
+
+            assert!(
+                matches!(
+                    Config::from_toml_str(&raw),
+                    Err(ViaError::InvalidConfig(message)) if message.contains("names a single file")
+                ),
+                "expected `cred://{name}` to be rejected"
+            );
+        }
+
+        assert_eq!(
+            directory_credential_name("cred://github-token"),
+            Some("github-token")
+        );
+        assert_eq!(directory_credential_name("cred://a\0b"), None);
+        assert_eq!(directory_credential_name("op://Private/GitHub/token"), None);
+        assert_eq!(directory_credential_name("github-token"), None);
     }
 
     #[cfg(windows)]

@@ -12,6 +12,7 @@ use base64::Engine as _;
 
 use crate::config::{valid_ssh_host_value, SshCommandConfig, SshProfileConfig};
 use crate::error::ViaError;
+use crate::executor::{ExecutionContext, InvocationTrace};
 use crate::providers::SecretProvider;
 
 static TEMP_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -24,12 +25,26 @@ const DEFAULT_SSH_PROGRAM: &str = "/usr/bin/ssh";
 const DEFAULT_SSH_ADD_PROGRAM: &str = "/usr/bin/ssh-add";
 
 pub fn execute(
+    context: &ExecutionContext,
     config: &SshCommandConfig,
     profile: &SshProfileConfig,
     provider: &dyn SecretProvider,
     args: Vec<String>,
+    trace: &mut InvocationTrace,
 ) -> Result<(), ViaError> {
-    let invocation = SshInvocation::parse(config, args)?;
+    trace.ssh_host = args.first().cloned();
+    let invocation = match SshInvocation::parse(config, args) {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            if matches!(error, ViaError::InvalidArgument(_)) {
+                trace.denied = Some("ssh_host_not_allowed");
+            }
+            return Err(error);
+        }
+    };
+    if !invocation.remote_args.is_empty() {
+        trace.ssh_command = Some(invocation.remote_args.join(" "));
+    }
     let agent_socket = resolve_agent_socket(profile)?;
     let (ssh_program, ssh_add_program) = resolve_ssh_programs(profile)?;
     ensure_agent_socket(&agent_socket)?;
@@ -40,6 +55,7 @@ pub fn execute(
     let identity_file = PublicKeyFile::create(&public_key)?;
 
     let mut command = build_command(
+        context,
         &ssh_program,
         config,
         &invocation,
@@ -56,6 +72,7 @@ pub fn execute(
             ViaError::Io(source)
         }
     })?;
+    trace.status = status.code().map(i64::from);
 
     if status.success() {
         Ok(())
@@ -94,10 +111,22 @@ impl SshInvocation {
             )));
         }
 
-        Ok(Self {
-            host,
-            remote_args: args.collect(),
-        })
+        let remote_args = args.collect::<Vec<_>>();
+        // `--` ends option parsing in current OpenSSH. Older releases went on
+        // to read options after the host name, where `-oProxyCommand=...`
+        // would run a local program. A remote command has no need to start
+        // with `-`, so do not depend on the installed version.
+        if remote_args
+            .first()
+            .is_some_and(|argument| argument.starts_with('-'))
+        {
+            return Err(ViaError::denied(
+                "ssh_option_not_allowed",
+                "the remote command may not start with `-`; OpenSSH options are fixed by the capability",
+            ));
+        }
+
+        Ok(Self { host, remote_args })
     }
 }
 
@@ -583,6 +612,7 @@ fn invalid_identity_path(reason: &str) -> ViaError {
 }
 
 fn build_command(
+    context: &ExecutionContext,
     ssh_program: &Path,
     config: &SshCommandConfig,
     invocation: &SshInvocation,
@@ -628,6 +658,16 @@ fn build_command(
         .arg("HostbasedAuthentication=no")
         .arg("-l")
         .arg(&config.user);
+    // The broker account's known_hosts file belongs to its operator. A broker
+    // caller with a terminal could otherwise answer the host-key prompt, and
+    // a server could add keys of its own choice.
+    if context.is_broker() {
+        command
+            .arg("-o")
+            .arg("StrictHostKeyChecking=yes")
+            .arg("-o")
+            .arg("UpdateHostKeys=no");
+    }
     if let Some(port) = config.port {
         command.arg("-p").arg(port.to_string());
     }
@@ -839,11 +879,14 @@ mod tests {
 
     #[test]
     fn execute_rejects_a_disallowed_host_before_provider_or_agent_access() {
+        let mut trace = InvocationTrace::default();
         let error = execute(
+            &ExecutionContext::direct(),
             &ssh_config(&["allowed.example.com"]),
             &profile(None),
             &NeverResolveProvider,
-            vec!["denied.example.com".to_owned()],
+            vec!["denied.example.com".to_owned(), "uptime".to_owned()],
+            &mut trace,
         )
         .unwrap_err();
 
@@ -851,6 +894,28 @@ mod tests {
             error,
             ViaError::InvalidArgument(message) if message.contains("not allowed")
         ));
+        assert_eq!(trace.denied, Some("ssh_host_not_allowed"));
+        assert_eq!(trace.ssh_host.as_deref(), Some("denied.example.com"));
+        assert_eq!(trace.ssh_command, None);
+        assert_eq!(trace.status, None);
+    }
+
+    #[test]
+    fn execute_does_not_mark_a_missing_host_as_denied() {
+        let mut trace = InvocationTrace::default();
+        let error = execute(
+            &ExecutionContext::direct(),
+            &ssh_config(&["allowed.example.com"]),
+            &profile(None),
+            &NeverResolveProvider,
+            Vec::new(),
+            &mut trace,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ViaError::MissingArgument(_)));
+        assert_eq!(trace.denied, None);
+        assert_eq!(trace.ssh_host, None);
     }
 
     #[test]
@@ -889,6 +954,7 @@ mod tests {
             remote_args: vec!["uname".to_owned(), "-a".to_owned()],
         };
         let command = build_command(
+            &ExecutionContext::direct(),
             Path::new("/secure/bin/ssh"),
             &config,
             &invocation,
@@ -1003,6 +1069,7 @@ mod tests {
             remote_args: Vec::new(),
         };
         let error = build_command(
+            &ExecutionContext::direct(),
             Path::new("/secure/bin/ssh"),
             &ssh_config(&["host.example.com"]),
             &invocation,
@@ -1027,6 +1094,7 @@ mod tests {
             remote_args: Vec::new(),
         };
         let built = build_command(
+            &ExecutionContext::direct(),
             &ssh_program,
             &ssh_config(&["host.example.com"]),
             &invocation,
@@ -1120,6 +1188,7 @@ mod tests {
             remote_args: Vec::new(),
         };
         let command = build_command(
+            &ExecutionContext::direct(),
             Path::new("/secure/bin/ssh"),
             &config,
             &invocation,
@@ -1131,6 +1200,85 @@ mod tests {
 
         assert!(!args.iter().any(|argument| *argument == OsStr::new("-p")));
         assert_eq!(args.last(), Some(&OsStr::new("host.example.com")));
+    }
+
+    #[test]
+    fn broker_context_leaves_known_hosts_to_the_operator() {
+        let invocation = SshInvocation {
+            host: "host.example.com".to_owned(),
+            remote_args: vec!["uptime".to_owned()],
+        };
+        let arguments = |context: ExecutionContext| {
+            build_command(
+                &context,
+                Path::new("/secure/bin/ssh"),
+                &ssh_config(&["host.example.com"]),
+                &invocation,
+                Path::new("/tmp/agent.sock"),
+                Path::new("/tmp/identity.pub"),
+            )
+            .unwrap()
+            .get_args()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        };
+        let options = ["StrictHostKeyChecking=yes", "UpdateHostKeys=no"].map(OsString::from);
+
+        let broker = arguments(ExecutionContext::broker());
+        let separator = broker.iter().position(|argument| argument == "--").unwrap();
+        for option in &options {
+            let position = broker
+                .iter()
+                .position(|argument| argument == option)
+                .unwrap();
+            assert!(position < separator, "{option:?}");
+            assert_eq!(broker[position - 1], "-o");
+        }
+        assert_eq!(broker[separator + 1..], ["host.example.com", "uptime"]);
+
+        // A direct caller owns its known_hosts file and keeps the prompt.
+        let direct = arguments(ExecutionContext::direct());
+        for option in &options {
+            assert!(!direct.contains(option), "{option:?}");
+        }
+    }
+
+    #[test]
+    fn invocation_rejects_a_remote_command_that_starts_with_an_option() {
+        let config = ssh_config(&["host.example.com"]);
+        let parse = |remote: &[&str]| {
+            SshInvocation::parse(
+                &config,
+                ["host.example.com"]
+                    .iter()
+                    .chain(remote)
+                    .map(|argument| (*argument).to_owned())
+                    .collect(),
+            )
+        };
+
+        for remote in [
+            &["-oProxyCommand=touch /tmp/via-test"][..],
+            &["-o", "ProxyCommand=touch /tmp/via-test"],
+            &["-vvv", "uptime"],
+            &["--", "uptime"],
+            &["-"],
+        ] {
+            assert!(
+                matches!(
+                    parse(remote),
+                    Err(ViaError::Denied {
+                        reason: "ssh_option_not_allowed",
+                        ..
+                    })
+                ),
+                "{remote:?}"
+            );
+        }
+
+        // Only the first word can be read as a local option.
+        assert_eq!(parse(&["ls", "-la"]).unwrap().remote_args, ["ls", "-la"]);
+        assert!(parse(&[]).unwrap().remote_args.is_empty());
     }
 
     #[test]
@@ -1181,7 +1329,9 @@ mod tests {
         profile.ssh_program = Some(ssh.clone());
         profile.ssh_add_program = Some(ssh_add.clone());
 
+        let mut trace = InvocationTrace::default();
         let error = execute(
+            &ExecutionContext::direct(),
             &ssh_config(&["node.example.com"]),
             &profile,
             &FakeProvider {
@@ -1192,6 +1342,7 @@ mod tests {
                 "uname".to_owned(),
                 "-a".to_owned(),
             ],
+            &mut trace,
         )
         .unwrap_err();
 
@@ -1199,6 +1350,10 @@ mod tests {
             error,
             ViaError::SshCommandFailed { status: Some(42) }
         ));
+        assert_eq!(trace.ssh_host.as_deref(), Some("node.example.com"));
+        assert_eq!(trace.ssh_command.as_deref(), Some("uname -a"));
+        assert_eq!(trace.status, Some(42));
+        assert_eq!(trace.denied, None);
 
         assert_eq!(
             fs::read_to_string(&ssh_add_socket_record).unwrap().trim(),
