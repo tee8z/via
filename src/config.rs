@@ -16,6 +16,33 @@ pub struct Config {
     pub ssh_profiles: BTreeMap<String, SshProfileConfig>,
     #[serde(default)]
     pub services: BTreeMap<String, ServiceConfig>,
+    // `broker` and `audit` are only consulted by `via broker exec`.
+    #[serde(default)]
+    pub broker: Option<BrokerConfig>,
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerConfig {
+    #[serde(default)]
+    pub disable_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    pub sink: AuditSinkKind,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditSinkKind {
+    Journald,
+    File,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +271,13 @@ impl Config {
             )));
         }
 
+        if let Some(broker) = &self.broker {
+            broker.validate()?;
+        }
+        if let Some(audit) = &self.audit {
+            audit.validate()?;
+        }
+
         for (provider_name, provider) in &self.providers {
             provider.validate(provider_name)?;
         }
@@ -281,6 +315,39 @@ pub fn resolve_path(path: Option<&Path>) -> Result<PathBuf, ViaError> {
     match path {
         Some(path) => Ok(path.to_path_buf()),
         None => default_config_path(),
+    }
+}
+
+impl BrokerConfig {
+    fn validate(&self) -> Result<(), ViaError> {
+        if self
+            .disable_dir
+            .as_deref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(ViaError::InvalidConfig(
+                "broker disable_dir must be an absolute path".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl AuditConfig {
+    fn validate(&self) -> Result<(), ViaError> {
+        match (self.sink, self.path.as_deref()) {
+            (AuditSinkKind::File, None) => Err(ViaError::InvalidConfig(
+                "audit sink `file` requires an absolute `path`".to_owned(),
+            )),
+            (AuditSinkKind::File, Some(path)) if !path.is_absolute() => Err(
+                ViaError::InvalidConfig("audit path must be an absolute path".to_owned()),
+            ),
+            (AuditSinkKind::Journald, Some(_)) => Err(ViaError::InvalidConfig(
+                "audit sink `journald` does not take a `path`".to_owned(),
+            )),
+            (AuditSinkKind::File, Some(_)) | (AuditSinkKind::Journald, None) => Ok(()),
+        }
     }
 }
 
@@ -1217,6 +1284,87 @@ effect = "allow"
             Config::from_toml_str(&rule("effect = \"allow\"")),
             Err(ViaError::ParseConfig(_))
         ));
+    }
+
+    #[cfg(windows)]
+    const ABSOLUTE_DIRECTORY: &str = r"'C:\via\state'";
+    #[cfg(not(windows))]
+    const ABSOLUTE_DIRECTORY: &str = r#""/var/lib/via""#;
+
+    #[test]
+    fn configs_without_broker_tables_leave_them_unset() {
+        let config = Config::from_toml_str(VALID).unwrap();
+
+        assert!(config.broker.is_none());
+        assert!(config.audit.is_none());
+    }
+
+    #[test]
+    fn parses_broker_and_audit_tables() {
+        let raw = format!(
+            "{VALID}\n[broker]\ndisable_dir = {ABSOLUTE_DIRECTORY}\n\n[audit]\nsink = \"file\"\npath = {ABSOLUTE_DIRECTORY}\n"
+        );
+        let config = Config::from_toml_str(&raw).unwrap();
+
+        assert!(config
+            .broker
+            .as_ref()
+            .and_then(|broker| broker.disable_dir.as_deref())
+            .is_some_and(Path::is_absolute));
+        let audit = config.audit.as_ref().unwrap();
+        assert_eq!(audit.sink, AuditSinkKind::File);
+        assert!(audit.path.as_deref().is_some_and(Path::is_absolute));
+
+        let journald = format!("{VALID}\n[audit]\nsink = \"journald\"\n");
+        let config = Config::from_toml_str(&journald).unwrap();
+        assert_eq!(config.audit.as_ref().unwrap().sink, AuditSinkKind::Journald);
+        assert!(config.broker.is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_broker_and_audit_tables() {
+        for (tables, expected) in [
+            (
+                "[broker]\ndisable_dir = \"disabled\"".to_owned(),
+                "disable_dir must be an absolute path",
+            ),
+            (
+                "[audit]\nsink = \"file\"".to_owned(),
+                "requires an absolute `path`",
+            ),
+            (
+                "[audit]\nsink = \"file\"\npath = \"audit.jsonl\"".to_owned(),
+                "audit path must be an absolute path",
+            ),
+            (
+                format!("[audit]\nsink = \"journald\"\npath = {ABSOLUTE_DIRECTORY}"),
+                "does not take a `path`",
+            ),
+        ] {
+            let raw = format!("{VALID}\n{tables}\n");
+
+            assert!(
+                matches!(
+                    Config::from_toml_str(&raw),
+                    Err(ViaError::InvalidConfig(message)) if message.contains(expected)
+                ),
+                "expected `{expected}` rejection"
+            );
+        }
+
+        for tables in [
+            "[audit]\nsink = \"syslog\"",
+            "[audit]\npath = \"/var/log/via.jsonl\"",
+            "[audit]\nsink = \"journald\"\nidentifier = \"via\"",
+            "[broker]\ndisable_directory = \"/var/lib/via/disabled\"",
+        ] {
+            let raw = format!("{VALID}\n{tables}\n");
+
+            assert!(
+                matches!(Config::from_toml_str(&raw), Err(ViaError::ParseConfig(_))),
+                "expected `{tables}` to fail to parse"
+            );
+        }
     }
 
     const DIRECTORY_VALID: &str = r#"

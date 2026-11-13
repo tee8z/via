@@ -47,6 +47,13 @@ fn run_cli(cli: Cli) -> Result<ExitCode, ViaError> {
         Command::Config(command) => run_config_command(config_path, command),
         Command::Daemon(command) => run_daemon_cli_command(command),
         Command::SkillPrint => run_skill_print_command(config_path),
+        Command::BrokerExec { caller, request } => {
+            crate::broker::run(crate::broker::BrokerInvocation {
+                config_path: config_path.map(Path::to_path_buf),
+                caller,
+                request,
+            })
+        }
         Command::Invoke {
             service,
             capability,
@@ -153,6 +160,19 @@ mod tests {
         ]);
 
         assert_eq!(code, ExitCode::from(1));
+    }
+
+    #[test]
+    fn broker_exec_without_config_returns_usage_error() {
+        let code = run([
+            OsString::from("via"),
+            OsString::from("broker"),
+            OsString::from("exec"),
+            OsString::from("--"),
+            OsString::from("capabilities"),
+        ]);
+
+        assert_eq!(code, ExitCode::from(2));
     }
 
     #[test]

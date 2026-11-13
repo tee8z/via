@@ -12,6 +12,7 @@ use base64::Engine as _;
 
 use crate::config::{valid_ssh_host_value, SshCommandConfig, SshProfileConfig};
 use crate::error::ViaError;
+use crate::executor::InvocationTrace;
 use crate::providers::SecretProvider;
 
 static TEMP_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -28,8 +29,21 @@ pub fn execute(
     profile: &SshProfileConfig,
     provider: &dyn SecretProvider,
     args: Vec<String>,
+    trace: &mut InvocationTrace,
 ) -> Result<(), ViaError> {
-    let invocation = SshInvocation::parse(config, args)?;
+    trace.ssh_host = args.first().cloned();
+    let invocation = match SshInvocation::parse(config, args) {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            if matches!(error, ViaError::InvalidArgument(_)) {
+                trace.denied = Some("ssh_host_not_allowed");
+            }
+            return Err(error);
+        }
+    };
+    if !invocation.remote_args.is_empty() {
+        trace.ssh_command = Some(invocation.remote_args.join(" "));
+    }
     let agent_socket = resolve_agent_socket(profile)?;
     let (ssh_program, ssh_add_program) = resolve_ssh_programs(profile)?;
     ensure_agent_socket(&agent_socket)?;
@@ -56,6 +70,7 @@ pub fn execute(
             ViaError::Io(source)
         }
     })?;
+    trace.status = status.code().map(i64::from);
 
     if status.success() {
         Ok(())
@@ -839,11 +854,13 @@ mod tests {
 
     #[test]
     fn execute_rejects_a_disallowed_host_before_provider_or_agent_access() {
+        let mut trace = InvocationTrace::default();
         let error = execute(
             &ssh_config(&["allowed.example.com"]),
             &profile(None),
             &NeverResolveProvider,
-            vec!["denied.example.com".to_owned()],
+            vec!["denied.example.com".to_owned(), "uptime".to_owned()],
+            &mut trace,
         )
         .unwrap_err();
 
@@ -851,6 +868,27 @@ mod tests {
             error,
             ViaError::InvalidArgument(message) if message.contains("not allowed")
         ));
+        assert_eq!(trace.denied, Some("ssh_host_not_allowed"));
+        assert_eq!(trace.ssh_host.as_deref(), Some("denied.example.com"));
+        assert_eq!(trace.ssh_command, None);
+        assert_eq!(trace.status, None);
+    }
+
+    #[test]
+    fn execute_does_not_mark_a_missing_host_as_denied() {
+        let mut trace = InvocationTrace::default();
+        let error = execute(
+            &ssh_config(&["allowed.example.com"]),
+            &profile(None),
+            &NeverResolveProvider,
+            Vec::new(),
+            &mut trace,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ViaError::MissingArgument(_)));
+        assert_eq!(trace.denied, None);
+        assert_eq!(trace.ssh_host, None);
     }
 
     #[test]
@@ -1181,6 +1219,7 @@ mod tests {
         profile.ssh_program = Some(ssh.clone());
         profile.ssh_add_program = Some(ssh_add.clone());
 
+        let mut trace = InvocationTrace::default();
         let error = execute(
             &ssh_config(&["node.example.com"]),
             &profile,
@@ -1192,6 +1231,7 @@ mod tests {
                 "uname".to_owned(),
                 "-a".to_owned(),
             ],
+            &mut trace,
         )
         .unwrap_err();
 
@@ -1199,6 +1239,10 @@ mod tests {
             error,
             ViaError::SshCommandFailed { status: Some(42) }
         ));
+        assert_eq!(trace.ssh_host.as_deref(), Some("node.example.com"));
+        assert_eq!(trace.ssh_command.as_deref(), Some("uname -a"));
+        assert_eq!(trace.status, Some(42));
+        assert_eq!(trace.denied, None);
 
         assert_eq!(
             fs::read_to_string(&ssh_add_socket_record).unwrap().trim(),

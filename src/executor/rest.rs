@@ -10,66 +10,124 @@ use reqwest::{Method, Url};
 
 use crate::config::{AuthConfig, RestCommandConfig, SecretHeaderConfig, ServiceConfig};
 use crate::error::ViaError;
+use crate::executor::{ExecutionContext, InvocationTrace};
 use crate::providers::SecretProvider;
 use crate::redaction::Redactor;
 use crate::rules::{self, RestRules};
 
 pub fn execute(
+    context: &ExecutionContext,
     service_name: &str,
     service: &ServiceConfig,
     config: &RestCommandConfig,
     provider: &dyn SecretProvider,
     args: Vec<String>,
+    trace: &mut InvocationTrace,
 ) -> Result<(), ViaError> {
-    let request = RestInvocation::parse(config, args)?;
+    record_request_target(config, &args, trace);
+    let request = RestInvocation::parse(context, config, args)?;
+    if request.absolute_url {
+        if let Err(error) = validate_asset_url(config, &request.path) {
+            trace.denied = Some("asset_host_not_allowed");
+            return Err(error);
+        }
+    }
     enforce_rules(config, &request)?;
-    let mut redactor = Redactor::new();
-    let client = http_client(config, &request)?;
-    let builder = {
-        let mut context = RestRequestBuildContext {
-            client: &client,
-            config,
-            service_name,
-            service,
-            provider,
-            redactor: &mut redactor,
-            oauth_token_mode: OAuthTokenMode::Cached,
-        };
-        build_authenticated_request(&mut context, &request)?
+
+    let client = http_client(context, config, &request)?;
+    let target = RestTarget {
+        service_name,
+        service,
+        config,
+        provider,
     };
+    let builder = authenticated_request(
+        &target,
+        &client,
+        &request,
+        &mut trace.redactor,
+        OAuthTokenMode::Cached,
+    )?;
     let mut response = send_rest_request(builder, &request.method, &request.path)?;
     if should_retry_with_fresh_oauth(config, response.status) {
         crate::timing::event("rest oauth retry", "status=401");
-        let builder = {
-            let mut context = RestRequestBuildContext {
-                client: &client,
-                config,
-                service_name,
-                service,
-                provider,
-                redactor: &mut redactor,
-                oauth_token_mode: OAuthTokenMode::Refresh,
-            };
-            build_authenticated_request(&mut context, &request)?
-        };
+        let builder = authenticated_request(
+            &target,
+            &client,
+            &request,
+            &mut trace.redactor,
+            OAuthTokenMode::Refresh,
+        )?;
         response = send_rest_request(builder, &request.method, &request.path)?;
     }
+    trace.status = Some(i64::from(response.status.as_u16()));
 
     if !response.status.is_success() {
-        if let Some(error) = unfollowed_redirect_error(&response, &redactor) {
+        if let Some(error) = unfollowed_redirect_error(&response, &trace.redactor) {
             return Err(error);
         }
-        let body = redactor.redact(&String::from_utf8_lossy(&response.body));
+        let body = trace
+            .redactor
+            .redact(&String::from_utf8_lossy(&response.body));
         ensure_success(response.status, &response.headers, &body)?;
     }
 
-    if let Some(output) = &request.output {
-        write_response_body(output, &response.body)?;
-    } else {
-        let body = redactor.redact(&String::from_utf8_lossy(&response.body));
-        println!("{body}");
+    match &request.output {
+        Some(OutputTarget::File(path)) => write_response_body(path, &response.body)?,
+        Some(OutputTarget::Stdout) => {
+            write_response_to_stdout(&trace.redactor.redact_bytes(&response.body))?;
+        }
+        None => {
+            let body = trace
+                .redactor
+                .redact(&String::from_utf8_lossy(&response.body));
+            println!("{body}");
+        }
     }
     Ok(())
+}
+
+struct RestTarget<'a> {
+    service_name: &'a str,
+    service: &'a ServiceConfig,
+    config: &'a RestCommandConfig,
+    provider: &'a dyn SecretProvider,
+}
+
+fn authenticated_request(
+    target: &RestTarget<'_>,
+    client: &Client,
+    request: &RestInvocation,
+    redactor: &mut Redactor,
+    oauth_token_mode: OAuthTokenMode,
+) -> Result<RequestBuilder, ViaError> {
+    let mut context = RestRequestBuildContext {
+        client,
+        config: target.config,
+        service_name: target.service_name,
+        service: target.service,
+        provider: target.provider,
+        redactor,
+        oauth_token_mode,
+    };
+    build_authenticated_request(&mut context, request)
+}
+
+// Records the method, host and path before any option is parsed, so that a
+// refused request can still be attributed. The query string is left out.
+fn record_request_target(config: &RestCommandConfig, args: &[String], trace: &mut InvocationTrace) {
+    let Ok((method, target, _)) = request_target(config, args) else {
+        return;
+    };
+
+    trace.method = Some(method.as_str().to_ascii_uppercase());
+    trace.path = Some(target_path(target).to_owned());
+    let url = if is_absolute_http_url(target) {
+        Url::parse(target)
+    } else {
+        Url::parse(&config.base_url)
+    };
+    trace.host = url.ok().and_then(|url| url.host_str().map(str::to_owned));
 }
 
 struct RestResponse {
@@ -164,10 +222,15 @@ fn send_rest_request(
     })
 }
 
-fn http_client(config: &RestCommandConfig, request: &RestInvocation) -> Result<Client, ViaError> {
+fn http_client(
+    context: &ExecutionContext,
+    config: &RestCommandConfig,
+    request: &RestInvocation,
+) -> Result<Client, ViaError> {
     // A redirect could lead to a host or path outside the capability
-    // boundary, so it is never followed where that boundary is restricted.
-    if request.absolute_url || config.has_rules() {
+    // boundary, so it is never followed where that boundary is restricted
+    // or the caller is untrusted.
+    if request.absolute_url || config.has_rules() || context.is_broker() {
         return Ok(Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()?);
@@ -285,6 +348,13 @@ fn write_response_body(path: &Path, body: &[u8]) -> Result<(), ViaError> {
     Ok(())
 }
 
+fn write_response_to_stdout(body: &[u8]) -> Result<(), ViaError> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(body)?;
+    stdout.flush()?;
+    Ok(())
+}
+
 fn ensure_success(
     status: reqwest::StatusCode,
     headers: &HeaderMap,
@@ -339,25 +409,25 @@ struct RestInvocation {
     path: String,
     query: Vec<(String, String)>,
     body: Option<String>,
-    output: Option<PathBuf>,
+    output: Option<OutputTarget>,
     absolute_url: bool,
 }
 
-impl RestInvocation {
-    fn parse(config: &RestCommandConfig, args: Vec<String>) -> Result<Self, ViaError> {
-        let mut args = args.into_iter().peekable();
-        let first = args
-            .next()
-            .ok_or_else(|| ViaError::MissingArgument("path".to_owned()))?;
+#[derive(Debug, PartialEq, Eq)]
+enum OutputTarget {
+    Stdout,
+    File(PathBuf),
+}
 
-        let (method, path) = if is_request_target(&first) {
-            (parse_method(&config.method_default)?, first)
-        } else {
-            let path = args
-                .next()
-                .ok_or_else(|| ViaError::MissingArgument("path".to_owned()))?;
-            (parse_method(&first)?, path)
-        };
+impl RestInvocation {
+    fn parse(
+        context: &ExecutionContext,
+        config: &RestCommandConfig,
+        args: Vec<String>,
+    ) -> Result<Self, ViaError> {
+        let (method, path, consumed) = request_target(config, &args)?;
+        let path = path.to_owned();
+        let mut args = args.into_iter().skip(consumed);
 
         let mut query = Vec::new();
         let mut body = None;
@@ -378,19 +448,19 @@ impl RestInvocation {
                     let value = args
                         .next()
                         .ok_or_else(|| ViaError::MissingArgument("--json value".to_owned()))?;
-                    body = Some(read_body_arg(&value)?);
+                    body = Some(read_body_arg(context, &value)?);
                 }
                 "--data" | "-d" => {
                     let value = args
                         .next()
                         .ok_or_else(|| ViaError::MissingArgument("--data value".to_owned()))?;
-                    body = Some(read_body_arg(&value)?);
+                    body = Some(read_body_arg(context, &value)?);
                 }
                 "--output" | "-o" => {
                     let value = args
                         .next()
                         .ok_or_else(|| ViaError::MissingArgument("--output path".to_owned()))?;
-                    output = Some(PathBuf::from(value));
+                    output = Some(output_target(context, value)?);
                 }
                 other => {
                     return Err(ViaError::InvalidArgument(format!(
@@ -403,7 +473,8 @@ impl RestInvocation {
         let absolute_url = is_absolute_http_url(&path);
         if absolute_url && output.is_none() {
             return Err(ViaError::InvalidArgument(
-                "absolute URL requests must use --output <path>".to_owned(),
+                "absolute URL requests must use --output <path>, or --output - for standard output"
+                    .to_owned(),
             ));
         }
 
@@ -416,6 +487,41 @@ impl RestInvocation {
             absolute_url,
         })
     }
+}
+
+// The method and request target at the start of the arguments, and how many
+// arguments they use.
+fn request_target<'a>(
+    config: &RestCommandConfig,
+    args: &'a [String],
+) -> Result<(Method, &'a str, usize), ViaError> {
+    let first = args
+        .first()
+        .ok_or_else(|| ViaError::MissingArgument("path".to_owned()))?;
+    if is_request_target(first) {
+        return Ok((parse_method(&config.method_default)?, first.as_str(), 1));
+    }
+
+    let path = args
+        .get(1)
+        .ok_or_else(|| ViaError::MissingArgument("path".to_owned()))?;
+    Ok((parse_method(first)?, path.as_str(), 2))
+}
+
+// `-` writes the raw response to standard output. A broker caller may not
+// name a file on the broker host.
+fn output_target(context: &ExecutionContext, value: String) -> Result<OutputTarget, ViaError> {
+    if value == "-" {
+        return Ok(OutputTarget::Stdout);
+    }
+    if context.is_broker() {
+        return Err(ViaError::denied(
+            "local_file_output",
+            "broker mode refuses `--output <path>`; use `--output -` to write the response to standard output",
+        ));
+    }
+
+    Ok(OutputTarget::File(PathBuf::from(value)))
 }
 
 fn is_request_target(value: &str) -> bool {
@@ -767,18 +873,42 @@ fn percent_encode(value: &str) -> String {
     encoded
 }
 
-fn read_body_arg(value: &str) -> Result<String, ViaError> {
+#[derive(Debug, PartialEq, Eq)]
+enum BodySource<'a> {
+    Inline(&'a str),
+    Stdin,
+    File(&'a str),
+}
+
+// `@-` reads standard input and `@path` reads a local file. A broker caller
+// may not read a file on the broker host.
+fn body_source<'a>(context: &ExecutionContext, value: &'a str) -> Result<BodySource<'a>, ViaError> {
     if value == "@-" {
-        let mut body = String::new();
-        io::stdin().read_to_string(&mut body)?;
-        return Ok(body);
+        return Ok(BodySource::Stdin);
+    }
+    let Some(path) = value.strip_prefix('@') else {
+        return Ok(BodySource::Inline(value));
+    };
+    if context.is_broker() {
+        return Err(ViaError::denied(
+            "local_file_input",
+            "broker mode refuses `@file` request bodies; pass the body inline or use `@-` to read standard input",
+        ));
     }
 
-    if let Some(path) = value.strip_prefix('@') {
-        return Ok(std::fs::read_to_string(path)?);
-    }
+    Ok(BodySource::File(path))
+}
 
-    Ok(value.to_owned())
+fn read_body_arg(context: &ExecutionContext, value: &str) -> Result<String, ViaError> {
+    match body_source(context, value)? {
+        BodySource::Inline(body) => Ok(body.to_owned()),
+        BodySource::Stdin => {
+            let mut body = String::new();
+            io::stdin().read_to_string(&mut body)?;
+            Ok(body)
+        }
+        BodySource::File(path) => Ok(std::fs::read_to_string(path)?),
+    }
 }
 
 #[cfg(test)]
@@ -819,7 +949,12 @@ Accept = "application/vnd.github+json"
 
     #[test]
     fn parses_default_method_and_path() {
-        let invocation = RestInvocation::parse(&rest_config(), vec!["/user".to_owned()]).unwrap();
+        let invocation = RestInvocation::parse(
+            &ExecutionContext::direct(),
+            &rest_config(),
+            vec!["/user".to_owned()],
+        )
+        .unwrap();
 
         assert_eq!(invocation.method, Method::GET);
         assert_eq!(invocation.path, "/user");
@@ -828,6 +963,7 @@ Accept = "application/vnd.github+json"
     #[test]
     fn parses_explicit_method_query_and_body() {
         let invocation = RestInvocation::parse(
+            &ExecutionContext::direct(),
             &rest_config(),
             vec![
                 "POST".to_owned(),
@@ -851,6 +987,7 @@ Accept = "application/vnd.github+json"
     #[test]
     fn parses_absolute_url_with_output() {
         let invocation = RestInvocation::parse(
+            &ExecutionContext::direct(),
             &rest_config(),
             vec![
                 "GET".to_owned(),
@@ -866,13 +1003,17 @@ Accept = "application/vnd.github+json"
             invocation.path,
             "https://uploads.linear.app/workspace/object/file"
         );
-        assert_eq!(invocation.output, Some(PathBuf::from("/tmp/hero.jpg")));
+        assert_eq!(
+            invocation.output,
+            Some(OutputTarget::File(PathBuf::from("/tmp/hero.jpg")))
+        );
         assert!(invocation.absolute_url);
     }
 
     #[test]
     fn rejects_absolute_url_without_output() {
         let error = RestInvocation::parse(
+            &ExecutionContext::direct(),
             &rest_config(),
             vec!["https://uploads.linear.app/workspace/object/file".to_owned()],
         )
@@ -886,6 +1027,7 @@ Accept = "application/vnd.github+json"
     #[test]
     fn rejects_bad_query_pair() {
         let error = match RestInvocation::parse(
+            &ExecutionContext::direct(),
             &rest_config(),
             vec!["/user".to_owned(), "--query".to_owned(), "state".to_owned()],
         ) {
@@ -945,12 +1087,311 @@ asset_hosts = ["uploads.linear.app"]
         );
     }
 
+    fn execute_direct(
+        service_name: &str,
+        service: &ServiceConfig,
+        config: &RestCommandConfig,
+        provider: &dyn SecretProvider,
+        args: Vec<String>,
+    ) -> Result<(), ViaError> {
+        execute(
+            &ExecutionContext::direct(),
+            service_name,
+            service,
+            config,
+            provider,
+            args,
+            &mut InvocationTrace::default(),
+        )
+    }
+
+    fn parse_in_broker(args: &[&str]) -> Result<RestInvocation, ViaError> {
+        let config: RestCommandConfig = toml::from_str(
+            "base_url = \"https://api.example.com\"\nasset_hosts = [\"assets.example.com\"]",
+        )
+        .unwrap();
+        RestInvocation::parse(
+            &ExecutionContext::broker(),
+            &config,
+            args.iter().map(|arg| (*arg).to_owned()).collect(),
+        )
+    }
+
+    fn broker_denial(args: &[&str]) -> &'static str {
+        match parse_in_broker(args) {
+            Err(ViaError::Denied { reason, .. }) => reason,
+            Err(error) => panic!("expected a denial for {args:?}, got {error}"),
+            Ok(_) => panic!("expected a denial for {args:?}"),
+        }
+    }
+
+    #[test]
+    fn broker_refuses_request_bodies_read_from_local_files() {
+        for option in ["--json", "--data", "-d"] {
+            assert_eq!(
+                broker_denial(&["POST", "/items", option, "@/etc/hostname"]),
+                "local_file_input",
+                "option `{option}`"
+            );
+            assert_eq!(
+                broker_denial(&["POST", "/items", option, "@relative.json"]),
+                "local_file_input",
+                "option `{option}`"
+            );
+        }
+
+        let inline = parse_in_broker(&["POST", "/items", "--json", "{\"name\":\"x\"}"]).unwrap();
+        assert_eq!(inline.body.as_deref(), Some("{\"name\":\"x\"}"));
+    }
+
+    #[test]
+    fn body_sources_keep_standard_input_available_to_broker_callers() {
+        let broker = ExecutionContext::broker();
+        let direct = ExecutionContext::direct();
+
+        assert_eq!(body_source(&broker, "@-").unwrap(), BodySource::Stdin);
+        assert_eq!(body_source(&direct, "@-").unwrap(), BodySource::Stdin);
+        assert_eq!(
+            body_source(&broker, "{}").unwrap(),
+            BodySource::Inline("{}")
+        );
+        assert_eq!(
+            body_source(&direct, "@body.json").unwrap(),
+            BodySource::File("body.json")
+        );
+        assert!(matches!(
+            body_source(&broker, "@body.json"),
+            Err(ViaError::Denied { reason, .. }) if reason == "local_file_input"
+        ));
+        assert!(matches!(
+            body_source(&broker, "@"),
+            Err(ViaError::Denied { reason, .. }) if reason == "local_file_input"
+        ));
+    }
+
+    #[test]
+    fn broker_refuses_output_paths_and_allows_standard_output() {
+        for option in ["--output", "-o"] {
+            assert_eq!(
+                broker_denial(&["/items", option, "/tmp/via-broker-output"]),
+                "local_file_output",
+                "option `{option}`"
+            );
+            assert_eq!(
+                broker_denial(&["/items", option, "relative-output"]),
+                "local_file_output",
+                "option `{option}`"
+            );
+
+            let stdout = parse_in_broker(&["/items", option, "-"]).unwrap();
+            assert_eq!(stdout.output, Some(OutputTarget::Stdout));
+        }
+
+        let direct = RestInvocation::parse(
+            &ExecutionContext::direct(),
+            &rest_config(),
+            vec!["/items".to_owned(), "--output".to_owned(), "-".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(direct.output, Some(OutputTarget::Stdout));
+    }
+
+    #[test]
+    fn broker_asset_downloads_require_standard_output() {
+        let asset = "https://assets.example.com/files/a.png";
+
+        let stdout = parse_in_broker(&[asset, "--output", "-"]).unwrap();
+        assert!(stdout.absolute_url);
+        assert_eq!(stdout.output, Some(OutputTarget::Stdout));
+        assert!(matches!(
+            parse_in_broker(&[asset]),
+            Err(ViaError::InvalidArgument(message)) if message.contains("--output")
+        ));
+        assert_eq!(
+            broker_denial(&[asset, "--output", "/tmp/a.png"]),
+            "local_file_output"
+        );
+    }
+
+    #[test]
+    fn records_the_request_target_without_the_query_for_refused_requests() {
+        let config: RestCommandConfig =
+            toml::from_str("base_url = \"https://api.example.com/v1\"").unwrap();
+        let service = service_with_secrets([]);
+        let mut trace = InvocationTrace::default();
+
+        let error = execute(
+            &ExecutionContext::broker(),
+            "example",
+            &service,
+            &config,
+            &FakeProvider::empty(),
+            vec![
+                "post".to_owned(),
+                "/items/1?token=query-secret".to_owned(),
+                "--json".to_owned(),
+                "@/etc/hostname".to_owned(),
+            ],
+            &mut trace,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ViaError::Denied { reason, .. } if reason == "local_file_input"
+        ));
+        assert_eq!(trace.method.as_deref(), Some("POST"));
+        assert_eq!(trace.host.as_deref(), Some("api.example.com"));
+        assert_eq!(trace.path.as_deref(), Some("/items/1"));
+        assert_eq!(trace.status, None);
+        assert_eq!(trace.denied, None);
+    }
+
+    #[test]
+    fn marks_unlisted_asset_hosts_as_denied_in_the_trace() {
+        let config: RestCommandConfig = toml::from_str(
+            "base_url = \"https://api.example.com\"\nasset_hosts = [\"assets.example.com\"]",
+        )
+        .unwrap();
+        let service = service_with_secrets([]);
+        let mut trace = InvocationTrace::default();
+
+        let error = execute(
+            &ExecutionContext::broker(),
+            "example",
+            &service,
+            &config,
+            &FakeProvider::empty(),
+            vec![
+                "https://evil.example/files/a.png?x=1".to_owned(),
+                "--output".to_owned(),
+                "-".to_owned(),
+            ],
+            &mut trace,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ViaError::InvalidArgument(_)));
+        assert_eq!(trace.denied, Some("asset_host_not_allowed"));
+        assert_eq!(trace.host.as_deref(), Some("evil.example"));
+        assert_eq!(trace.path.as_deref(), Some("/files/a.png"));
+    }
+
+    #[test]
+    fn records_status_and_secrets_in_the_trace() {
+        crate::tls::install_crypto_provider();
+
+        let (base_url, server) = request_server(vec![
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found"
+                .to_owned(),
+        ]);
+        let config: RestCommandConfig = toml::from_str(&format!(
+            "base_url = \"{base_url}\"\n\n[auth]\ntype = \"bearer\"\nsecret = \"token\""
+        ))
+        .unwrap();
+        let service = service_with_secrets([("token", "op://Private/API/token")]);
+        let provider = FakeProvider::new([("op://Private/API/token", "bearer-token")]);
+        let mut trace = InvocationTrace::default();
+
+        let error = execute(
+            &ExecutionContext::direct(),
+            "example",
+            &service,
+            &config,
+            &provider,
+            vec![
+                "/items/1".to_owned(),
+                "--query".to_owned(),
+                "a=b".to_owned(),
+            ],
+            &mut trace,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ViaError::InvalidArgument(message) if message.contains("404")
+        ));
+        assert_eq!(trace.method.as_deref(), Some("GET"));
+        assert_eq!(trace.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(trace.path.as_deref(), Some("/items/1"));
+        assert_eq!(trace.status, Some(404));
+        assert_eq!(trace.redactor.redact("bearer-token"), "[REDACTED]");
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /items/1?a=b "));
+    }
+
+    #[test]
+    fn broker_requests_do_not_follow_redirects() {
+        crate::tls::install_crypto_provider();
+
+        let (base_url, server) = request_server(vec![
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: /items/2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+        ]);
+        let config: RestCommandConfig =
+            toml::from_str(&format!("base_url = \"{base_url}\"")).unwrap();
+        let service = service_with_secrets([]);
+        let mut trace = InvocationTrace::default();
+
+        let error = execute(
+            &ExecutionContext::broker(),
+            "example",
+            &service,
+            &config,
+            &FakeProvider::empty(),
+            vec!["/items/1".to_owned()],
+            &mut trace,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ViaError::InvalidArgument(message)
+                if message.contains("did not follow the redirect to /items/2")
+        ));
+        assert_eq!(trace.status, Some(301));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn writes_redacted_response_bytes_to_standard_output() {
+        crate::tls::install_crypto_provider();
+
+        let (base_url, server) = request_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_owned(),
+        ]);
+        let config: RestCommandConfig =
+            toml::from_str(&format!("base_url = \"{base_url}\"")).unwrap();
+        let service = service_with_secrets([]);
+        let mut trace = InvocationTrace::default();
+
+        execute(
+            &ExecutionContext::broker(),
+            "example",
+            &service,
+            &config,
+            &FakeProvider::empty(),
+            vec!["/items/1".to_owned(), "--output".to_owned(), "-".to_owned()],
+            &mut trace,
+        )
+        .unwrap();
+
+        assert_eq!(trace.status, Some(200));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
     fn rules_config(base_url: &str, rules: &str) -> RestCommandConfig {
         toml::from_str(&format!("base_url = \"{base_url}\"\n{rules}")).unwrap()
     }
 
     fn invocation(config: &RestCommandConfig, args: &[&str]) -> RestInvocation {
-        RestInvocation::parse(config, args.iter().map(|arg| (*arg).to_owned()).collect()).unwrap()
+        RestInvocation::parse(
+            &ExecutionContext::direct(),
+            config,
+            args.iter().map(|arg| (*arg).to_owned()).collect(),
+        )
+        .unwrap()
     }
 
     fn rule_denial(config: &RestCommandConfig, args: &[&str]) -> &'static str {
@@ -1162,7 +1603,7 @@ asset_hosts = ["uploads.linear.app"]
         let service = service_with_secrets([("token", "op://Private/API/token")]);
         let provider = FakeProvider::new([("op://Private/API/token", "bearer-token")]);
 
-        let error = execute(
+        let error = execute_direct(
             "example",
             &service,
             &config,
@@ -1199,7 +1640,7 @@ asset_hosts = ["uploads.linear.app"]
         );
         let service = service_with_secrets([("token", "op://Private/API/token")]);
 
-        let error = execute(
+        let error = execute_direct(
             "example",
             &service,
             &config,
@@ -1382,7 +1823,7 @@ secret = "token"
         let service = service_with_secrets([("token", "op://Private/API/token")]);
         let provider = FakeProvider::new([("op://Private/API/token", "bearer-token")]);
 
-        execute(
+        execute_direct(
             "linear",
             &service,
             &config,
@@ -1526,7 +1967,7 @@ Content-Type = "application/json"
         std::fs::write(&path, JSON_BODY).unwrap();
 
         assert_eq!(
-            read_body_arg(&format!("@{}", path.display())).unwrap(),
+            read_body_arg(&ExecutionContext::direct(), &format!("@{}", path.display())).unwrap(),
             JSON_BODY
         );
 
@@ -1535,7 +1976,14 @@ Content-Type = "application/json"
 
     #[test]
     fn reads_inline_body_arg() {
-        assert_eq!(read_body_arg("{\"ok\":true}").unwrap(), "{\"ok\":true}");
+        assert_eq!(
+            read_body_arg(&ExecutionContext::direct(), "{\"ok\":true}").unwrap(),
+            "{\"ok\":true}"
+        );
+        assert_eq!(
+            read_body_arg(&ExecutionContext::broker(), "{\"ok\":true}").unwrap(),
+            "{\"ok\":true}"
+        );
     }
 
     #[test]

@@ -70,6 +70,9 @@ pub enum ViaError {
         message: String,
     },
 
+    #[error("audit record unavailable; the request is refused: {0}")]
+    AuditUnavailable(String),
+
     #[error("doctor checks failed; see output above for setup guidance")]
     DoctorFailed,
 
@@ -114,6 +117,7 @@ impl ViaError {
             ViaError::UnknownSecret { .. } => "unknown_secret",
             ViaError::SecretUnavailable { .. } => "secret_unavailable",
             ViaError::Denied { reason, .. } => reason,
+            ViaError::AuditUnavailable(_) => "audit_unavailable",
             ViaError::DoctorFailed => "doctor_failed",
             ViaError::Http(_) => "http_error",
             ViaError::Json(_) => "json_error",
@@ -152,6 +156,7 @@ impl ViaError {
             | ViaError::SshIdentityUnavailable
             | ViaError::InvalidSshIdentityPath(_)
             | ViaError::SecretUnavailable { .. }
+            | ViaError::AuditUnavailable(_)
             | ViaError::DoctorFailed
             | ViaError::Http(_)
             | ViaError::Json(_)

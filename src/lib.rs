@@ -1,5 +1,7 @@
 pub mod app;
+pub mod audit;
 pub mod auth;
+pub mod broker;
 pub mod capabilities;
 pub mod cli;
 pub mod config;

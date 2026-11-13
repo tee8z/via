@@ -1,43 +1,64 @@
+use crate::capabilities::visible_services;
 use crate::config::{CapabilityMode, CommandConfig, Config};
+use crate::executor::ExecutionContext;
 
 pub fn print(config: &Config) {
     print!("{}", render(config));
 }
 
 pub fn render(config: &Config) -> String {
+    render_with_context(config, &ExecutionContext::direct())
+}
+
+pub fn render_with_context(config: &Config, context: &ExecutionContext) -> String {
     let mut output = String::new();
     output.push_str("---\n");
     output.push_str("name: via\n");
-    output.push_str("description: Use via when a task needs authenticated access to configured services without asking for or handling raw secrets. via resolves credentials from 1Password and runs configured capabilities such as REST API calls, delegated CLIs, or scoped SSH sessions.\n");
+    output.push_str("description: Use via when a task needs authenticated access to configured services without asking for or handling raw secrets. via resolves credentials from its configured secret provider and runs configured capabilities such as REST API calls, delegated CLIs, or scoped SSH sessions.\n");
     output.push_str("---\n\n");
     output.push_str("# via\n\n");
     output.push_str("Use `via capabilities --json` before authenticated work to discover configured services and capabilities.\n\n");
     output.push_str("Rules:\n");
     output.push_str("- Never ask the user for tokens, passwords, or SSH private keys.\n");
     output.push_str("- Never call the underlying secret provider directly.\n");
-    output
-        .push_str("- If provider authentication is not ready, ask the user to run `via login`.\n");
+    if context.is_broker() {
+        output.push_str("- This `via` runs on a remote broker host. Only `via capabilities`, `via skill print`, and the REST and SSH capabilities listed below are available.\n");
+        output.push_str("- Pass a request body inline or with `@-` from standard input. `@file` bodies and `--output <file>` are refused; use `--output -` to receive the raw response on standard output.\n");
+        output.push_str(
+            "- Redirects are not followed. A redirected request fails and reports its target.\n",
+        );
+        output.push_str("- If a capability fails with a credential or configuration error, report it to the user instead of retrying.\n");
+    } else {
+        output.push_str(
+            "- If provider authentication is not ready, ask the user to run `via login`.\n",
+        );
+    }
     output.push_str("- Prefer REST capabilities because secrets stay inside `via`.\n");
-    output.push_str("- Use delegated capabilities only when the configured binary is trusted and its native behavior is required.\n");
+    if !context.is_broker() {
+        output.push_str("- Use delegated capabilities only when the configured binary is trusted and its native behavior is required.\n");
+    }
     if has_ssh_capabilities(config) {
         output.push_str("- For SSH capabilities, use a listed host. Arguments after the host form the remote command, not local SSH options.\n");
     }
     output.push_str("- Do not print environment variables or credentials.\n");
-    output.push_str("- Run `via config doctor <service>` when a configured service fails.\n\n");
-    output.push_str("Configured capabilities:\n");
+    if !context.is_broker() {
+        output.push_str("- Run `via config doctor <service>` when a configured service fails.\n");
+    }
+    output.push_str("\nConfigured capabilities:\n");
 
-    for (service_name, service) in &config.services {
+    for visible in visible_services(config, context) {
+        let service_name = visible.name;
         output.push('\n');
-        match &service.description {
+        match &visible.service.description {
             Some(description) => output.push_str(&format!("- `{service_name}`: {description}\n")),
             None => output.push_str(&format!("- `{service_name}`\n")),
         }
-        if let Some(hint) = &service.hint {
+        if let Some(hint) = &visible.service.hint {
             output.push_str(&format!("  - Example: `{hint}`.\n"));
         }
-        for (command_name, command) in &service.commands {
+        for (command_name, command) in visible.commands {
             let usage = match command.mode() {
-                CapabilityMode::Rest => rest_usage(service_name, command_name, command),
+                CapabilityMode::Rest => rest_usage(context, service_name, command_name, command),
                 CapabilityMode::Delegated => {
                     format!("via {service_name} {command_name} <tool-args...>")
                 }
@@ -116,10 +137,17 @@ fn rest_rule_details(command: &CommandConfig) -> String {
     details
 }
 
-fn rest_usage(service_name: &str, command_name: &str, command: &CommandConfig) -> String {
+fn rest_usage(
+    context: &ExecutionContext,
+    service_name: &str,
+    command_name: &str,
+    command: &CommandConfig,
+) -> String {
+    // A broker caller cannot name a file on the broker host.
+    let output = if context.is_broker() { "-" } else { "<file>" };
     match command {
         CommandConfig::Rest(rest) if !rest.asset_hosts.is_empty() => format!(
-            "via {service_name} {command_name} <path> or via {service_name} {command_name} GET <asset-url> --output <file>"
+            "via {service_name} {command_name} <path> or via {service_name} {command_name} GET <asset-url> --output {output}"
         ),
         _ => format!("via {service_name} {command_name} <path>"),
     }
@@ -205,6 +233,30 @@ port = 2222
         assert!(!output.contains("agent_socket"));
         assert!(!output.contains("ssh_program"));
         assert!(!output.contains("ssh_add_program"));
+    }
+
+    #[test]
+    fn broker_context_renders_only_what_a_remote_caller_may_use() {
+        let output = render_with_context(&config(), &ExecutionContext::broker());
+
+        assert!(output.contains("runs on a remote broker host"));
+        assert!(output.contains("`@file` bodies and `--output <file>` are refused"));
+        assert!(output.contains("Redirects are not followed"));
+        assert!(output.contains("via github api GET <asset-url> --output -`"));
+        assert!(output.contains("via github shell <host> [remote-command...]"));
+        assert!(!output.contains("via github gh"));
+        assert!(!output.contains("via login"));
+        assert!(!output.contains("via config doctor"));
+        assert!(!output.contains("Use delegated capabilities"));
+        assert!(!output.contains("op://Private"));
+    }
+
+    #[test]
+    fn direct_context_matches_the_default_rendering() {
+        assert_eq!(
+            render_with_context(&config(), &ExecutionContext::direct()),
+            render(&config())
+        );
     }
 
     #[test]
