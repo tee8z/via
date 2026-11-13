@@ -113,7 +113,7 @@ impl ViaError {
             ViaError::InvalidSshIdentityPath(_) => "invalid_ssh_identity_path",
             ViaError::UnknownSecret { .. } => "unknown_secret",
             ViaError::SecretUnavailable { .. } => "secret_unavailable",
-            ViaError::Denied { reason, .. } => *reason,
+            ViaError::Denied { reason, .. } => reason,
             ViaError::DoctorFailed => "doctor_failed",
             ViaError::Http(_) => "http_error",
             ViaError::Json(_) => "json_error",
