@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ViaError;
 
+// Unknown top-level keys are rejected. A misspelled `[broker]` table would
+// otherwise load as a config without a kill switch.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
     #[serde(default)]
@@ -1359,6 +1362,24 @@ effect = "allow"
         let config = Config::from_toml_str(&journald).unwrap();
         assert_eq!(config.audit.as_ref().unwrap().sink, AuditSinkKind::Journald);
         assert!(config.broker.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_tables_instead_of_ignoring_them() {
+        for table in [
+            "[brokers]\ndisable_dir = \"/var/lib/via/disabled\"",
+            "[Broker]\ndisable_dir = \"/var/lib/via/disabled\"",
+            "[audits]\nsink = \"journald\"",
+            "[service.github]\nprovider = \"onepassword\"",
+        ] {
+            let error = Config::from_toml_str(&format!("{VALID}\n{table}\n")).unwrap_err();
+
+            assert!(
+                matches!(error, ViaError::ParseConfig(_)),
+                "expected `{table}` to fail to parse"
+            );
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
     }
 
     #[test]

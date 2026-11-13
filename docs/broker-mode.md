@@ -484,6 +484,9 @@ A refused request exits with status `2` and prints
 `via broker: access is disabled`. It does not say which marker exists. via
 writes an audit record for it.
 
+via rejects a config with an unknown top-level table, so a misspelled
+`[broker]` table cannot leave the kill switch off without an error.
+
 A missing directory disables nothing. Any other failure to check a marker,
 such as a permission error, counts as disabled. The broker account needs
 search permission on the directory and should not be able to write to it. A
