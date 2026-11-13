@@ -9,11 +9,16 @@ impl Redactor {
     }
 
     pub fn add(&mut self, secret: &str) {
-        if secret.is_empty() {
+        if secret.is_empty() || self.secrets.iter().any(|known| known == secret) {
             return;
         }
 
-        self.secrets.push(secret.to_owned());
+        // Longest first: when one secret contains another, replacing the
+        // shorter one first would leave the rest of the longer one in place.
+        let position = self
+            .secrets
+            .partition_point(|known| known.len() >= secret.len());
+        self.secrets.insert(position, secret.to_owned());
     }
 
     pub fn redact(&self, value: &str) -> String {
@@ -92,6 +97,28 @@ mod tests {
         assert_eq!(redactor.redact_bytes(&body), body);
         assert_eq!(Redactor::new().redact_bytes(&body), body);
         assert_eq!(redactor.redact_bytes(b""), b"");
+    }
+
+    #[test]
+    fn redacts_a_secret_that_contains_another_secret_in_full() {
+        for order in [
+            ["secret", "secret-token-suffix"],
+            ["secret-token-suffix", "secret"],
+        ] {
+            let mut redactor = Redactor::new();
+            for secret in order {
+                redactor.add(secret);
+            }
+
+            assert_eq!(
+                redactor.redact("a=secret-token-suffix b=secret"),
+                "a=[REDACTED] b=[REDACTED]"
+            );
+            assert_eq!(
+                redactor.redact_bytes(b"a=secret-token-suffix\xff b=secret"),
+                b"a=[REDACTED]\xff b=[REDACTED]"
+            );
+        }
     }
 
     #[test]
