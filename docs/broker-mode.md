@@ -340,6 +340,7 @@ except their Actions secrets. It cannot change anything.
 | `rules` | Optional finer rules that pair methods with one path pattern. |
 
 A capability with none of these fields behaves as before.
+Unknown REST field names are rejected. A misspelled policy field cannot silently disable its restriction.
 
 ### Patterns
 

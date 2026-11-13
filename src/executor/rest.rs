@@ -28,25 +28,7 @@ pub fn execute(
     args: Vec<String>,
     trace: &mut InvocationTrace,
 ) -> Result<(), ViaError> {
-    record_request_target(config, &args, trace);
-    let mut request = RestInvocation::parse(context, config, args)?;
-    if request.absolute_url {
-        if let Err(error) = validate_asset_url(config, &request.path) {
-            trace.denied = Some("asset_host_not_allowed");
-            return Err(error);
-        }
-        if context.is_broker() {
-            validate_broker_asset_origin(config, &request.path)?;
-        }
-    }
-    enforce_rules(config, &request)?;
-    // Validate the URL even without rules, before consuming caller input.
-    build_url(config, &request.path, &request.query)?;
-    request.body = request
-        .body
-        .as_deref()
-        .map(|value| read_body_arg(context, value))
-        .transpose()?;
+    let request = prepare_request(context, config, args, trace)?;
 
     let client = http_client(context, config, &request)?;
     let target = RestTarget {
@@ -99,6 +81,37 @@ pub fn execute(
         }
     }
     Ok(())
+}
+
+// Complete caller-input validation before credentials or network operations.
+// Body I/O is deliberately last, after all target and option restrictions.
+fn prepare_request(
+    context: &ExecutionContext,
+    config: &RestCommandConfig,
+    args: Vec<String>,
+    trace: &mut InvocationTrace,
+) -> Result<RestInvocation, ViaError> {
+    record_request_target(config, &args, trace);
+    let mut request = RestInvocation::parse(context, config, args)?;
+    if request.absolute_url {
+        if let Err(error) = validate_asset_url(config, &request.path) {
+            trace.denied = Some("asset_host_not_allowed");
+            return Err(error);
+        }
+        if context.is_broker() {
+            validate_broker_asset_origin(config, &request.path)?;
+        }
+    }
+    enforce_rules(config, &request)?;
+    // Validate the URL even without rules, before consuming caller input.
+    build_url(config, &request.path, &request.query)?;
+    request.body = request
+        .body
+        .as_deref()
+        .map(|value| read_body_arg(context, value))
+        .transpose()?;
+
+    Ok(request)
 }
 
 struct RestTarget<'a> {

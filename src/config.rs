@@ -129,6 +129,7 @@ pub struct SshCommandConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestCommandConfig {
     #[serde(default)]
     pub description: Option<String>,
@@ -1255,6 +1256,19 @@ effect = "allow"
                 ),
                 "expected `{rules}` to be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn rejects_misspelled_rest_policy_fields_instead_of_disabling_rules() {
+        for field in ["method", "allow_path", "deny_path", "rule"] {
+            let raw = VALID.replace(
+                "base_url = \"https://api.github.com\"",
+                &format!("base_url = \"https://api.github.com\"\n{field} = []"),
+            );
+            let error = Config::from_toml_str(&raw).unwrap_err();
+            assert!(matches!(error, ViaError::ParseConfig(_)));
+            assert!(error.to_string().contains(field), "{error}");
         }
     }
 
