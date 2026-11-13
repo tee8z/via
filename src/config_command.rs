@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cli::ConfigCommand;
 use crate::config::{self, Config};
@@ -53,18 +53,17 @@ fn configure(path: &Path) -> Result<(), ViaError> {
     .configure(path)
 }
 
-fn write_config(path: &Path, contents: &str) -> Result<(), ViaError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+// Exclusive creation does not follow a symbolic link. A dotfile manager can
+// leave the config path as a link to a file that does not exist yet, so
+// create that file instead of failing after every question is answered.
+fn creation_path(path: &Path) -> PathBuf {
+    match fs::read_link(path) {
+        Ok(target) if !path.exists() => match path.parent() {
+            Some(parent) => parent.join(target),
+            None => target,
+        },
+        _ => path.to_path_buf(),
     }
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    file.write_all(contents.as_bytes())?;
-    println!("created via config: {}", path.display());
-    println!("Run `via config doctor` to check the setup.");
-    Ok(())
 }
 
 struct ServiceSetup {
@@ -121,14 +120,41 @@ impl Prompts<'_> {
             ],
             1,
         )? {
-            1 => write_config(path, &build_service_config(self.prompt_service_setup()?)),
-            2 => write_config(path, empty_config()),
+            1 => {
+                let config = build_service_config(self.prompt_service_setup()?);
+                self.write_config(path, &config)
+            }
+            2 => self.write_config(path, empty_config()),
             3 => {
                 writeln!(self.output, "{}", path.display())?;
                 Ok(())
             }
             _ => unreachable!("prompt_choice only returns listed choices"),
         }
+    }
+
+    // Creates the config and never replaces a file. A config that appeared
+    // while the questions were being answered stays as it is.
+    fn write_config(&mut self, path: &Path, contents: &str) -> Result<(), ViaError> {
+        let target = creation_path(path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|source| match source.kind() {
+                io::ErrorKind::AlreadyExists => io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} already exists and was not changed", target.display()),
+                ),
+                _ => source,
+            })?;
+        file.write_all(contents.as_bytes())?;
+        writeln!(self.output, "created via config: {}", path.display())?;
+        writeln!(self.output, "Run `via config doctor` to check the setup.")?;
+        Ok(())
     }
 
     fn prompt_service_setup(&mut self) -> Result<ServiceSetup, ViaError> {
@@ -555,7 +581,11 @@ mod tests {
     fn interactive_setup_creates_a_valid_rest_service_with_defaults() {
         let directory = crate::test_support::TempDir::create("setup-rest");
         let path = directory.join("nested/config.toml");
-        configure_with_input(&path, REST_INPUT).unwrap();
+        let output = configure_with_input(&path, REST_INPUT).unwrap();
+        assert!(output.ends_with(&format!(
+            "created via config: {}\nRun `via config doctor` to check the setup.\n",
+            path.display()
+        )));
         let config = Config::load(Some(&path)).unwrap();
         let service = &config.services["example"];
         assert_eq!(service.secrets["token"], "op://Private/Example/token");
@@ -674,36 +704,91 @@ mod tests {
     fn writing_config_preserves_existing_files_and_reports_parent_errors() {
         let directory = crate::test_support::TempDir::create("setup-write");
         let path = directory.write_private("config.toml", b"existing config");
-        assert!(
-            matches!(write_config(&path, empty_config()), Err(ViaError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists)
-        );
+        let mut output = Vec::new();
+        let mut prompts = Prompts {
+            input: &mut io::empty(),
+            output: &mut output,
+        };
+        match prompts.write_config(&path, empty_config()) {
+            Err(ViaError::Io(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                // The message names the file that was kept.
+                assert!(error.to_string().contains(&path.display().to_string()));
+            }
+            other => panic!("expected the existing config to be kept, got {other:?}"),
+        }
         assert_eq!(fs::read_to_string(&path).unwrap(), "existing config");
-        assert!(write_config(&path.join("child.toml"), empty_config()).is_err());
+        assert!(prompts
+            .write_config(&path.join("child.toml"), empty_config())
+            .is_err());
+        assert!(output.is_empty());
     }
 
-    struct FailedOutput;
+    #[cfg(unix)]
+    #[test]
+    fn writing_config_creates_the_missing_target_of_a_symbolic_link() {
+        let directory = crate::test_support::TempDir::create("setup-link");
+        let path = directory.join("config.toml");
+        std::os::unix::fs::symlink("dotfiles/via.toml", &path).unwrap();
+
+        configure_with_input(&path, "2\n").unwrap();
+
+        assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(
+            fs::read_to_string(directory.join("dotfiles/via.toml")).unwrap(),
+            empty_config()
+        );
+        assert!(Config::load(Some(&path)).unwrap().services.is_empty());
+
+        // A link whose own target is a dangling link is not followed further.
+        let chained = directory.join("chained.toml");
+        std::os::unix::fs::symlink("missing.toml", directory.join("middle.toml")).unwrap();
+        std::os::unix::fs::symlink("middle.toml", &chained).unwrap();
+        assert!(matches!(
+            configure_with_input(&chained, "2\n"),
+            Err(ViaError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert!(!directory.join("missing.toml").exists());
+    }
+
+    // Output that fails when written to, or only when a prompt is flushed.
+    struct FailedOutput {
+        fail_write: bool,
+    }
 
     impl Write for FailedOutput {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            Err(io::ErrorKind::BrokenPipe.into())
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(bytes.len())
+            }
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            Err(io::ErrorKind::BrokenPipe.into())
         }
     }
 
     #[test]
     fn setup_stops_before_reading_input_when_output_fails() {
-        let mut input = io::Cursor::new(REST_INPUT);
-        let mut prompts = Prompts {
-            input: &mut input,
-            output: &mut FailedOutput,
-        };
-        assert!(
-            matches!(prompts.configure(Path::new("unused.toml")), Err(ViaError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe)
-        );
-        assert_eq!(input.position(), 0);
+        // A failed write stops at the banner. A failed flush stops at the
+        // first prompt, which must not go on to read an answer.
+        for fail_write in [true, false] {
+            let mut input = io::Cursor::new(REST_INPUT);
+            let mut prompts = Prompts {
+                input: &mut input,
+                output: &mut FailedOutput { fail_write },
+            };
+            assert!(
+                matches!(
+                    prompts.configure(Path::new("unused.toml")),
+                    Err(ViaError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe
+                ),
+                "fail_write: {fail_write}"
+            );
+            assert_eq!(input.position(), 0, "fail_write: {fail_write}");
+        }
     }
 
     #[test]
