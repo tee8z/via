@@ -291,9 +291,10 @@ Quote shell syntax for that remote shell carefully.
 via preserves OpenSSH exit values from 1 through 255. A terminated process
 without an exit value returns 1.
 
-Caller-supplied local OpenSSH options are not supported. For example, `-v`
-after the host is remote command text, not a local verbosity option. Configure
-the user, port, hosts, and identity in via instead.
+Caller-supplied local OpenSSH options are not supported. via refuses a remote
+command that starts with `-`, such as `-v` after the host, so that no OpenSSH
+release can read it as a local option. Configure the user, port, hosts, and
+identity in via instead.
 
 ## 7. Verify The Capability
 

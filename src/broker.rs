@@ -1311,6 +1311,127 @@ base_url = "{base_url}"
         assert_eq!(records[2]["mode"], "rest");
     }
 
+    // An `ssh` capability with stand-ins for OpenSSH: `ssh` records its
+    // arguments and `ssh-add` lists the configured identity.
+    #[cfg(unix)]
+    fn ssh_harness(label: &str) -> (Harness, PathBuf, std::os::unix::net::UnixListener) {
+        const PUBLIC_KEY: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        let directory = TempDir::create(label);
+        let root = directory.path().display().to_string();
+        let arguments = directory.join("ssh-arguments");
+        directory.write_private("deploy-key", format!("{PUBLIC_KEY}\n").as_bytes());
+        let agent = std::os::unix::net::UnixListener::bind(directory.join("agent.sock")).unwrap();
+        for (name, script) in [
+            (
+                "ssh",
+                format!(
+                    "#!/bin/sh\nfor argument in \"$@\"; do\n  printf '%s\\n' \"$argument\" >> '{}'\ndone\n",
+                    arguments.display()
+                ),
+            ),
+            ("ssh-add", format!("#!/bin/sh\nprintf '%s\\n' '{PUBLIC_KEY}'\n")),
+        ] {
+            let path = directory.write_private(name, script.as_bytes());
+            crate::test_support::set_mode(&path, 0o700);
+        }
+        let config = format!(
+            r#"
+version = 1
+
+[providers.files]
+type = "directory"
+path = '{root}'
+
+[audit]
+sink = "file"
+path = '{root}/audit.jsonl'
+
+[ssh_profiles.deploy]
+provider = "files"
+public_key = "cred://deploy-key"
+agent_socket = '{root}/agent.sock'
+ssh_program = '{root}/ssh'
+ssh_add_program = '{root}/ssh-add'
+
+[services.servers]
+provider = "files"
+
+[services.servers.commands.shell]
+mode = "ssh"
+profile = "deploy"
+user = "deploy"
+hosts = ["app-*.example.com"]
+"#
+        );
+        let config_path = directory.write_private("broker.toml", config.as_bytes());
+
+        (
+            Harness {
+                directory,
+                config_path,
+            },
+            arguments,
+            agent,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serves_an_ssh_capability_with_broker_restrictions() {
+        let (harness, arguments, _agent) = ssh_harness("broker-ssh");
+
+        harness
+            .run(&["servers", "shell", "app-01.example.com", "uptime", "-a"])
+            .unwrap();
+        let started = fs::read_to_string(&arguments).unwrap();
+        let started = started.lines().collect::<Vec<_>>();
+        for option in ["StrictHostKeyChecking=yes", "UpdateHostKeys=no"] {
+            assert!(
+                started.windows(2).any(|pair| pair == ["-o", option]),
+                "{option} is missing from {started:?}"
+            );
+        }
+        assert_eq!(
+            started[started.len() - 4..],
+            ["--", "app-01.example.com", "uptime", "-a"]
+        );
+
+        // Neither refusal reaches OpenSSH.
+        assert_eq!(
+            denial_reason(harness.run(&[
+                "servers",
+                "shell",
+                "app-01.example.com",
+                "-oProxyCommand=touch /tmp/via-broker-test"
+            ])),
+            "ssh_option_not_allowed"
+        );
+        assert!(matches!(
+            harness.run(&["servers", "shell", "db-01.example.com", "uptime"]),
+            Err(ViaError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(&arguments).unwrap().lines().count(),
+            started.len()
+        );
+
+        let records = harness.records();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["outcome"], "ok");
+        assert_eq!(records[0]["mode"], "ssh");
+        assert_eq!(records[0]["ssh_host"], "app-01.example.com");
+        assert_eq!(records[0]["ssh_command"], "uptime -a");
+        assert_eq!(records[0]["status"], 0);
+        assert_eq!(records[1]["outcome"], "denied");
+        assert_eq!(records[1]["reason"], "ssh_option_not_allowed");
+        assert!(records[1]["ssh_command"].is_null());
+        assert_eq!(records[2]["outcome"], "denied");
+        assert_eq!(records[2]["reason"], "ssh_host_not_allowed");
+        assert_eq!(records[2]["ssh_host"], "db-01.example.com");
+    }
+
     #[test]
     fn serves_requests_passed_after_the_separator() {
         let harness = Harness::create("broker-cli-request", UNREACHABLE);

@@ -183,13 +183,16 @@ agent_socket = "/run/via-broker/ssh-agent.sock"
 via reads only the public key. It asks the agent for that one identity, so
 the private key never enters via or the caller's session.
 
-In broker mode via runs OpenSSH with `StrictHostKeyChecking=yes`. OpenSSH
-refuses a host whose key is not in `known_hosts` and never asks the caller to
-accept one, even when the caller's key has `pty`. Add each allowed host's key
-to the broker account's `known_hosts` file before the first request.
+In broker mode via runs OpenSSH with `StrictHostKeyChecking=yes` and
+`UpdateHostKeys=no`. OpenSSH refuses a host whose key is not in `known_hosts`
+and never asks the caller to accept one, even when the caller's key has `pty`.
+A server cannot add keys either. Add each allowed host's key to the broker
+account's `known_hosts` file before the first request.
 
 OpenSSH joins the remote command's arguments with spaces and the remote
-shell parses the result, as it does for a local `ssh` command.
+shell parses the result, as it does for a local `ssh` command. via refuses a
+remote command that starts with `-`, so it cannot be read as an OpenSSH
+option.
 
 ### 4. Force the command for the caller's key
 
@@ -568,6 +571,7 @@ show all of what ran.
 | `method_not_allowed`, `path_denied`, `path_not_allowed` | A method or path rule refused the request. |
 | `path_not_normalized` | The request path is not in normal form. |
 | `asset_host_not_allowed`, `ssh_host_not_allowed` | The host is not listed for the capability. |
+| `ssh_option_not_allowed` | The remote command of an `ssh` request starts with `-`. |
 | `asset_origin_not_allowed` | An asset URL uses an unapproved scheme, port, or user information. |
 | `body_too_large`, `body_timeout` | Standard input exceeds 8 MiB or does not finish within 30 seconds. |
 

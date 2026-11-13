@@ -111,10 +111,22 @@ impl SshInvocation {
             )));
         }
 
-        Ok(Self {
-            host,
-            remote_args: args.collect(),
-        })
+        let remote_args = args.collect::<Vec<_>>();
+        // `--` ends option parsing in current OpenSSH. Older releases went on
+        // to read options after the host name, where `-oProxyCommand=...`
+        // would run a local program. A remote command has no need to start
+        // with `-`, so do not depend on the installed version.
+        if remote_args
+            .first()
+            .is_some_and(|argument| argument.starts_with('-'))
+        {
+            return Err(ViaError::denied(
+                "ssh_option_not_allowed",
+                "the remote command may not start with `-`; OpenSSH options are fixed by the capability",
+            ));
+        }
+
+        Ok(Self { host, remote_args })
     }
 }
 
@@ -646,11 +658,15 @@ fn build_command(
         .arg("HostbasedAuthentication=no")
         .arg("-l")
         .arg(&config.user);
-    // A broker caller must not decide which host keys the broker account
-    // trusts. With a terminal it could otherwise answer the host-key prompt
-    // and add an entry to the account's known_hosts file.
+    // The broker account's known_hosts file belongs to its operator. A broker
+    // caller with a terminal could otherwise answer the host-key prompt, and
+    // a server could add keys of its own choice.
     if context.is_broker() {
-        command.arg("-o").arg("StrictHostKeyChecking=yes");
+        command
+            .arg("-o")
+            .arg("StrictHostKeyChecking=yes")
+            .arg("-o")
+            .arg("UpdateHostKeys=no");
     }
     if let Some(port) = config.port {
         command.arg("-p").arg(port.to_string());
@@ -1187,10 +1203,10 @@ mod tests {
     }
 
     #[test]
-    fn broker_context_refuses_unknown_host_keys_without_a_prompt() {
+    fn broker_context_leaves_known_hosts_to_the_operator() {
         let invocation = SshInvocation {
             host: "host.example.com".to_owned(),
-            remote_args: vec!["-o".to_owned(), "StrictHostKeyChecking=no".to_owned()],
+            remote_args: vec!["uptime".to_owned()],
         };
         let arguments = |context: ExecutionContext| {
             build_command(
@@ -1206,26 +1222,63 @@ mod tests {
             .map(OsString::from)
             .collect::<Vec<_>>()
         };
-        let strict = OsString::from("StrictHostKeyChecking=yes");
+        let options = ["StrictHostKeyChecking=yes", "UpdateHostKeys=no"].map(OsString::from);
 
-        // The option is an OpenSSH option only before `--`. After the host,
-        // the caller's arguments are the remote command.
         let broker = arguments(ExecutionContext::broker());
         let separator = broker.iter().position(|argument| argument == "--").unwrap();
-        let option = broker
-            .iter()
-            .position(|argument| *argument == strict)
-            .unwrap();
-        assert!(option < separator);
-        assert_eq!(broker[option - 1], "-o");
-        assert_eq!(
-            broker[separator + 1..],
-            ["host.example.com", "-o", "StrictHostKeyChecking=no"]
-        );
+        for option in &options {
+            let position = broker
+                .iter()
+                .position(|argument| argument == option)
+                .unwrap();
+            assert!(position < separator, "{option:?}");
+            assert_eq!(broker[position - 1], "-o");
+        }
+        assert_eq!(broker[separator + 1..], ["host.example.com", "uptime"]);
 
         // A direct caller owns its known_hosts file and keeps the prompt.
         let direct = arguments(ExecutionContext::direct());
-        assert!(!direct.contains(&strict));
+        for option in &options {
+            assert!(!direct.contains(option), "{option:?}");
+        }
+    }
+
+    #[test]
+    fn invocation_rejects_a_remote_command_that_starts_with_an_option() {
+        let config = ssh_config(&["host.example.com"]);
+        let parse = |remote: &[&str]| {
+            SshInvocation::parse(
+                &config,
+                ["host.example.com"]
+                    .iter()
+                    .chain(remote)
+                    .map(|argument| (*argument).to_owned())
+                    .collect(),
+            )
+        };
+
+        for remote in [
+            &["-oProxyCommand=touch /tmp/via-test"][..],
+            &["-o", "ProxyCommand=touch /tmp/via-test"],
+            &["-vvv", "uptime"],
+            &["--", "uptime"],
+            &["-"],
+        ] {
+            assert!(
+                matches!(
+                    parse(remote),
+                    Err(ViaError::Denied {
+                        reason: "ssh_option_not_allowed",
+                        ..
+                    })
+                ),
+                "{remote:?}"
+            );
+        }
+
+        // Only the first word can be read as a local option.
+        assert_eq!(parse(&["ls", "-la"]).unwrap().remote_args, ["ls", "-la"]);
+        assert!(parse(&[]).unwrap().remote_args.is_empty());
     }
 
     #[test]
