@@ -221,12 +221,15 @@ Harden sshd for the broker account:
 - Keep `authorized_keys` owned by root or outside the account's control,
   for example with `AuthorizedKeysFile /etc/ssh/authorized_keys/%u`.
 - Do not accept caller-set environment. Leave `PermitUserEnvironment` at its
-  default of `no`. Do not add an `AcceptEnv` entry that matches `VIA_*`,
-  `CREDENTIALS_DIRECTORY`, `HOME`, `PATH` or `XDG_RUNTIME_DIR`.
+  default of `no`, and add no `AcceptEnv` entry for the broker account. In
+  particular, none may match `VIA_*`, `CREDENTIALS_DIRECTORY`, `HOME`, `PATH`,
+  `TMPDIR`, `XDG_*`, or a proxy variable such as `HTTPS_PROXY`, `HTTP_PROXY`,
+  `ALL_PROXY` or `NO_PROXY`.
 - Give each caller its own key and `--caller` label.
 
-via reads these variables, so a caller that could set them could change
-where via looks for credentials, caches and its daemon.
+via and its HTTP client read these variables. A caller that could set them
+could change where via looks for credentials, caches and its daemon, or send
+requests through a proxy of its choice.
 
 ## Call The Broker
 
