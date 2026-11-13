@@ -147,7 +147,7 @@ fn record_request_target(config: &RestCommandConfig, args: &[String], trace: &mu
         return;
     };
 
-    trace.method = Some(method.as_str().to_ascii_uppercase());
+    trace.method = Some(method.as_str().to_owned());
     trace.path = Some(target_path(target).to_owned());
     let url = if is_absolute_http_url(target) {
         Url::parse(target)
@@ -548,8 +548,11 @@ fn is_absolute_http_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
+// Method names are case-sensitive on the wire, and rules and audit records
+// use upper case. Send the same spelling that they describe.
 fn parse_method(method: &str) -> Result<Method, ViaError> {
     method
+        .to_ascii_uppercase()
         .parse()
         .map_err(|_| ViaError::InvalidArgument(format!("invalid HTTP method `{method}`")))
 }
@@ -1585,6 +1588,10 @@ asset_hosts = ["uploads.linear.app"]
 
         assert!(enforce_rules(&config, &invocation(&config, &["/user"])).is_ok());
         assert!(enforce_rules(&config, &invocation(&config, &["post", "/user"])).is_ok());
+        // The request carries the method that the rules allowed, not the
+        // caller's spelling of it.
+        assert_eq!(invocation(&config, &["post", "/user"]).method, Method::POST);
+        assert_eq!(invocation(&config, &["Get", "/user"]).method, Method::GET);
         assert_eq!(
             rule_denial(&config, &["DELETE", "/user"]),
             "method_not_allowed"

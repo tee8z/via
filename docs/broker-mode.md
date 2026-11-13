@@ -335,7 +335,7 @@ except their Actions secrets. It cannot change anything.
 
 | Field | Meaning |
 | --- | --- |
-| `methods` | Only these HTTP methods are allowed. The comparison ignores case. |
+| `methods` | Only these HTTP methods are allowed. The comparison ignores case, and via sends the method name in upper case. |
 | `allow_paths` | When not empty, the request path must match at least one pattern. |
 | `deny_paths` | A match refuses the request. Deny wins over allow. |
 | `rules` | Optional finer rules that pair methods with one path pattern. |
