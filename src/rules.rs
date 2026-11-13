@@ -200,6 +200,13 @@ impl PathPattern {
         if pattern.contains('\\') || pattern.chars().any(char::is_control) {
             return Err("a pattern may not contain a backslash or a control character");
         }
+        // A request path never contains these, so such a pattern could never
+        // match and a deny rule written with one would have no effect.
+        if pattern.contains(['?', '#']) {
+            return Err(
+                "a pattern may not contain `?` or `#`; rules do not cover the query string",
+            );
+        }
         if body.is_empty() {
             return Ok(Self {
                 segments: Vec::new(),
@@ -468,7 +475,7 @@ mod tests {
     fn rejects_invalid_patterns() {
         for pattern in [
             "", "user", "//", "/a//b", "/a/./b", "/a/../b", "/a/**/b", "/a/b*", "/a/*b/c",
-            "/a/***", "/a\\b", "/a\nb",
+            "/a/***", "/a\\b", "/a\nb", "/a?b=c", "/a/b?", "/a#b",
         ] {
             assert!(
                 PathPattern::parse(pattern).is_err(),
