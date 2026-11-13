@@ -1127,6 +1127,85 @@ base_url = "https://api.example.com"
         assert!(matches!(status.into_result(), Err(ViaError::DoctorFailed)));
     }
 
+    fn ssh_doctor_config(directory: &Path) -> Config {
+        Config::from_toml_str(&format!(
+            r#"
+version = 1
+[providers.files]
+type = "directory"
+path = '{}'
+[ssh_profiles.deploy]
+provider = "files"
+public_key = "cred://public-key"
+"#,
+            directory.display()
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn ssh_public_key_check_accepts_a_valid_key_and_reports_invalid_or_missing_keys() {
+        let directory = crate::test_support::TempDir::create("doctor-public-key");
+        let config = ssh_doctor_config(directory.path());
+        let providers = ProviderRegistry::from_config(&config).unwrap();
+        let ready = BTreeMap::from([("files".to_owned(), true)]);
+        let profile = &config.ssh_profiles["deploy"];
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let path = directory.write_private("public-key", key.as_bytes());
+        let mut status = DoctorStatus::default();
+        assert_eq!(
+            check_ssh_public_key("test", "deploy", profile, &ready, &providers, &mut status)
+                .unwrap()
+                .as_deref(),
+            Some(key)
+        );
+        assert!(status.into_result().is_ok());
+
+        directory.write_private("public-key", b"not an OpenSSH key");
+        let mut status = DoctorStatus::default();
+        assert!(
+            check_ssh_public_key("test", "deploy", profile, &ready, &providers, &mut status)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(status.into_result(), Err(ViaError::DoctorFailed)));
+
+        std::fs::remove_file(path).unwrap();
+        let mut status = DoctorStatus::default();
+        assert!(
+            check_ssh_public_key("test", "deploy", profile, &ready, &providers, &mut status)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(status.into_result(), Err(ViaError::DoctorFailed)));
+    }
+
+    #[test]
+    fn ssh_public_key_check_skips_an_unready_provider() {
+        let directory = crate::test_support::TempDir::create("doctor-public-key-unready");
+        // The key is readable and valid, so only the provider state can make
+        // the check fail.
+        directory.write_private(
+            "public-key",
+            b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        );
+        let config = ssh_doctor_config(directory.path());
+        let providers = ProviderRegistry::from_config(&config).unwrap();
+        let mut status = DoctorStatus::default();
+        assert!(check_ssh_public_key(
+            "test",
+            "deploy",
+            &config.ssh_profiles["deploy"],
+            &BTreeMap::new(),
+            &providers,
+            &mut status
+        )
+        .unwrap()
+        .is_none());
+        assert!(matches!(status.into_result(), Err(ViaError::DoctorFailed)));
+    }
+
     #[test]
     fn directory_secrets_are_checked_without_printing_values() {
         let directory = crate::test_support::TempDir::create("doctor-directory-secrets");

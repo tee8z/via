@@ -431,92 +431,120 @@ impl CommandConfig {
         ssh_profiles: &BTreeMap<String, SshProfileConfig>,
     ) -> Result<(), ViaError> {
         match self {
-            CommandConfig::Rest(rest) => {
-                if rest.base_url.trim().is_empty() {
-                    return Err(ViaError::InvalidConfig(format!(
-                        "command `{service_name}.{command_name}` must set rest base_url"
-                    )));
-                }
-                validate_asset_hosts(service_name, command_name, &rest.asset_hosts)?;
-                crate::rules::RestRules::from_config(rest).map_err(|problem| {
-                    ViaError::InvalidConfig(format!(
-                        "command `{service_name}.{command_name}` {problem}"
-                    ))
-                })?;
+            CommandConfig::Rest(rest) => rest.validate(service_name, command_name, service),
+            CommandConfig::Delegated(delegated) => {
+                delegated.validate(service_name, command_name, service)
+            }
+            CommandConfig::Ssh(ssh) => ssh.validate(service_name, command_name, ssh_profiles),
+        }
+    }
+}
 
-                if let Some(auth) = &rest.auth {
-                    match auth {
-                        AuthConfig::Bearer { secret } => {
-                            validate_secret_name(service_name, command_name, service, secret)?;
-                        }
-                        AuthConfig::Headers { headers } => {
-                            if headers.is_empty() {
-                                return Err(ViaError::InvalidConfig(format!(
-                                    "command `{service_name}.{command_name}` headers auth must configure at least one header"
-                                )));
-                            }
-                            for secret_header in headers.values() {
-                                validate_secret_name(
-                                    service_name,
-                                    command_name,
-                                    service,
-                                    &secret_header.secret,
-                                )?;
-                            }
-                        }
-                        AuthConfig::GitHubApp {
-                            secret,
-                            credential,
-                            private_key,
-                        } => validate_github_app_auth(
+impl RestCommandConfig {
+    fn validate(
+        &self,
+        service_name: &str,
+        command_name: &str,
+        service: &ServiceConfig,
+    ) -> Result<(), ViaError> {
+        if self.base_url.trim().is_empty() {
+            return Err(ViaError::InvalidConfig(format!(
+                "command `{service_name}.{command_name}` must set rest base_url"
+            )));
+        }
+        validate_asset_hosts(service_name, command_name, &self.asset_hosts)?;
+        crate::rules::RestRules::from_config(self).map_err(|problem| {
+            ViaError::InvalidConfig(format!("command `{service_name}.{command_name}` {problem}"))
+        })?;
+
+        if let Some(auth) = &self.auth {
+            match auth {
+                AuthConfig::Bearer { secret } => {
+                    validate_secret_name(service_name, command_name, service, secret)?;
+                }
+                AuthConfig::Headers { headers } => {
+                    if headers.is_empty() {
+                        return Err(ViaError::InvalidConfig(format!(
+                            "command `{service_name}.{command_name}` headers auth must configure at least one header"
+                        )));
+                    }
+                    for secret_header in headers.values() {
+                        validate_secret_name(
                             service_name,
                             command_name,
                             service,
-                            secret.as_deref(),
-                            credential.as_deref(),
-                            private_key.as_deref(),
-                        )?,
-                        AuthConfig::OAuth { credential } => {
-                            validate_secret_name(service_name, command_name, service, credential)?;
-                        }
+                            &secret_header.secret,
+                        )?;
                     }
                 }
-            }
-            CommandConfig::Delegated(delegated) => {
-                if delegated.program.trim().is_empty() {
-                    return Err(ViaError::InvalidConfig(format!(
-                        "command `{service_name}.{command_name}` must set delegated program"
-                    )));
-                }
-
-                for binding in delegated.inject.env.values() {
-                    validate_secret_name(service_name, command_name, service, &binding.secret)?;
-                }
-            }
-            CommandConfig::Ssh(ssh) => {
-                if !ssh_profiles.contains_key(&ssh.profile) {
-                    return Err(ViaError::InvalidConfig(format!(
-                        "command `{service_name}.{command_name}` references unknown SSH profile `{}`",
-                        ssh.profile
-                    )));
-                }
-                validate_ssh_user(service_name, command_name, &ssh.user)?;
-                if ssh.hosts.is_empty() {
-                    return Err(ViaError::InvalidConfig(format!(
-                        "command `{service_name}.{command_name}` must allow at least one SSH host pattern"
-                    )));
-                }
-                for pattern in &ssh.hosts {
-                    validate_ssh_host_pattern(service_name, command_name, pattern)?;
-                }
-                if ssh.port == Some(0) {
-                    return Err(ViaError::InvalidConfig(format!(
-                        "command `{service_name}.{command_name}` SSH port must be between 1 and 65535"
-                    )));
+                AuthConfig::GitHubApp {
+                    secret,
+                    credential,
+                    private_key,
+                } => validate_github_app_auth(
+                    service_name,
+                    command_name,
+                    service,
+                    secret.as_deref(),
+                    credential.as_deref(),
+                    private_key.as_deref(),
+                )?,
+                AuthConfig::OAuth { credential } => {
+                    validate_secret_name(service_name, command_name, service, credential)?;
                 }
             }
         }
+        Ok(())
+    }
+}
 
+impl DelegatedCommandConfig {
+    fn validate(
+        &self,
+        service_name: &str,
+        command_name: &str,
+        service: &ServiceConfig,
+    ) -> Result<(), ViaError> {
+        if self.program.trim().is_empty() {
+            return Err(ViaError::InvalidConfig(format!(
+                "command `{service_name}.{command_name}` must set delegated program"
+            )));
+        }
+
+        for binding in self.inject.env.values() {
+            validate_secret_name(service_name, command_name, service, &binding.secret)?;
+        }
+        Ok(())
+    }
+}
+
+impl SshCommandConfig {
+    fn validate(
+        &self,
+        service_name: &str,
+        command_name: &str,
+        ssh_profiles: &BTreeMap<String, SshProfileConfig>,
+    ) -> Result<(), ViaError> {
+        if !ssh_profiles.contains_key(&self.profile) {
+            return Err(ViaError::InvalidConfig(format!(
+                "command `{service_name}.{command_name}` references unknown SSH profile `{}`",
+                self.profile
+            )));
+        }
+        validate_ssh_user(service_name, command_name, &self.user)?;
+        if self.hosts.is_empty() {
+            return Err(ViaError::InvalidConfig(format!(
+                "command `{service_name}.{command_name}` must allow at least one SSH host pattern"
+            )));
+        }
+        for pattern in &self.hosts {
+            validate_ssh_host_pattern(service_name, command_name, pattern)?;
+        }
+        if self.port == Some(0) {
+            return Err(ViaError::InvalidConfig(format!(
+                "command `{service_name}.{command_name}` SSH port must be between 1 and 65535"
+            )));
+        }
         Ok(())
     }
 }

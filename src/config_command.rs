@@ -1,6 +1,6 @@
 use std::fs;
-use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
 use crate::cli::ConfigCommand;
 use crate::config::{self, Config};
@@ -46,39 +46,24 @@ fn configure(path: &Path) -> Result<(), ViaError> {
         ));
     }
 
-    println!("No via config found.");
-    println!();
-    println!("via can create one at:");
-    println!("  {}", path.display());
-    println!();
-
-    match prompt_choice(
-        "What do you want to configure?",
-        &[
-            "A service with 1Password",
-            "Empty config",
-            "Print config path only",
-        ],
-        1,
-    )? {
-        1 => write_config(path, &build_service_config(prompt_service_setup()?)),
-        2 => write_config(path, empty_config()),
-        3 => {
-            println!("{}", path.display());
-            Ok(())
-        }
-        _ => unreachable!("prompt_choice only returns listed choices"),
+    Prompts {
+        input: &mut io::stdin().lock(),
+        output: &mut io::stdout().lock(),
     }
+    .configure(path)
 }
 
-fn write_config(path: &Path, contents: &str) -> Result<(), ViaError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+// Exclusive creation does not follow a symbolic link. A dotfile manager can
+// leave the config path as a link to a file that does not exist yet, so
+// create that file instead of failing after every question is answered.
+fn creation_path(path: &Path) -> PathBuf {
+    match fs::read_link(path) {
+        Ok(target) if !path.exists() => match path.parent() {
+            Some(parent) => parent.join(target),
+            None => target,
+        },
+        _ => path.to_path_buf(),
     }
-    fs::write(path, contents)?;
-    println!("created via config: {}", path.display());
-    println!("Run `via config doctor` to check the setup.");
-    Ok(())
 }
 
 struct ServiceSetup {
@@ -113,60 +98,277 @@ struct DelegatedSetup {
     check_args: Vec<String>,
 }
 
-fn prompt_service_setup() -> Result<ServiceSetup, ViaError> {
-    let service_name = prompt_required("Service name", None)?;
-    let hint = prompt_optional("Example command hint")?;
-    let secret_name = prompt_required("Secret name in via config", Some("token"))?;
-    let secret_reference = prompt_secret_reference()?;
-    let mode = prompt_service_mode()?;
-    let rest = prompt_optional_rest_setup(mode)?;
-    let (private_key_secret_name, private_key_secret_reference) =
-        prompt_optional_private_key(rest.as_ref())?;
-    let delegated = prompt_optional_delegated_setup(mode)?;
-
-    Ok(ServiceSetup {
-        service_name,
-        hint,
-        secret_name,
-        secret_reference,
-        private_key_secret_name,
-        private_key_secret_reference,
-        rest,
-        delegated,
-    })
+struct Prompts<'a> {
+    input: &'a mut dyn BufRead,
+    output: &'a mut dyn Write,
 }
 
-fn prompt_service_mode() -> Result<usize, ViaError> {
-    prompt_choice(
-        "How should via run this service?",
-        &["REST API", "Trusted CLI", "Both"],
-        1,
-    )
-}
+impl Prompts<'_> {
+    fn configure(&mut self, path: &Path) -> Result<(), ViaError> {
+        writeln!(self.output, "No via config found.")?;
+        writeln!(self.output)?;
+        writeln!(self.output, "via can create one at:")?;
+        writeln!(self.output, "  {}", path.display())?;
+        writeln!(self.output)?;
 
-fn prompt_optional_rest_setup(mode: usize) -> Result<Option<RestSetup>, ViaError> {
-    if mode_uses_rest(mode) {
-        Ok(Some(prompt_rest_setup()?))
-    } else {
-        Ok(None)
+        match self.prompt_choice(
+            "What do you want to configure?",
+            &[
+                "A service with 1Password",
+                "Empty config",
+                "Print config path only",
+            ],
+            1,
+        )? {
+            1 => {
+                let config = build_service_config(self.prompt_service_setup()?);
+                self.write_config(path, &config)
+            }
+            2 => self.write_config(path, empty_config()),
+            3 => {
+                writeln!(self.output, "{}", path.display())?;
+                Ok(())
+            }
+            _ => unreachable!("prompt_choice only returns listed choices"),
+        }
     }
-}
 
-fn prompt_optional_private_key(
-    rest: Option<&RestSetup>,
-) -> Result<(Option<String>, Option<String>), ViaError> {
-    if rest.is_some_and(rest_uses_github_app) {
-        prompt_private_key_secret()
-    } else {
-        Ok((None, None))
+    // Creates the config and never replaces a file. A config that appeared
+    // while the questions were being answered stays as it is.
+    fn write_config(&mut self, path: &Path, contents: &str) -> Result<(), ViaError> {
+        let target = creation_path(path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|source| match source.kind() {
+                io::ErrorKind::AlreadyExists => io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} already exists and was not changed", target.display()),
+                ),
+                _ => source,
+            })?;
+        file.write_all(contents.as_bytes())?;
+        writeln!(self.output, "created via config: {}", path.display())?;
+        writeln!(self.output, "Run `via config doctor` to check the setup.")?;
+        Ok(())
     }
-}
 
-fn prompt_optional_delegated_setup(mode: usize) -> Result<Option<DelegatedSetup>, ViaError> {
-    if mode_uses_delegated(mode) {
-        Ok(Some(prompt_delegated_setup()?))
-    } else {
-        Ok(None)
+    fn prompt_service_setup(&mut self) -> Result<ServiceSetup, ViaError> {
+        let service_name = self.prompt_required("Service name", None)?;
+        let hint = self.prompt_optional("Example command hint")?;
+        let secret_name = self.prompt_required("Secret name in via config", Some("token"))?;
+        let secret_reference = self.prompt_secret_reference()?;
+        let mode = self.prompt_service_mode()?;
+        let rest = self.prompt_optional_rest_setup(mode)?;
+        let (private_key_secret_name, private_key_secret_reference) =
+            self.prompt_optional_private_key(rest.as_ref())?;
+        let delegated = self.prompt_optional_delegated_setup(mode)?;
+
+        Ok(ServiceSetup {
+            service_name,
+            hint,
+            secret_name,
+            secret_reference,
+            private_key_secret_name,
+            private_key_secret_reference,
+            rest,
+            delegated,
+        })
+    }
+
+    fn prompt_service_mode(&mut self) -> Result<usize, ViaError> {
+        self.prompt_choice(
+            "How should via run this service?",
+            &["REST API", "Trusted CLI", "Both"],
+            1,
+        )
+    }
+
+    fn prompt_optional_rest_setup(&mut self, mode: usize) -> Result<Option<RestSetup>, ViaError> {
+        if mode_uses_rest(mode) {
+            Ok(Some(self.prompt_rest_setup()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn prompt_optional_private_key(
+        &mut self,
+        rest: Option<&RestSetup>,
+    ) -> Result<(Option<String>, Option<String>), ViaError> {
+        if rest.is_some_and(rest_uses_github_app) {
+            self.prompt_private_key_secret()
+        } else {
+            Ok((None, None))
+        }
+    }
+
+    fn prompt_optional_delegated_setup(
+        &mut self,
+        mode: usize,
+    ) -> Result<Option<DelegatedSetup>, ViaError> {
+        if mode_uses_delegated(mode) {
+            Ok(Some(self.prompt_delegated_setup()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn prompt_private_key_secret(&mut self) -> Result<(Option<String>, Option<String>), ViaError> {
+        writeln!(self.output)?;
+        writeln!(self.output, "GitHub App private key")?;
+        let name =
+            self.prompt_required("Private key secret name in via config", Some("private_key"))?;
+        let reference = self.prompt_secret_reference()?;
+        Ok((Some(name), Some(reference)))
+    }
+
+    fn prompt_secret_reference(&mut self) -> Result<String, ViaError> {
+        loop {
+            writeln!(self.output, "1Password secret reference:")?;
+            writeln!(self.output, "  Example: op://Private/Service/token")?;
+            let value = self.prompt_required("Reference", None)?;
+            if value.starts_with("op://") {
+                return Ok(value);
+            }
+            writeln!(self.output, "Secret references must start with `op://`.")?;
+        }
+    }
+
+    fn prompt_rest_setup(&mut self) -> Result<RestSetup, ViaError> {
+        writeln!(self.output)?;
+        writeln!(self.output, "REST API capability")?;
+        let (command_name, base_url, method_default) = self.prompt_rest_fields()?;
+        let asset_hosts = self.prompt_asset_hosts()?;
+        let auth = self.prompt_rest_auth_setup()?;
+
+        Ok(RestSetup {
+            command_name,
+            base_url,
+            asset_hosts,
+            method_default,
+            auth,
+        })
+    }
+
+    fn prompt_rest_fields(&mut self) -> Result<(String, String, String), ViaError> {
+        Ok((
+            self.prompt_required("Capability name", Some("api"))?,
+            self.prompt_required("Base URL", None)?,
+            self.prompt_required("Default HTTP method", Some("GET"))?,
+        ))
+    }
+
+    fn prompt_rest_auth_setup(&mut self) -> Result<RestAuthSetup, ViaError> {
+        rest_auth_setup_from_choice(self.prompt_choice(
+            "How should REST authenticate?",
+            &[
+                "Bearer token",
+                "GitHub App credential bundle",
+                "OAuth credential bundle (prefer client_credentials for bots)",
+            ],
+            1,
+        )?)
+    }
+
+    fn prompt_asset_hosts(&mut self) -> Result<Vec<String>, ViaError> {
+        let raw =
+            self.prompt_optional("Asset hosts for authenticated downloads, comma-separated")?;
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        Ok(raw
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    fn prompt_delegated_setup(&mut self) -> Result<DelegatedSetup, ViaError> {
+        writeln!(self.output)?;
+        writeln!(self.output, "Trusted CLI capability")?;
+        let program = self.prompt_required("Program", None)?;
+        let default_command = program.clone();
+        let command_name = self.prompt_required("Capability name", Some(&default_command))?;
+        let env_var = self.prompt_required("Environment variable to inject", Some("TOKEN"))?;
+        let check = self.prompt_required("Check command args", Some("--version"))?;
+
+        Ok(DelegatedSetup {
+            command_name,
+            program,
+            env_var,
+            check_args: split_args(&check),
+        })
+    }
+
+    fn prompt_choice(
+        &mut self,
+        prompt: &str,
+        choices: &[&str],
+        default: usize,
+    ) -> Result<usize, ViaError> {
+        loop {
+            writeln!(self.output, "{prompt}")?;
+            for (index, choice) in choices.iter().enumerate() {
+                writeln!(self.output, "  {}. {choice}", index + 1)?;
+            }
+
+            let raw = self.prompt_optional(&format!("Choice [{default}]"))?;
+            let choice = if raw.is_empty() {
+                default
+            } else {
+                match raw.parse::<usize>() {
+                    Ok(choice) => choice,
+                    Err(_) => {
+                        writeln!(self.output, "Enter a number from 1 to {}.", choices.len())?;
+                        continue;
+                    }
+                }
+            };
+
+            if (1..=choices.len()).contains(&choice) {
+                return Ok(choice);
+            }
+            writeln!(self.output, "Enter a number from 1 to {}.", choices.len())?;
+        }
+    }
+
+    fn prompt_required(&mut self, prompt: &str, default: Option<&str>) -> Result<String, ViaError> {
+        loop {
+            let label = match default {
+                Some(default) => format!("{prompt} [{default}]"),
+                None => prompt.to_owned(),
+            };
+            let value = self.prompt_optional(&label)?;
+            if !value.is_empty() {
+                return Ok(value);
+            }
+            if let Some(default) = default {
+                return Ok(default.to_owned());
+            }
+            writeln!(self.output, "This value is required.")?;
+        }
+    }
+
+    fn prompt_optional(&mut self, prompt: &str) -> Result<String, ViaError> {
+        write!(self.output, "{prompt}: ")?;
+        self.output.flush()?;
+
+        let mut value = String::new();
+        if self.input.read_line(&mut value)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "configuration input ended before setup was complete",
+            )
+            .into());
+        }
+        Ok(value.trim().to_owned())
     }
 }
 
@@ -182,76 +384,6 @@ fn rest_uses_github_app(rest: &RestSetup) -> bool {
     matches!(rest.auth, RestAuthSetup::GitHubApp)
 }
 
-fn prompt_private_key_secret() -> Result<(Option<String>, Option<String>), ViaError> {
-    println!();
-    println!("GitHub App private key");
-    let name = prompt_required("Private key secret name in via config", Some("private_key"))?;
-    let reference = prompt_secret_reference()?;
-    Ok((Some(name), Some(reference)))
-}
-
-fn prompt_secret_reference() -> Result<String, ViaError> {
-    loop {
-        println!("1Password secret reference:");
-        println!("  Example: op://Private/Service/token");
-        let value = prompt_required("Reference", None)?;
-        if value.starts_with("op://") {
-            return Ok(value);
-        }
-        println!("Secret references must start with `op://`.");
-    }
-}
-
-fn prompt_rest_setup() -> Result<RestSetup, ViaError> {
-    println!();
-    println!("REST API capability");
-    let (command_name, base_url, method_default) = prompt_rest_fields()?;
-    let asset_hosts = prompt_asset_hosts()?;
-    let auth = prompt_rest_auth_setup()?;
-
-    Ok(RestSetup {
-        command_name,
-        base_url,
-        asset_hosts,
-        method_default,
-        auth,
-    })
-}
-
-fn prompt_rest_fields() -> Result<(String, String, String), ViaError> {
-    Ok((
-        prompt_required("Capability name", Some("api"))?,
-        prompt_required("Base URL", None)?,
-        prompt_required("Default HTTP method", Some("GET"))?,
-    ))
-}
-
-fn prompt_rest_auth_setup() -> Result<RestAuthSetup, ViaError> {
-    rest_auth_setup_from_choice(prompt_choice(
-        "How should REST authenticate?",
-        &[
-            "Bearer token",
-            "GitHub App credential bundle",
-            "OAuth credential bundle (prefer client_credentials for bots)",
-        ],
-        1,
-    )?)
-}
-
-fn prompt_asset_hosts() -> Result<Vec<String>, ViaError> {
-    let raw = prompt_optional("Asset hosts for authenticated downloads, comma-separated")?;
-    if raw.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    Ok(raw
-        .split(',')
-        .map(str::trim)
-        .filter(|host| !host.is_empty())
-        .map(str::to_owned)
-        .collect())
-}
-
 fn rest_auth_setup_from_choice(choice: usize) -> Result<RestAuthSetup, ViaError> {
     match choice {
         1 => Ok(RestAuthSetup::Bearer),
@@ -261,76 +393,6 @@ fn rest_auth_setup_from_choice(choice: usize) -> Result<RestAuthSetup, ViaError>
             "unsupported REST auth choice {choice}"
         ))),
     }
-}
-
-fn prompt_delegated_setup() -> Result<DelegatedSetup, ViaError> {
-    println!();
-    println!("Trusted CLI capability");
-    let program = prompt_required("Program", None)?;
-    let default_command = program.clone();
-    let command_name = prompt_required("Capability name", Some(&default_command))?;
-    let env_var = prompt_required("Environment variable to inject", Some("TOKEN"))?;
-    let check = prompt_required("Check command args", Some("--version"))?;
-
-    Ok(DelegatedSetup {
-        command_name,
-        program,
-        env_var,
-        check_args: split_args(&check),
-    })
-}
-
-fn prompt_choice(prompt: &str, choices: &[&str], default: usize) -> Result<usize, ViaError> {
-    loop {
-        println!("{prompt}");
-        for (index, choice) in choices.iter().enumerate() {
-            println!("  {}. {choice}", index + 1);
-        }
-
-        let raw = prompt_optional(&format!("Choice [{default}]"))?;
-        let choice = if raw.is_empty() {
-            default
-        } else {
-            match raw.parse::<usize>() {
-                Ok(choice) => choice,
-                Err(_) => {
-                    println!("Enter a number from 1 to {}.", choices.len());
-                    continue;
-                }
-            }
-        };
-
-        if (1..=choices.len()).contains(&choice) {
-            return Ok(choice);
-        }
-        println!("Enter a number from 1 to {}.", choices.len());
-    }
-}
-
-fn prompt_required(prompt: &str, default: Option<&str>) -> Result<String, ViaError> {
-    loop {
-        let label = match default {
-            Some(default) => format!("{prompt} [{default}]"),
-            None => prompt.to_owned(),
-        };
-        let value = prompt_optional(&label)?;
-        if !value.is_empty() {
-            return Ok(value);
-        }
-        if let Some(default) = default {
-            return Ok(default.to_owned());
-        }
-        println!("This value is required.");
-    }
-}
-
-fn prompt_optional(prompt: &str) -> Result<String, ViaError> {
-    print!("{prompt}: ");
-    io::stdout().flush()?;
-
-    let mut value = String::new();
-    io::stdin().read_line(&mut value)?;
-    Ok(value.trim().to_owned())
 }
 
 fn build_service_config(setup: ServiceSetup) -> String {
@@ -502,6 +564,232 @@ fn print_missing_config(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn configure_with_input(path: &Path, input: &str) -> Result<String, ViaError> {
+        let mut output = Vec::new();
+        Prompts {
+            input: &mut io::Cursor::new(input),
+            output: &mut output,
+        }
+        .configure(path)?;
+        Ok(String::from_utf8(output).unwrap())
+    }
+
+    const REST_INPUT: &str = "\nexample\nvia example api /items\n\nop://Private/Example/token\n\n\nhttps://api.example.com\n\n\n\n";
+
+    #[test]
+    fn interactive_setup_creates_a_valid_rest_service_with_defaults() {
+        let directory = crate::test_support::TempDir::create("setup-rest");
+        let path = directory.join("nested/config.toml");
+        let output = configure_with_input(&path, REST_INPUT).unwrap();
+        assert!(output.ends_with(&format!(
+            "created via config: {}\nRun `via config doctor` to check the setup.\n",
+            path.display()
+        )));
+        let config = Config::load(Some(&path)).unwrap();
+        let service = &config.services["example"];
+        assert_eq!(service.secrets["token"], "op://Private/Example/token");
+        let config::CommandConfig::Rest(rest) = &service.commands["api"] else {
+            panic!("expected REST capability");
+        };
+        assert_eq!(rest.base_url, "https://api.example.com");
+        assert_eq!(rest.method_default, "GET");
+        assert!(
+            matches!(&rest.auth, Some(config::AuthConfig::Bearer { secret }) if secret == "token")
+        );
+    }
+
+    #[test]
+    fn interactive_setup_supports_combined_github_app_and_delegated_access() {
+        let directory = crate::test_support::TempDir::create("setup-combined");
+        let path = directory.join("config.toml");
+        configure_with_input(&path, "1\ngithub\n\napp\nop://Private/App/metadata\n3\napi\nhttps://api.github.com\nGET\n assets.example.com, , downloads.example.com \n2\n\nop://Private/App/key\ngh\ncli\nGH_TOKEN\nversion --verbose\n").unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        let service = &config.services["github"];
+        assert_eq!(service.secrets["private_key"], "op://Private/App/key");
+        let config::CommandConfig::Rest(rest) = &service.commands["api"] else {
+            panic!("expected REST capability");
+        };
+        assert_eq!(
+            rest.asset_hosts,
+            ["assets.example.com", "downloads.example.com"]
+        );
+        assert!(
+            matches!(&rest.auth, Some(config::AuthConfig::GitHubApp { credential: Some(name), private_key: Some(key), .. }) if name == "app" && key == "private_key")
+        );
+        let config::CommandConfig::Delegated(cli) = &service.commands["cli"] else {
+            panic!("expected delegated capability");
+        };
+        assert_eq!(cli.program, "gh");
+        assert_eq!(cli.check, ["version", "--verbose"]);
+        assert_eq!(cli.inject.env["GH_TOKEN"].secret, "app");
+    }
+
+    #[test]
+    fn interactive_setup_supports_delegated_defaults_and_oauth() {
+        let directory = crate::test_support::TempDir::create("setup-modes");
+        let path = directory.join("delegated.toml");
+        configure_with_input(
+            &path,
+            "1\ndeploy\n\n\nop://Private/Deploy/token\n2\ndeployctl\n\n\n\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        let service = &config.services["deploy"];
+        assert_eq!(service.commands.len(), 1);
+        let config::CommandConfig::Delegated(cli) = &service.commands["deployctl"] else {
+            panic!("expected delegated capability");
+        };
+        assert_eq!(cli.check, ["--version"]);
+        assert_eq!(cli.inject.env["TOKEN"].secret, "token");
+
+        let path = directory.join("oauth.toml");
+        configure_with_input(
+            &path,
+            &format!("{}3\n", &REST_INPUT[..REST_INPUT.len() - 1]),
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        let config::CommandConfig::Rest(rest) = &config.services["example"].commands["api"] else {
+            panic!("expected REST capability");
+        };
+        assert!(
+            matches!(&rest.auth, Some(config::AuthConfig::OAuth { credential }) if credential == "token")
+        );
+    }
+
+    #[test]
+    fn interactive_setup_retries_invalid_choices_required_fields_and_references() {
+        let directory = crate::test_support::TempDir::create("setup-retry");
+        let path = directory.join("config.toml");
+        let input = REST_INPUT
+            .replacen("\nexample", "oops\n0\n4\n1\n\nexample", 1)
+            .replace(
+                "op://Private/Example/token",
+                "plaintext\nop://Private/Example/token",
+            );
+        let output = configure_with_input(&path, &input).unwrap();
+        assert!(output.contains("Enter a number from 1 to 3."));
+        assert!(output.contains("This value is required."));
+        assert!(output.contains("Secret references must start with `op://`."));
+        assert!(Config::load(Some(&path)).is_ok());
+    }
+
+    #[test]
+    fn interrupted_setup_returns_eof_without_creating_a_config() {
+        let directory = crate::test_support::TempDir::create("setup-eof");
+        let path = directory.join("config.toml");
+        for (index, _) in REST_INPUT.match_indices('\n') {
+            let error = configure_with_input(&path, &REST_INPUT[..index]).unwrap_err();
+            assert!(
+                matches!(error, ViaError::Io(ref source) if source.kind() == io::ErrorKind::UnexpectedEof)
+            );
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn empty_and_path_only_setup_do_not_require_service_details() {
+        let directory = crate::test_support::TempDir::create("setup-empty");
+        let path = directory.join("config.toml");
+        assert!(configure_with_input(&path, "3\n")
+            .unwrap()
+            .contains(&path.display().to_string()));
+        assert!(!path.exists());
+        configure_with_input(&path, "2\n").unwrap();
+        assert!(Config::load(Some(&path)).unwrap().services.is_empty());
+    }
+
+    #[test]
+    fn writing_config_preserves_existing_files_and_reports_parent_errors() {
+        let directory = crate::test_support::TempDir::create("setup-write");
+        let path = directory.write_private("config.toml", b"existing config");
+        let mut output = Vec::new();
+        let mut prompts = Prompts {
+            input: &mut io::empty(),
+            output: &mut output,
+        };
+        match prompts.write_config(&path, empty_config()) {
+            Err(ViaError::Io(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                // The message names the file that was kept.
+                assert!(error.to_string().contains(&path.display().to_string()));
+            }
+            other => panic!("expected the existing config to be kept, got {other:?}"),
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), "existing config");
+        assert!(prompts
+            .write_config(&path.join("child.toml"), empty_config())
+            .is_err());
+        assert!(output.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_config_creates_the_missing_target_of_a_symbolic_link() {
+        let directory = crate::test_support::TempDir::create("setup-link");
+        let path = directory.join("config.toml");
+        std::os::unix::fs::symlink("dotfiles/via.toml", &path).unwrap();
+
+        configure_with_input(&path, "2\n").unwrap();
+
+        assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(
+            fs::read_to_string(directory.join("dotfiles/via.toml")).unwrap(),
+            empty_config()
+        );
+        assert!(Config::load(Some(&path)).unwrap().services.is_empty());
+
+        // A link whose own target is a dangling link is not followed further.
+        let chained = directory.join("chained.toml");
+        std::os::unix::fs::symlink("missing.toml", directory.join("middle.toml")).unwrap();
+        std::os::unix::fs::symlink("middle.toml", &chained).unwrap();
+        assert!(matches!(
+            configure_with_input(&chained, "2\n"),
+            Err(ViaError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert!(!directory.join("missing.toml").exists());
+    }
+
+    // Output that fails when written to, or only when a prompt is flushed.
+    struct FailedOutput {
+        fail_write: bool,
+    }
+
+    impl Write for FailedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn setup_stops_before_reading_input_when_output_fails() {
+        // A failed write stops at the banner. A failed flush stops at the
+        // first prompt, which must not go on to read an answer.
+        for fail_write in [true, false] {
+            let mut input = io::Cursor::new(REST_INPUT);
+            let mut prompts = Prompts {
+                input: &mut input,
+                output: &mut FailedOutput { fail_write },
+            };
+            assert!(
+                matches!(
+                    prompts.configure(Path::new("unused.toml")),
+                    Err(ViaError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe
+                ),
+                "fail_write: {fail_write}"
+            );
+            assert_eq!(input.position(), 0, "fail_write: {fail_write}");
+        }
+    }
 
     #[test]
     fn builds_generic_rest_config() {
