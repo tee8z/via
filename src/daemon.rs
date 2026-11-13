@@ -1214,6 +1214,64 @@ mod imp {
         use std::thread;
 
         #[test]
+        fn listener_recovers_a_stale_socket_and_refuses_a_live_one() {
+            let directory = crate::test_support::TempDir::create("daemon-listener");
+            let path = directory.join("private/daemon.sock");
+            let listener = bind_listener(&path).unwrap();
+            assert_eq!(
+                fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(
+                matches!(bind_listener(&path), Err(ViaError::InvalidConfig(message)) if message.contains("already running"))
+            );
+            drop(listener);
+            let listener = bind_listener(&path).unwrap();
+            assert!(UnixStream::connect(&path).is_ok());
+            drop(listener);
+        }
+
+        #[test]
+        fn listener_reports_an_unusable_parent_without_removing_it() {
+            let directory = crate::test_support::TempDir::create("daemon-parent");
+            let path = directory.write_private("file", b"keep me");
+            assert!(bind_listener(&path.join("daemon.sock")).is_err());
+            assert_eq!(fs::read(path).unwrap(), b"keep me");
+        }
+
+        #[test]
+        fn service_manager_commands_report_success_missing_program_and_failure() {
+            let mut success = Command::new("/bin/sh");
+            success.args(["-c", "exit 0"]);
+            assert!(run_start_command("test manager", success).is_ok());
+            let directory = crate::test_support::TempDir::create("daemon-manager");
+            assert_eq!(
+                run_start_command("test manager", Command::new(directory.join("missing")))
+                    .unwrap_err(),
+                "test manager not found"
+            );
+            let mut failed = Command::new("/bin/sh");
+            failed.args(["-c", "printf 'test failure' >&2; exit 7"]);
+            assert_eq!(
+                run_start_command("test manager", failed).unwrap_err(),
+                "test manager exited with status Some(7): test failure"
+            );
+            let mut silent = Command::new("/bin/sh");
+            silent.args(["-c", "exit 7"]);
+            assert!(run_start_command("test manager", silent)
+                .unwrap_err()
+                .contains("Some(7)"));
+        }
+
+        #[test]
         fn rejects_unregistered_resolve_request() {
             let mut state = DaemonState::default();
 
