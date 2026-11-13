@@ -65,7 +65,7 @@ pub fn execute(
         let body = trace
             .redactor
             .redact(&String::from_utf8_lossy(&response.body));
-        ensure_success(response.status, &response.headers, &body)?;
+        ensure_success(response.status, &response.headers, &body, &trace.redactor)?;
     }
 
     match &request.output {
@@ -379,6 +379,7 @@ fn ensure_success(
     status: reqwest::StatusCode,
     headers: &HeaderMap,
     body: &str,
+    redactor: &Redactor,
 ) -> Result<(), ViaError> {
     if status.is_success() {
         return Ok(());
@@ -389,14 +390,17 @@ fn ensure_success(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("unknown");
     let mut message = format!("request failed with status {status}; request id {request_id}");
-    if let Some(body) = error_body_summary(body) {
+    if let Some(body) = error_body_summary(body, redactor) {
         message.push_str("; response body: ");
         message.push_str(&body);
     }
     Err(ViaError::InvalidArgument(message))
 }
 
-fn error_body_summary(body: &str) -> Option<String> {
+// `body` is already redacted. Decoding a JSON string can still restore a
+// secret that the service escaped, such as `\/` for `/`, so the decoded
+// message is redacted again before any of it is printed.
+fn error_body_summary(body: &str, redactor: &Redactor) -> Option<String> {
     let body = body.trim();
     if body.is_empty() {
         return None;
@@ -404,7 +408,7 @@ fn error_body_summary(body: &str) -> Option<String> {
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
-            return Some(truncate_error_body(message));
+            return Some(truncate_error_body(&redactor.redact(message)));
         }
     }
 
@@ -1813,7 +1817,13 @@ asset_hosts = ["uploads.linear.app"]
     fn success_status_accepts_response_body_without_error() {
         let headers = HeaderMap::new();
 
-        assert!(ensure_success(reqwest::StatusCode::OK, &headers, "{\"ok\":true}").is_ok());
+        assert!(ensure_success(
+            reqwest::StatusCode::OK,
+            &headers,
+            "{\"ok\":true}",
+            &Redactor::new()
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1825,6 +1835,7 @@ asset_hosts = ["uploads.linear.app"]
             reqwest::StatusCode::GATEWAY_TIMEOUT,
             &headers,
             r#"{"message":"Endpoint request timed out","secret":"[REDACTED]"}"#,
+            &Redactor::new(),
         )
         .unwrap_err();
 
@@ -1833,6 +1844,29 @@ asset_hosts = ["uploads.linear.app"]
                     && message.contains("ABC123")
                     && message.contains("Endpoint request timed out")
                     && !message.contains("secret")));
+    }
+
+    #[test]
+    fn failure_status_redacts_a_secret_that_json_decoding_restores() {
+        let mut redactor = Redactor::new();
+        redactor.add("abc/def+ghi");
+        // The service echoes the key with JSON escapes, so the raw body does
+        // not contain the secret but the decoded message does.
+        let raw = r#"{"message":"bad key abc\/def\u002Bghi"}"#;
+        let body = redactor.redact(raw);
+        assert_eq!(body, raw);
+
+        let error = ensure_success(
+            reqwest::StatusCode::UNAUTHORIZED,
+            &HeaderMap::new(),
+            &body,
+            &redactor,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ViaError::InvalidArgument(message)
+                if message.contains("response body: bad key [REDACTED]")
+                    && !message.contains("abc/def")));
     }
 
     #[test]
