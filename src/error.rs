@@ -61,6 +61,15 @@ pub enum ViaError {
     #[error("secret `{secret}` is not configured for service `{service}`")]
     UnknownSecret { service: String, secret: String },
 
+    #[error("credential `{name}` is unavailable: {reason}")]
+    SecretUnavailable { name: String, reason: String },
+
+    #[error("{message}")]
+    Denied {
+        reason: &'static str,
+        message: String,
+    },
+
     #[error("doctor checks failed; see output above for setup guidance")]
     DoctorFailed,
 
@@ -75,6 +84,43 @@ pub enum ViaError {
 }
 
 impl ViaError {
+    pub fn denied(reason: &'static str, message: impl Into<String>) -> Self {
+        ViaError::Denied {
+            reason,
+            message: message.into(),
+        }
+    }
+
+    // A short, stable, machine-readable name for audit records. It never
+    // contains caller input or secret material.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ViaError::InvalidCli(_) | ViaError::Clap(_) => "invalid_cli",
+            ViaError::ConfigNotFound(_) => "config_not_found",
+            ViaError::ReadConfig { .. } => "config_unreadable",
+            ViaError::ParseConfig(_) => "config_parse_failed",
+            ViaError::InvalidConfig(_) => "invalid_config",
+            ViaError::UnknownService(_) => "unknown_service",
+            ViaError::UnknownCapability { .. } => "unknown_capability",
+            ViaError::MissingArgument(_) => "missing_argument",
+            ViaError::InvalidArgument(_) => "invalid_argument",
+            ViaError::MissingProgram { .. } => "missing_program",
+            ViaError::ExternalCommandFailed { .. } => "command_failed",
+            ViaError::SshCommandFailed { .. } => "ssh_command_failed",
+            ViaError::SshAgentUnavailable { .. } => "ssh_agent_unavailable",
+            ViaError::InvalidSshPublicKey(_) => "invalid_ssh_public_key",
+            ViaError::SshIdentityUnavailable => "ssh_identity_unavailable",
+            ViaError::InvalidSshIdentityPath(_) => "invalid_ssh_identity_path",
+            ViaError::UnknownSecret { .. } => "unknown_secret",
+            ViaError::SecretUnavailable { .. } => "secret_unavailable",
+            ViaError::Denied { reason, .. } => *reason,
+            ViaError::DoctorFailed => "doctor_failed",
+            ViaError::Http(_) => "http_error",
+            ViaError::Json(_) => "json_error",
+            ViaError::Io(_) => "io_error",
+        }
+    }
+
     pub fn exit_code(&self) -> u8 {
         match self {
             ViaError::Clap(error) => {
@@ -93,7 +139,8 @@ impl ViaError {
             | ViaError::UnknownCapability { .. }
             | ViaError::MissingArgument(_)
             | ViaError::InvalidArgument(_)
-            | ViaError::UnknownSecret { .. } => 2,
+            | ViaError::UnknownSecret { .. }
+            | ViaError::Denied { .. } => 2,
             ViaError::ConfigNotFound(_)
             | ViaError::ReadConfig { .. }
             | ViaError::ParseConfig(_)
@@ -104,6 +151,7 @@ impl ViaError {
             | ViaError::InvalidSshPublicKey(_)
             | ViaError::SshIdentityUnavailable
             | ViaError::InvalidSshIdentityPath(_)
+            | ViaError::SecretUnavailable { .. }
             | ViaError::DoctorFailed
             | ViaError::Http(_)
             | ViaError::Json(_)
@@ -131,6 +179,27 @@ mod tests {
             ViaError::InvalidSshIdentityPath("unsafe path".to_owned()).exit_code(),
             1
         );
+    }
+
+    #[test]
+    fn denied_errors_exit_two_and_report_their_reason() {
+        let error = ViaError::denied("method_not_allowed", "method `DELETE` is not allowed");
+
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(error.kind(), "method_not_allowed");
+        assert_eq!(error.to_string(), "method `DELETE` is not allowed");
+    }
+
+    #[test]
+    fn unavailable_credentials_exit_one_without_a_value() {
+        let error = ViaError::SecretUnavailable {
+            name: "github-token".to_owned(),
+            reason: "the credential file does not exist or is not accessible".to_owned(),
+        };
+
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(error.kind(), "secret_unavailable");
+        assert!(error.to_string().contains("credential `github-token`"));
     }
 
     #[test]

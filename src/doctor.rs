@@ -653,11 +653,54 @@ fn check_providers(config: &Config, status: &mut DoctorStatus) -> BTreeMap<Strin
                 *cache_ttl_seconds,
                 status,
             ),
+            ProviderConfig::Directory { path } => {
+                check_directory_provider(provider_name, path.as_deref(), status)
+            }
         };
         ready.insert(provider_name.clone(), provider_ready);
     }
 
     ready
+}
+
+fn check_directory_provider(
+    provider_name: &str,
+    path: Option<&Path>,
+    status: &mut DoctorStatus,
+) -> bool {
+    println!("provider {provider_name} (directory): checking");
+
+    match crate::providers::directory::credentials_directory(path) {
+        Ok(directory) if directory.is_dir() => {
+            println!("  credential directory {}: ready", directory.display());
+            true
+        }
+        Ok(directory) => {
+            status.fail();
+            println!("  credential directory {}: not found", directory.display());
+            print_directory_provider_setup();
+            false
+        }
+        Err(error) => {
+            status.fail();
+            println!("  credential directory: not configured");
+            print_error_hint(&error);
+            print_directory_provider_setup();
+            false
+        }
+    }
+}
+
+fn print_directory_provider_setup() {
+    print_human_setup(&[
+        "Set the provider `path` to an absolute directory, or run via where `CREDENTIALS_DIRECTORY` is set.",
+        "Store each credential as one regular file named after its `cred://<name>` reference.",
+        "Make each file readable by the account that runs via and not readable by other users.",
+        "Rerun `via config doctor` after the directory is available.",
+    ]);
+    print_agent_guidance(
+        "Ask the user to fix the credential directory; do not ask for credential values.",
+    );
 }
 
 fn check_onepassword_provider(
@@ -904,14 +947,14 @@ fn print_secret_failure(service_name: &str, secret_name: &str, error: &ViaError)
     print_secret_error_hint(error);
     print_human_setup(&[
         &format!(
-            "Confirm the configured 1Password reference for `{service_name}.{secret_name}` exists."
+            "Confirm the configured secret reference for `{service_name}.{secret_name}` exists in its provider."
         ),
-        "Confirm your signed-in account has permission to read it.",
+        "Confirm via may read it: the signed-in provider account, or the credential file's owner and mode.",
         "Update `via.toml` with the correct secret reference if needed.",
         &format!("Rerun `via config doctor {service_name}` after fixing the secret."),
     ]);
     print_agent_guidance(
-        "Do not ask for the token value. Ask the user to fix the configured secret reference or 1Password permissions.",
+        "Do not ask for the token value. Ask the user to fix the configured secret reference or its provider permissions.",
     );
 }
 
@@ -923,6 +966,7 @@ fn print_secret_error_hint(error: &ViaError) {
         ViaError::ExternalCommandFailed { status, .. } => {
             println!("  reason: secret provider could not read the configured reference; status {status:?}");
         }
+        ViaError::SecretUnavailable { reason, .. } => println!("  reason: {reason}"),
         _ => println!("  reason: secret provider could not read the configured reference"),
     }
 }
@@ -1060,6 +1104,64 @@ base_url = "https://api.example.com"
                 .map(crate::secrets::SecretValue::new)
                 .ok_or_else(|| ViaError::InvalidConfig(format!("missing test secret {reference}")))
         }
+    }
+
+    #[test]
+    fn directory_provider_check_requires_an_existing_directory() {
+        let directory = crate::test_support::TempDir::create("doctor-directory");
+
+        let mut status = DoctorStatus::default();
+        assert!(check_directory_provider(
+            "files",
+            Some(directory.path()),
+            &mut status
+        ));
+        assert!(status.into_result().is_ok());
+
+        let mut status = DoctorStatus::default();
+        assert!(!check_directory_provider(
+            "files",
+            Some(&directory.join("absent")),
+            &mut status
+        ));
+        assert!(matches!(status.into_result(), Err(ViaError::DoctorFailed)));
+    }
+
+    #[test]
+    fn directory_secrets_are_checked_without_printing_values() {
+        let directory = crate::test_support::TempDir::create("doctor-directory-secrets");
+        directory.write_private("github-token", b"secret-token\n");
+        let config = Config::from_toml_str(&format!(
+            r#"
+version = 1
+
+[providers.files]
+type = "directory"
+path = '{}'
+
+[services.github]
+provider = "files"
+
+[services.github.secrets]
+token = "cred://github-token"
+missing = "cred://absent-token"
+"#,
+            directory.path().display()
+        ))
+        .unwrap();
+        let providers = ProviderRegistry::from_config(&config).unwrap();
+        let service = &config.services["github"];
+
+        let mut status = DoctorStatus::default();
+        check_service_secrets("github", service, true, &providers, &mut status).unwrap();
+
+        // The readable credential passes and the absent file fails the run.
+        assert!(matches!(status.into_result(), Err(ViaError::DoctorFailed)));
+        assert!(providers
+            .get("files")
+            .unwrap()
+            .resolve("cred://github-token")
+            .is_ok());
     }
 
     #[test]

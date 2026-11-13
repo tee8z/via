@@ -30,6 +30,11 @@ pub enum ProviderConfig {
         #[serde(default = "default_onepassword_cache_ttl_seconds")]
         cache_ttl_seconds: u64,
     },
+    #[serde(rename = "directory")]
+    Directory {
+        #[serde(default)]
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -192,22 +197,26 @@ impl Config {
             )));
         }
 
+        for (provider_name, provider) in &self.providers {
+            provider.validate(provider_name)?;
+        }
+
         for (profile_name, profile) in &self.ssh_profiles {
             validate_ssh_profile(profile_name, profile, &self.providers)?;
         }
 
         for (service_name, service) in &self.services {
-            if !self.providers.contains_key(&service.provider) {
-                return Err(ViaError::InvalidConfig(format!(
+            let provider = self.providers.get(&service.provider).ok_or_else(|| {
+                ViaError::InvalidConfig(format!(
                     "service `{service_name}` references unknown provider `{}`",
                     service.provider
-                )));
-            }
+                ))
+            })?;
 
             for (secret_name, reference) in &service.secrets {
-                if !reference.starts_with("op://") {
+                if let Err(problem) = provider.validate_reference(reference) {
                     return Err(ViaError::InvalidConfig(format!(
-                        "secret `{service_name}.{secret_name}` must be an op:// reference"
+                        "secret `{service_name}.{secret_name}` {problem}"
                     )));
                 }
             }
@@ -226,6 +235,57 @@ pub fn resolve_path(path: Option<&Path>) -> Result<PathBuf, ViaError> {
         Some(path) => Ok(path.to_path_buf()),
         None => default_config_path(),
     }
+}
+
+const ONEPASSWORD_REFERENCE_SCHEME: &str = "op://";
+const DIRECTORY_REFERENCE_SCHEME: &str = "cred://";
+
+impl ProviderConfig {
+    fn validate(&self, provider_name: &str) -> Result<(), ViaError> {
+        match self {
+            ProviderConfig::OnePassword { .. } => Ok(()),
+            ProviderConfig::Directory { path } => {
+                if path.as_deref().is_some_and(|path| !path.is_absolute()) {
+                    return Err(ViaError::InvalidConfig(format!(
+                        "provider `{provider_name}` directory path must be an absolute path"
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    // A reference must use the scheme of the provider that resolves it. The
+    // returned problem completes a sentence that names the offending field.
+    fn validate_reference(&self, reference: &str) -> Result<(), &'static str> {
+        match self {
+            ProviderConfig::OnePassword { .. } => {
+                if reference.starts_with(ONEPASSWORD_REFERENCE_SCHEME) {
+                    Ok(())
+                } else {
+                    Err("must be an op:// reference")
+                }
+            }
+            ProviderConfig::Directory { .. } => {
+                if !reference.starts_with(DIRECTORY_REFERENCE_SCHEME) {
+                    Err("must be a cred:// reference")
+                } else if directory_credential_name(reference).is_none() {
+                    Err("must be a cred://<name> reference that names a single file")
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn directory_credential_name(reference: &str) -> Option<&str> {
+    let name = reference.strip_prefix(DIRECTORY_REFERENCE_SCHEME)?;
+    valid_path_component(name).then_some(name)
+}
+
+pub(crate) fn valid_path_component(value: &str) -> bool {
+    !value.is_empty() && value != "." && value != ".." && !value.contains(['/', '\\', '\0'])
 }
 
 impl CommandConfig {
@@ -349,15 +409,15 @@ fn validate_ssh_profile(
                 .to_owned(),
         ));
     }
-    if !providers.contains_key(&profile.provider) {
+    let Some(provider) = providers.get(&profile.provider) else {
         return Err(ViaError::InvalidConfig(format!(
             "SSH profile `{profile_name}` references unknown provider `{}`",
             profile.provider
         )));
-    }
-    if !profile.public_key.starts_with("op://") {
+    };
+    if let Err(problem) = provider.validate_reference(&profile.public_key) {
         return Err(ViaError::InvalidConfig(format!(
-            "SSH profile `{profile_name}` public_key must be an op:// reference"
+            "SSH profile `{profile_name}` public_key {problem}"
         )));
     }
     if let Some(agent_socket) = &profile.agent_socket {
@@ -910,6 +970,7 @@ cache_ttl_seconds = 600"#,
                 assert_eq!(*cache, OnePasswordCacheMode::Daemon);
                 assert_eq!(*cache_ttl_seconds, 600);
             }
+            other => panic!("expected a 1Password provider, got {other:?}"),
         }
     }
 
@@ -929,6 +990,7 @@ cache_ttl_seconds = 600"#,
                 assert_eq!(*cache, OnePasswordCacheMode::Off);
                 assert_eq!(*cache_ttl_seconds, 300);
             }
+            other => panic!("expected a 1Password provider, got {other:?}"),
         }
     }
 
@@ -996,6 +1058,143 @@ type = "headers""#,
             Config::from_toml_str(&raw),
             Err(ViaError::InvalidConfig(message)) if message.contains("delegated program")
         ));
+    }
+
+    const DIRECTORY_VALID: &str = r#"
+version = 1
+
+[providers.files]
+type = "directory"
+
+[ssh_profiles.deploy]
+provider = "files"
+public_key = "cred://deploy-ssh-public-key"
+
+[services.github]
+provider = "files"
+
+[services.github.secrets]
+token = "cred://github-token"
+
+[services.github.commands.api]
+mode = "rest"
+base_url = "https://api.github.com"
+
+[services.github.commands.api.auth]
+type = "bearer"
+secret = "token"
+"#;
+
+    #[test]
+    fn parses_directory_provider_with_cred_references() {
+        let config = Config::from_toml_str(DIRECTORY_VALID).unwrap();
+
+        assert!(matches!(
+            &config.providers["files"],
+            ProviderConfig::Directory { path: None }
+        ));
+        assert_eq!(
+            config.services["github"].secrets["token"],
+            "cred://github-token"
+        );
+        assert_eq!(
+            config.ssh_profiles["deploy"].public_key,
+            "cred://deploy-ssh-public-key"
+        );
+    }
+
+    #[test]
+    fn directory_provider_path_must_be_absolute() {
+        #[cfg(windows)]
+        let absolute = r"path = 'C:\via\credentials'";
+        #[cfg(not(windows))]
+        let absolute = r#"path = "/run/credentials/via""#;
+        let with_path = |path: &str| {
+            DIRECTORY_VALID.replace(
+                "type = \"directory\"",
+                &format!("type = \"directory\"\n{path}"),
+            )
+        };
+
+        let config = Config::from_toml_str(&with_path(absolute)).unwrap();
+        assert!(matches!(
+            &config.providers["files"],
+            ProviderConfig::Directory { path: Some(path) } if path.is_absolute()
+        ));
+
+        assert!(matches!(
+            Config::from_toml_str(&with_path("path = \"credentials\"")),
+            Err(ViaError::InvalidConfig(message)) if message.contains("must be an absolute path")
+        ));
+    }
+
+    #[test]
+    fn rejects_references_that_do_not_match_the_provider_type() {
+        let op_secret_for_directory =
+            DIRECTORY_VALID.replace("cred://github-token", "op://Private/GitHub/token");
+        assert!(matches!(
+            Config::from_toml_str(&op_secret_for_directory),
+            Err(ViaError::InvalidConfig(message))
+                if message.contains("secret `github.token` must be a cred:// reference")
+        ));
+
+        let op_public_key_for_directory = DIRECTORY_VALID.replace(
+            "cred://deploy-ssh-public-key",
+            "op://Private/Deploy SSH/public key",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&op_public_key_for_directory),
+            Err(ViaError::InvalidConfig(message))
+                if message.contains("public_key must be a cred:// reference")
+        ));
+
+        let cred_secret_for_onepassword =
+            VALID.replace("op://Private/GitHub/token", "cred://github-token");
+        assert!(matches!(
+            Config::from_toml_str(&cred_secret_for_onepassword),
+            Err(ViaError::InvalidConfig(message)) if message.contains("must be an op:// reference")
+        ));
+
+        let cred_public_key_for_onepassword = SSH_VALID.replace(
+            "op://Private/Production SSH/public key",
+            "cred://deploy-ssh-public-key",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&cred_public_key_for_onepassword),
+            Err(ViaError::InvalidConfig(message)) if message.contains("public_key must be an op://")
+        ));
+    }
+
+    #[test]
+    fn rejects_directory_references_that_are_not_a_single_file_name() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "nested/token",
+            "../token",
+            "/etc/passwd",
+            r"a\b",
+        ] {
+            let raw =
+                DIRECTORY_VALID.replace("\"cred://github-token\"", &format!("'cred://{name}'"));
+
+            assert!(
+                matches!(
+                    Config::from_toml_str(&raw),
+                    Err(ViaError::InvalidConfig(message)) if message.contains("names a single file")
+                ),
+                "expected `cred://{name}` to be rejected"
+            );
+        }
+
+        assert_eq!(
+            directory_credential_name("cred://github-token"),
+            Some("github-token")
+        );
+        assert_eq!(directory_credential_name("cred://a\0b"), None);
+        assert_eq!(directory_credential_name("op://Private/GitHub/token"), None);
+        assert_eq!(directory_credential_name("github-token"), None);
     }
 
     #[cfg(windows)]

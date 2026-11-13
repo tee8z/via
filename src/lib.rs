@@ -13,6 +13,8 @@ pub mod providers;
 pub mod redaction;
 pub mod secrets;
 pub mod skill;
+#[cfg(test)]
+mod test_support;
 pub mod timing;
 pub mod tls;
 

@@ -4,6 +4,7 @@ use crate::config::{Config, ProviderConfig};
 use crate::error::ViaError;
 use crate::secrets::SecretValue;
 
+pub(crate) mod directory;
 mod onepassword;
 
 pub trait SecretProvider {
@@ -32,6 +33,12 @@ impl ProviderRegistry {
                             *cache_ttl_seconds,
                             provider_secret_references(config, name),
                         )),
+                    );
+                }
+                ProviderConfig::Directory { path } => {
+                    providers.insert(
+                        name.clone(),
+                        Box::new(directory::DirectoryProvider::new(path.clone())),
                     );
                 }
             }
