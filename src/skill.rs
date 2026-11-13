@@ -45,7 +45,7 @@ pub fn render(config: &Config) -> String {
                     format!("via {service_name} {command_name} <host> [remote-command...]")
                 }
             };
-            let details = ssh_details(command);
+            let details = format!("{}{}", rest_rule_details(command), ssh_details(command));
             match command.description() {
                 Some(description) => output.push_str(&format!(
                     "  - `{command_name}`: {description}{details} Use `{usage}`.\n"
@@ -82,6 +82,38 @@ fn ssh_details(command: &CommandConfig) -> String {
         ssh.user,
         ssh.hosts.join("`, `")
     )
+}
+
+fn rest_rule_details(command: &CommandConfig) -> String {
+    let CommandConfig::Rest(rest) = command else {
+        return String::new();
+    };
+
+    let mut details = String::new();
+    if let Some(methods) = &rest.methods {
+        details.push_str(&format!(" Allowed methods: `{}`.", methods.join("`, `")));
+    }
+    if !rest.allow_paths.is_empty() {
+        details.push_str(&format!(
+            " Allowed paths: `{}`.",
+            rest.allow_paths.join("`, `")
+        ));
+    }
+    if !rest.deny_paths.is_empty() {
+        details.push_str(&format!(
+            " Denied paths: `{}`.",
+            rest.deny_paths.join("`, `")
+        ));
+    }
+    if !rest.rules.is_empty() {
+        let rules = rest
+            .rules
+            .iter()
+            .map(crate::rules::describe_rule)
+            .collect::<Vec<_>>();
+        details.push_str(&format!(" Rules: `{}`.", rules.join("`, `")));
+    }
+    details
 }
 
 fn rest_usage(service_name: &str, command_name: &str, command: &CommandConfig) -> String {
@@ -173,5 +205,45 @@ port = 2222
         assert!(!output.contains("agent_socket"));
         assert!(!output.contains("ssh_program"));
         assert!(!output.contains("ssh_add_program"));
+    }
+
+    #[test]
+    fn renders_rest_rules_for_agents() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[providers.files]
+type = "directory"
+
+[services.github]
+provider = "files"
+
+[services.github.commands.api]
+description = "REST access."
+mode = "rest"
+base_url = "https://api.github.com"
+methods = ["GET", "post"]
+allow_paths = ["/repos/OWNER/**", "/user"]
+deny_paths = ["/repos/*/*/actions/secrets/**"]
+
+[[services.github.commands.api.rules]]
+methods = ["PATCH"]
+path = "/repos/OWNER/REPO/issues/*"
+effect = "allow"
+
+[services.github.commands.open]
+description = "Unrestricted."
+mode = "rest"
+base_url = "https://api.github.com"
+"#,
+        )
+        .unwrap();
+        let output = render(&config);
+
+        assert!(output.contains(
+            "`api`: REST access. Allowed methods: `GET`, `POST`. Allowed paths: `/repos/OWNER/**`, `/user`. Denied paths: `/repos/*/*/actions/secrets/**`. Rules: `allow PATCH /repos/OWNER/REPO/issues/*`. Use `via github api <path>`."
+        ));
+        assert!(output.contains("`open`: Unrestricted. Use `via github open <path>`."));
     }
 }

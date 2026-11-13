@@ -11,6 +11,7 @@ pub mod executor;
 pub mod login;
 pub mod providers;
 pub mod redaction;
+mod rules;
 pub mod secrets;
 pub mod skill;
 #[cfg(test)]

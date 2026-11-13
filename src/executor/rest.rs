@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{
-    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
+    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, LOCATION, USER_AGENT,
 };
 use reqwest::{Method, Url};
 
@@ -12,6 +12,7 @@ use crate::config::{AuthConfig, RestCommandConfig, SecretHeaderConfig, ServiceCo
 use crate::error::ViaError;
 use crate::providers::SecretProvider;
 use crate::redaction::Redactor;
+use crate::rules::{self, RestRules};
 
 pub fn execute(
     service_name: &str,
@@ -21,8 +22,9 @@ pub fn execute(
     args: Vec<String>,
 ) -> Result<(), ViaError> {
     let request = RestInvocation::parse(config, args)?;
+    enforce_rules(config, &request)?;
     let mut redactor = Redactor::new();
-    let client = http_client(&request)?;
+    let client = http_client(config, &request)?;
     let builder = {
         let mut context = RestRequestBuildContext {
             client: &client,
@@ -54,6 +56,9 @@ pub fn execute(
     }
 
     if !response.status.is_success() {
+        if let Some(error) = unfollowed_redirect_error(&response, &redactor) {
+            return Err(error);
+        }
         let body = redactor.redact(&String::from_utf8_lossy(&response.body));
         ensure_success(response.status, &response.headers, &body)?;
     }
@@ -159,14 +164,94 @@ fn send_rest_request(
     })
 }
 
-fn http_client(request: &RestInvocation) -> Result<Client, ViaError> {
-    if request.absolute_url {
+fn http_client(config: &RestCommandConfig, request: &RestInvocation) -> Result<Client, ViaError> {
+    // A redirect could lead to a host or path outside the capability
+    // boundary, so it is never followed where that boundary is restricted.
+    if request.absolute_url || config.has_rules() {
         return Ok(Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()?);
     }
 
     Ok(Client::new())
+}
+
+// Reports where an unfollowed redirect pointed so the caller can decide
+// whether to make a new request.
+fn unfollowed_redirect_error(response: &RestResponse, redactor: &Redactor) -> Option<ViaError> {
+    if !response.status.is_redirection() {
+        return None;
+    }
+    let location = response.headers.get(LOCATION)?.to_str().ok()?;
+
+    Some(ViaError::InvalidArgument(format!(
+        "request was redirected with status {}; via did not follow the redirect to {}",
+        response.status,
+        redactor.redact(location)
+    )))
+}
+
+fn enforce_rules(config: &RestCommandConfig, request: &RestInvocation) -> Result<(), ViaError> {
+    let Some(rest_rules) = RestRules::from_config(config)
+        .map_err(|problem| ViaError::InvalidConfig(format!("REST capability {problem}")))?
+    else {
+        return Ok(());
+    };
+
+    rules::check_raw_target(&request.path)
+        .map_err(|problem| rules::refused("path_not_normalized", problem))?;
+    let raw_path = target_path(&request.path);
+    rest_rules.check(request.method.as_str(), raw_path)?;
+    ensure_sent_path_is_checked_path(config, request, raw_path)
+}
+
+// The rules were evaluated against `raw_path`. Refuse the request unless the
+// URL parser sends exactly that path to the expected host.
+fn ensure_sent_path_is_checked_path(
+    config: &RestCommandConfig,
+    request: &RestInvocation,
+    raw_path: &str,
+) -> Result<(), ViaError> {
+    let changed = || {
+        rules::refused(
+            "path_not_normalized",
+            "the request URL does not preserve the checked path",
+        )
+    };
+    let url = build_url(config, &request.path, &request.query)?;
+    let sent = Url::parse(&url).map_err(|_| changed())?;
+    let mut expected = Vec::new();
+    if !request.absolute_url {
+        let base = Url::parse(config.base_url.trim_end_matches('/')).map_err(|_| changed())?;
+        if base.host_str() != sent.host_str() {
+            return Err(changed());
+        }
+        expected.extend(rules::percent_decode_lenient(
+            base.path().trim_end_matches('/'),
+        ));
+    }
+    expected.extend(rules::percent_decode_lenient(raw_path));
+
+    if rules::percent_decode_lenient(sent.path()) == expected {
+        Ok(())
+    } else {
+        Err(changed())
+    }
+}
+
+// The path component of a request target: no query string and no fragment.
+fn target_path(target: &str) -> &str {
+    let end = target.find(['?', '#']).unwrap_or(target.len());
+    let target = &target[..end];
+    if !is_absolute_http_url(target) {
+        return target;
+    }
+
+    let authority_and_path = target.split_once("://").map_or(target, |(_, rest)| rest);
+    match authority_and_path.find('/') {
+        Some(index) => &authority_and_path[index..],
+        None => "/",
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -858,6 +943,275 @@ asset_hosts = ["uploads.linear.app"]
             url,
             "https://api.github.com/search/issues?q=repo%3Aowner%2Fname%20bug%20fix"
         );
+    }
+
+    fn rules_config(base_url: &str, rules: &str) -> RestCommandConfig {
+        toml::from_str(&format!("base_url = \"{base_url}\"\n{rules}")).unwrap()
+    }
+
+    fn invocation(config: &RestCommandConfig, args: &[&str]) -> RestInvocation {
+        RestInvocation::parse(config, args.iter().map(|arg| (*arg).to_owned()).collect()).unwrap()
+    }
+
+    fn rule_denial(config: &RestCommandConfig, args: &[&str]) -> &'static str {
+        match enforce_rules(config, &invocation(config, args)) {
+            Err(ViaError::Denied { reason, .. }) => reason,
+            Err(error) => panic!("expected a denial for {args:?}, got {error}"),
+            Ok(()) => panic!("expected a denial for {args:?}"),
+        }
+    }
+
+    #[test]
+    fn extracts_the_path_component_of_a_request_target() {
+        assert_eq!(target_path("/user"), "/user");
+        assert_eq!(target_path("/user?per_page=1"), "/user");
+        assert_eq!(target_path("/user#fragment"), "/user");
+        assert_eq!(target_path("/a/b?c=/d/../e"), "/a/b");
+        assert_eq!(target_path("https://assets.example.com/a/b?c=d"), "/a/b");
+        assert_eq!(target_path("https://assets.example.com"), "/");
+        assert_eq!(target_path("https://assets.example.com?c=d"), "/");
+        assert_eq!(target_path("https://user@assets.example.com:8443/a"), "/a");
+    }
+
+    #[test]
+    fn requests_without_rules_are_not_normalized_or_restricted() {
+        let config = rest_config();
+
+        for args in [
+            &["/user"][..],
+            &["DELETE", "/repos/o/r"],
+            &["/a/../b"],
+            &["/a//b"],
+            &["/a b"],
+        ] {
+            assert!(
+                enforce_rules(&config, &invocation(&config, args)).is_ok(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn method_rules_refuse_other_methods() {
+        let config = rules_config("https://api.example.com", "methods = [\"GET\", \"POST\"]");
+
+        assert!(enforce_rules(&config, &invocation(&config, &["/user"])).is_ok());
+        assert!(enforce_rules(&config, &invocation(&config, &["post", "/user"])).is_ok());
+        assert_eq!(
+            rule_denial(&config, &["DELETE", "/user"]),
+            "method_not_allowed"
+        );
+        assert_eq!(
+            rule_denial(&config, &["delete", "/user"]),
+            "method_not_allowed"
+        );
+    }
+
+    #[test]
+    fn path_rules_apply_to_the_path_without_the_query() {
+        let config = rules_config(
+            "https://api.example.com/v1/",
+            "allow_paths = [\"/repos/owner/**\"]\ndeny_paths = [\"/repos/*/*/secrets/**\"]",
+        );
+
+        for args in [
+            &["/repos/owner/repo"][..],
+            &["/repos/owner/repo?path=/repos/owner/repo/secrets"],
+            &["/repos/owner/repo/", "--query", "ref=a/../b"],
+            &["/repos/owner/repo/caf%C3%A9"],
+            &["/repos/owner/repo/a%20b"],
+        ] {
+            assert!(
+                enforce_rules(&config, &invocation(&config, args)).is_ok(),
+                "{args:?}"
+            );
+        }
+
+        assert_eq!(rule_denial(&config, &["/user"]), "path_not_allowed");
+        assert_eq!(
+            rule_denial(&config, &["/user?next=/repos/owner/repo"]),
+            "path_not_allowed"
+        );
+        assert_eq!(
+            rule_denial(&config, &["/repos/owner/repo/secrets/NAME"]),
+            "path_denied"
+        );
+        assert_eq!(
+            rule_denial(&config, &["/repos/owner/repo/%73ecrets"]),
+            "path_denied"
+        );
+    }
+
+    #[test]
+    fn path_rules_refuse_bypass_attempts() {
+        let config = rules_config(
+            "https://api.example.com",
+            "allow_paths = [\"/public/**\"]\ndeny_paths = [\"/admin/**\"]",
+        );
+
+        for target in [
+            "/public/../admin",
+            "/public/%2e%2e/admin",
+            "/public/%2E%2E/admin",
+            "/public/.%2e/admin",
+            "/public/./admin",
+            "/public//admin",
+            "//admin",
+            "/public/%2fadmin",
+            "/public/..%2Fadmin",
+            "/public\\admin",
+            "/public/%5cadmin",
+            "/public/\tadmin",
+            "/public/a\nb",
+            "/public/a b",
+            "/public/a?b=c d",
+            "/public/a?b=c\\d",
+            "/public/%zz",
+        ] {
+            assert_eq!(
+                rule_denial(&config, &[target]),
+                "path_not_normalized",
+                "target `{target}`"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_apply_to_absolute_asset_urls() {
+        let config = rules_config(
+            "https://api.example.com",
+            "asset_hosts = [\"assets.example.com\"]\nmethods = [\"GET\"]\nallow_paths = [\"/files/**\"]",
+        );
+        let output = ["--output", "/tmp/via-rules-test-output"];
+        let args = |target: &'static str, method: Option<&'static str>| {
+            method
+                .into_iter()
+                .chain([target])
+                .chain(output)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(enforce_rules(
+            &config,
+            &invocation(
+                &config,
+                &args("https://assets.example.com/files/a.png?size=2", None)
+            )
+        )
+        .is_ok());
+        assert_eq!(
+            rule_denial(
+                &config,
+                &args("https://assets.example.com/private/a.png", None)
+            ),
+            "path_not_allowed"
+        );
+        assert_eq!(
+            rule_denial(&config, &args("https://assets.example.com", None)),
+            "path_not_allowed"
+        );
+        assert_eq!(
+            rule_denial(
+                &config,
+                &args("https://assets.example.com/files/a.png", Some("DELETE"))
+            ),
+            "method_not_allowed"
+        );
+        for target in [
+            "https://assets.example.com/files/../private/a.png",
+            "https://assets.example.com/files/%2e%2e/private/a.png",
+            "https://assets.example.com/files//a.png",
+            "https://assets.example.com\\@evil.example/files/a.png",
+        ] {
+            assert_eq!(
+                rule_denial(&config, &args(target, None)),
+                "path_not_normalized",
+                "target `{target}`"
+            );
+        }
+
+        let unlisted = invocation(&config, &args("https://evil.example/files/a.png", None));
+        assert!(matches!(
+            enforce_rules(&config, &unlisted),
+            Err(ViaError::InvalidArgument(message)) if message.contains("asset_hosts")
+        ));
+    }
+
+    #[test]
+    fn invalid_rule_patterns_are_a_config_error_at_execution() {
+        let config = rules_config("https://api.example.com", "allow_paths = [\"user\"]");
+
+        assert!(matches!(
+            enforce_rules(&config, &invocation(&config, &["/user"])),
+            Err(ViaError::InvalidConfig(message)) if message.contains("invalid path pattern")
+        ));
+    }
+
+    #[test]
+    fn capabilities_with_rules_do_not_follow_redirects() {
+        crate::tls::install_crypto_provider();
+
+        let (base_url, server) = request_server(vec![
+            "HTTP/1.1 302 Found\r\nLocation: https://elsewhere.example/admin?token=bearer-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+        ]);
+        let config = rules_config(
+            &base_url,
+            "allow_paths = [\"/public/**\"]\n\n[auth]\ntype = \"bearer\"\nsecret = \"token\"",
+        );
+        let service = service_with_secrets([("token", "op://Private/API/token")]);
+        let provider = FakeProvider::new([("op://Private/API/token", "bearer-token")]);
+
+        let error = execute(
+            "example",
+            &service,
+            &config,
+            &provider,
+            vec!["/public/moved".to_owned()],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            ViaError::InvalidArgument(message)
+                if message.contains("302")
+                    && message.contains("did not follow the redirect")
+                    && message.contains("https://elsewhere.example/admin?token=[REDACTED]")
+        ));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /public/moved "));
+    }
+
+    #[test]
+    fn rules_refuse_a_request_before_it_is_sent() {
+        struct NeverResolveProvider;
+
+        impl SecretProvider for NeverResolveProvider {
+            fn resolve(&self, _reference: &str) -> Result<SecretValue, ViaError> {
+                panic!("the provider must not run for a refused request")
+            }
+        }
+
+        let config = rules_config(
+            "http://127.0.0.1:9",
+            "methods = [\"GET\"]\n\n[auth]\ntype = \"bearer\"\nsecret = \"token\"",
+        );
+        let service = service_with_secrets([("token", "op://Private/API/token")]);
+
+        let error = execute(
+            "example",
+            &service,
+            &config,
+            &NeverResolveProvider,
+            vec!["DELETE".to_owned(), "/user".to_owned()],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ViaError::Denied { reason, .. } if reason == "method_not_allowed"
+        ));
     }
 
     #[test]

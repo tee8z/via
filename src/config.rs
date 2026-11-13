@@ -114,6 +114,53 @@ pub struct RestCommandConfig {
     pub auth: Option<AuthConfig>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "deserialize_methods")]
+    pub methods: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_paths: Vec<String>,
+    #[serde(default)]
+    pub deny_paths: Vec<String>,
+    #[serde(default)]
+    pub rules: Vec<RestRuleConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestRuleConfig {
+    #[serde(default, deserialize_with = "deserialize_methods")]
+    pub methods: Option<Vec<String>>,
+    pub path: String,
+    pub effect: RuleEffect,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleEffect {
+    Allow,
+    Deny,
+}
+
+impl RestCommandConfig {
+    pub fn has_rules(&self) -> bool {
+        self.methods.is_some()
+            || !self.allow_paths.is_empty()
+            || !self.deny_paths.is_empty()
+            || !self.rules.is_empty()
+    }
+}
+
+// HTTP methods in rules are stored in upper case.
+fn deserialize_methods<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let methods = Option::<Vec<String>>::deserialize(deserializer)?;
+    Ok(methods.map(|methods| {
+        methods
+            .into_iter()
+            .map(|method| method.to_ascii_uppercase())
+            .collect()
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,6 +367,11 @@ impl CommandConfig {
                     )));
                 }
                 validate_asset_hosts(service_name, command_name, &rest.asset_hosts)?;
+                crate::rules::RestRules::from_config(rest).map_err(|problem| {
+                    ViaError::InvalidConfig(format!(
+                        "command `{service_name}.{command_name}` {problem}"
+                    ))
+                })?;
 
                 if let Some(auth) = &rest.auth {
                     match auth {
@@ -1057,6 +1109,113 @@ type = "headers""#,
         assert!(matches!(
             Config::from_toml_str(&raw),
             Err(ViaError::InvalidConfig(message)) if message.contains("delegated program")
+        ));
+    }
+
+    #[test]
+    fn parses_rest_rules_and_stores_methods_in_upper_case() {
+        let raw = VALID.replace(
+            "base_url = \"https://api.github.com\"",
+            r#"base_url = "https://api.github.com"
+methods = ["get", "Post"]
+allow_paths = ["/repos/OWNER/**", "/user"]
+deny_paths = ["/repos/*/*/actions/secrets/**"]
+
+[[services.github.commands.api.rules]]
+methods = ["patch"]
+path = "/repos/OWNER/REPO/issues/*"
+effect = "allow"
+"#,
+        );
+        let config = Config::from_toml_str(&raw).unwrap();
+
+        match &config.services["github"].commands["api"] {
+            CommandConfig::Rest(rest) => {
+                assert!(rest.has_rules());
+                assert_eq!(
+                    rest.methods.as_deref(),
+                    Some(&["GET".to_owned(), "POST".to_owned()][..])
+                );
+                assert_eq!(rest.allow_paths, ["/repos/OWNER/**", "/user"]);
+                assert_eq!(rest.deny_paths, ["/repos/*/*/actions/secrets/**"]);
+                assert_eq!(rest.rules.len(), 1);
+                assert_eq!(
+                    rest.rules[0].methods.as_deref(),
+                    Some(&["PATCH".to_owned()][..])
+                );
+                assert_eq!(rest.rules[0].path, "/repos/OWNER/REPO/issues/*");
+                assert_eq!(rest.rules[0].effect, RuleEffect::Allow);
+            }
+            _ => panic!("expected REST command"),
+        }
+    }
+
+    #[test]
+    fn rest_commands_without_rule_fields_have_no_rules() {
+        let config = Config::from_toml_str(VALID).unwrap();
+
+        match &config.services["github"].commands["api"] {
+            CommandConfig::Rest(rest) => assert!(!rest.has_rules()),
+            _ => panic!("expected REST command"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_rest_rules() {
+        for (rules, expected) in [
+            ("methods = []", "at least one HTTP method"),
+            ("methods = [\"GE T\"]", "invalid HTTP method"),
+            (
+                "allow_paths = [\"repos\"]",
+                "invalid path pattern `repos` in allow_paths",
+            ),
+            (
+                "deny_paths = [\"/a/**/b\"]",
+                "invalid path pattern `/a/**/b` in deny_paths",
+            ),
+            ("allow_paths = [\"/a/../b\"]", "invalid path pattern"),
+        ] {
+            let raw = VALID.replace(
+                "base_url = \"https://api.github.com\"",
+                &format!("base_url = \"https://api.github.com\"\n{rules}"),
+            );
+
+            assert!(
+                matches!(
+                    Config::from_toml_str(&raw),
+                    Err(ViaError::InvalidConfig(message))
+                        if message.contains("command `github.api`") && message.contains(expected)
+                ),
+                "expected `{rules}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rest_rule_tables_reject_unknown_fields_and_effects() {
+        let rule = |body: &str| {
+            VALID.replace(
+                "base_url = \"https://api.github.com\"",
+                &format!(
+                    "base_url = \"https://api.github.com\"\n\n[[services.github.commands.api.rules]]\n{body}\n"
+                ),
+            )
+        };
+
+        assert!(Config::from_toml_str(&rule("path = \"/user\"\neffect = \"allow\"")).is_ok());
+        assert!(matches!(
+            Config::from_toml_str(&rule("path = \"/user\"\neffect = \"permit\"")),
+            Err(ViaError::ParseConfig(_))
+        ));
+        assert!(matches!(
+            Config::from_toml_str(&rule(
+                "path = \"/user\"\neffect = \"allow\"\nmethod = \"GET\""
+            )),
+            Err(ViaError::ParseConfig(_))
+        ));
+        assert!(matches!(
+            Config::from_toml_str(&rule("effect = \"allow\"")),
+            Err(ViaError::ParseConfig(_))
         ));
     }
 
