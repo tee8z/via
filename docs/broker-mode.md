@@ -103,7 +103,8 @@ via refuses a credential file when any of these is true:
 - It is a symbolic link to a file outside the directory, or to a file in a
   subdirectory.
 - It is not a regular file.
-- It is readable by "other" users (mode `& 0o004`). Use mode `0400` or `0600`.
+- It is readable or writable by "other" users (mode `& 0o006`). Use mode
+  `0400` or `0600`.
 - It is larger than 1 MiB or is not valid UTF-8.
 
 via strips exactly one trailing newline, and a carriage return before it.

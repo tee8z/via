@@ -145,8 +145,13 @@ fn check_credential_metadata(metadata: &fs::Metadata) -> Result<(), &'static str
     {
         use std::os::unix::fs::PermissionsExt;
 
-        if metadata.permissions().mode() & 0o004 != 0 {
+        let mode = metadata.permissions().mode();
+        if mode & 0o004 != 0 {
             return Err("the credential file is readable by other users");
+        }
+        // Another user could replace the credential that requests carry.
+        if mode & 0o002 != 0 {
+            return Err("the credential file is writable by other users");
         }
     }
 
@@ -291,6 +296,18 @@ mod tests {
                     .contains("readable by other users"),
                 "mode {mode:o}"
             );
+        }
+
+        for mode in [0o602, 0o622, 0o402] {
+            let path = directory.write_private("shared-token", b"secret-token");
+            set_mode(&path, mode);
+
+            assert!(
+                unavailable_reason(read_credential(directory.path(), "cred://shared-token"))
+                    .contains("writable by other users"),
+                "mode {mode:o}"
+            );
+            set_mode(&path, 0o600);
         }
 
         for mode in [0o600, 0o400, 0o640] {
