@@ -24,6 +24,7 @@ pub fn render_with_context(config: &Config, context: &ExecutionContext) -> Strin
     if context.is_broker() {
         output.push_str("- This `via` runs on a remote broker host. Only `via capabilities`, `via skill print`, and the REST and SSH capabilities listed below are available.\n");
         output.push_str("- Pass a request body inline or with `@-` from standard input. `@file` bodies and `--output <file>` are refused; use `--output -` to receive the raw response on standard output.\n");
+        output.push_str("- Standard input bodies must finish within 30 seconds and contain at most 8 MiB. Absolute asset URLs require HTTPS and port 443, or the exact HTTPS origin configured in `base_url`.\n");
         output.push_str(
             "- Redirects are not followed. A redirected request fails and reports its target.\n",
         );

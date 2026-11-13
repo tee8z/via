@@ -205,7 +205,7 @@ mod tests {
 
         assert_eq!(code, ExitCode::SUCCESS);
         let audit = std::fs::read_to_string(audit_path).unwrap();
-        assert_eq!(audit.lines().count(), 1);
+        assert_eq!(audit.lines().count(), 2);
         assert!(audit.contains("\"caller\":\"local-test\""));
         assert!(audit.contains("\"request\":\"capabilities\""));
         assert!(audit.contains("\"outcome\":\"ok\""));

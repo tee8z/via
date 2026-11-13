@@ -17,12 +17,13 @@ sequenceDiagram
 
     Caller->>SSH: ssh broker '["github","api","/user"]'
     SSH->>Via: forced command, SSH_ORIGINAL_COMMAND
-    Via->>Via: parse request, check kill switch and rules
+    Via->>Via: parse request, check kill switch, record admission
+    Via->>Via: check rules, read bounded request body
     Via->>Provider: read cred://github-token
     Via->>Service: authenticated request
     Service-->>Via: response
-    Via->>Via: write audit record
     Via-->>Caller: response only
+    Via->>Via: write completion record
 ```
 
 ## Threat Model
@@ -107,6 +108,9 @@ via refuses a credential file when any of these is true:
 
 via strips exactly one trailing newline, and a carriage return before it.
 It never prints a value or includes one in an error.
+
+via pins the credential directory while it opens a file. File resolution stays
+inside that directory, even if another process replaces a checked path.
 
 When `path` is absent, via uses the `CREDENTIALS_DIRECTORY` environment
 variable. systemd sets that variable for a unit that uses `LoadCredential=`
@@ -205,7 +209,7 @@ label of your choice. via writes it to every audit record from this key.
 If an interactive session through an `ssh` capability needs a terminal, add
 `pty` after `restrict`. Grant `pty` only to a key that needs it: with a
 terminal, a disconnect or an interrupt key can end via before it writes the
-audit record of the running request.
+completion record. The admission record remains.
 
 Harden sshd for the broker account:
 
@@ -260,6 +264,8 @@ via servers shell app-01.example.com uptime
 
 via limits a request to 64 KiB and 256 arguments, and refuses a NUL byte.
 Send a larger body on standard input with `--json @-` or `--data @-`.
+The body limit is 8 MiB, with a 30-second deadline to receive the body and EOF.
+via checks the method, path, and asset origin before reading the body.
 
 Exit codes match a local via. `0` means success. `2` means that the request
 was refused, was invalid, or received an HTTP error status. `1` means another
@@ -305,6 +311,9 @@ Other differences from a local via:
 `--output -` writes the raw response bytes to standard output. via redacts
 known secret values from those bytes. An absolute asset URL still needs
 `--output`, so use `--output -` for an asset download through the broker.
+Broker asset URLs require HTTPS without user information. Port 443 is allowed
+for listed asset hosts. Another port requires the exact HTTPS origin in `base_url`.
+These restrictions apply before credentials are resolved or sent.
 
 ## Method And Path Rules
 
@@ -469,8 +478,8 @@ already running.
 ## Audit Records
 
 `broker exec` requires an `[audit]` table. via opens the sink before it runs
-a request. If the table is missing or the sink cannot be opened, via refuses
-the request.
+a request. It must also write an admission record before starting an accepted request.
+If either operation fails, via refuses the request.
 
 ```toml
 [audit]
@@ -494,17 +503,22 @@ Read journald records with:
 journalctl -t via -o cat | jq .
 ```
 
-via writes one record after each request finishes or is refused:
+Accepted requests produce an `outcome = "started"` admission record and a completion record.
+The two records share a `request_id`. Rejections before admission produce one completion record.
+An admission record without a completion record identifies an unfinished or interrupted request.
+
+Example completion record:
 
 ```json
-{"ts":"2026-01-02T03:04:05.678Z","caller":"sandbox-1","client":"198.51.100.7","request":"run","service":"github","capability":"api","mode":"rest","method":"GET","host":"api.github.com","path":"/repos/OWNER/REPO/issues","ssh_host":null,"ssh_command":null,"outcome":"ok","reason":null,"status":200,"duration_ms":182}
+{"ts":"2026-01-02T03:04:05.678Z","request_id":"1234-1767323045496000000","caller":"sandbox-1","client":"198.51.100.7","request":"run","service":"github","capability":"api","mode":"rest","method":"GET","host":"api.github.com","path":"/repos/OWNER/REPO/issues","ssh_host":null,"ssh_command":null,"outcome":"ok","reason":null,"status":200,"duration_ms":182}
 ```
 
 Every field is always present. A field that does not apply is `null`.
 
 | Field | Content |
 | --- | --- |
-| `ts` | Completion time, RFC 3339 in UTC. |
+| `ts` | Record time, RFC 3339 in UTC. |
+| `request_id` | Correlates admission and completion records for one process request. |
 | `caller` | The `--caller` label. |
 | `client` | The first field of `SSH_CONNECTION`: the caller's address. |
 | `request` | `capabilities`, `skill` or `run`. `null` when via could not accept the request as one of these. |
@@ -512,7 +526,7 @@ Every field is always present. A field that does not apply is `null`.
 | `mode` | `rest`, `ssh` or `delegated`, once via has found the capability. |
 | `method`, `host`, `path` | The HTTP method, target host, and path of a `rest` request. The path has no query string. |
 | `ssh_host`, `ssh_command` | The host of an `ssh` request and its remote command joined with spaces, cut to 512 bytes. `ssh_command` is `null` for an interactive session. |
-| `outcome` | `ok`, `denied` or `error`. |
+| `outcome` | `started`, `ok`, `denied` or `error`. |
 | `reason` | A short code for a `denied` or `error` outcome. |
 | `status` | The HTTP status, or the exit code of the SSH client. |
 | `duration_ms` | Time spent on the request. |
@@ -529,6 +543,8 @@ Every field is always present. A field that does not apply is `null`.
 | `local_file_input`, `local_file_output` | The request used `@file` or `--output <path>`. |
 | `method_not_allowed`, `path_denied`, `path_not_allowed`, `path_not_normalized` | A method or path rule refused the request. |
 | `asset_host_not_allowed`, `ssh_host_not_allowed` | The host is not listed for the capability. |
+| `asset_origin_not_allowed` | An asset URL uses an unapproved scheme, port, or user information. |
+| `body_too_large`, `body_timeout` | Standard input exceeds 8 MiB or does not finish within 30 seconds. |
 
 `error` reasons include `http_status` for a response outside the 2xx range,
 `unknown_service`, `unknown_capability`, `secret_unavailable`,
@@ -538,14 +554,15 @@ A record never contains a query string, a request or response body, a header
 value, or a value from a provider. via redacts resolved secrets from every
 field and limits each field's length.
 
-via writes the record after the request, so a record that cannot be written
-at that point cannot undo the request. via then exits with status `1` and
+Admission records omit targets and command arguments because secrets are not yet available for redaction.
+Completion records include the sanitized execution details.
+
+A completion record that cannot be written cannot undo the request. via then exits with status `1` and
 reports the audit failure, even if the request succeeded. Watch for that
 error, and keep the audit file's volume from filling up.
 
-A caller that disconnects early does not avoid its record. Without a
-terminal, via finishes the request, fails to write the response to the closed
-connection, and records the request with its status and an `io_error` reason.
+A caller that stops reading cannot prevent the admission record.
+Without a terminal, a disconnect lets via record the output failure with an `io_error` reason.
 
 ## Configuration Reference
 

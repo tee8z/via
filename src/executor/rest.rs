@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{
@@ -15,6 +16,9 @@ use crate::providers::SecretProvider;
 use crate::redaction::Redactor;
 use crate::rules::{self, RestRules};
 
+const MAX_BROKER_BODY_BYTES: u64 = 8 * 1024 * 1024;
+const BROKER_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub fn execute(
     context: &ExecutionContext,
     service_name: &str,
@@ -25,14 +29,24 @@ pub fn execute(
     trace: &mut InvocationTrace,
 ) -> Result<(), ViaError> {
     record_request_target(config, &args, trace);
-    let request = RestInvocation::parse(context, config, args)?;
+    let mut request = RestInvocation::parse(context, config, args)?;
     if request.absolute_url {
         if let Err(error) = validate_asset_url(config, &request.path) {
             trace.denied = Some("asset_host_not_allowed");
             return Err(error);
         }
+        if context.is_broker() {
+            validate_broker_asset_origin(config, &request.path)?;
+        }
     }
     enforce_rules(config, &request)?;
+    // Validate the URL even without rules, before consuming caller input.
+    build_url(config, &request.path, &request.query)?;
+    request.body = request
+        .body
+        .as_deref()
+        .map(|value| read_body_arg(context, value))
+        .transpose()?;
 
     let client = http_client(context, config, &request)?;
     let target = RestTarget {
@@ -437,17 +451,13 @@ impl RestInvocation {
                     })?;
                     query.push((name.to_owned(), value.to_owned()));
                 }
-                "--json" => {
+                "--json" | "--data" | "-d" => {
                     let value = args
                         .next()
-                        .ok_or_else(|| ViaError::MissingArgument("--json value".to_owned()))?;
-                    body = Some(read_body_arg(context, &value)?);
-                }
-                "--data" | "-d" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| ViaError::MissingArgument("--data value".to_owned()))?;
-                    body = Some(read_body_arg(context, &value)?);
+                        .ok_or_else(|| ViaError::MissingArgument(format!("{arg} value")))?;
+                    // Classify without reading: authorization precedes body I/O.
+                    body_source(context, &value)?;
+                    body = Some(value);
                 }
                 "--output" | "-o" => {
                     let value = args
@@ -835,6 +845,24 @@ fn validate_asset_url(config: &RestCommandConfig, url: &str) -> Result<(), ViaEr
     )))
 }
 
+fn validate_broker_asset_origin(config: &RestCommandConfig, target: &str) -> Result<(), ViaError> {
+    let url = Url::parse(target)
+        .map_err(|_| ViaError::InvalidArgument("invalid absolute REST URL".to_owned()))?;
+    let configured_origin =
+        Url::parse(&config.base_url).is_ok_and(|base| base.origin() == url.origin());
+    if url.scheme() != "https"
+        || (url.port_or_known_default() != Some(443) && !configured_origin)
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(ViaError::denied(
+            "asset_origin_not_allowed",
+            "broker asset URLs require HTTPS without user information and port 443, or the exact HTTPS origin configured in base_url",
+        ));
+    }
+    Ok(())
+}
+
 fn append_query(mut url: String, query: &[(String, String)]) -> String {
     if !query.is_empty() {
         let separator = if url.contains('?') { '&' } else { '?' };
@@ -896,12 +924,53 @@ fn read_body_arg(context: &ExecutionContext, value: &str) -> Result<String, ViaE
     match body_source(context, value)? {
         BodySource::Inline(body) => Ok(body.to_owned()),
         BodySource::Stdin => {
+            if context.is_broker() {
+                return read_broker_body(io::stdin(), BROKER_BODY_TIMEOUT);
+            }
             let mut body = String::new();
             io::stdin().read_to_string(&mut body)?;
             Ok(body)
         }
         BodySource::File(path) => Ok(std::fs::read_to_string(path)?),
     }
+}
+
+fn read_broker_body(
+    reader: impl Read + Send + 'static,
+    timeout: Duration,
+) -> Result<String, ViaError> {
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    // A broker process handles one request. On timeout it exits, releasing
+    // stdin and this bounded reader even if the caller never sends EOF.
+    std::thread::Builder::new()
+        .name("broker-body".to_owned())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let result = reader
+                .take(MAX_BROKER_BODY_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = send.send(result);
+        })?;
+    let bytes = receive
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => ViaError::denied(
+                "body_timeout",
+                "broker request body was not received within 30 seconds",
+            ),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                ViaError::Io(io::Error::other("broker body reader stopped"))
+            }
+        })??;
+    if bytes.len() as u64 > MAX_BROKER_BODY_BYTES {
+        return Err(ViaError::denied(
+            "body_too_large",
+            "broker request bodies must not exceed 8 MiB",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| ViaError::InvalidArgument("request body is not valid UTF-8".to_owned()))
 }
 
 #[cfg(test)]
@@ -921,6 +990,78 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     const JSON_BODY: &str = r#"{"query":"query { viewer { id } }"}"#;
+
+    #[test]
+    fn broker_assets_reject_downgrades_ports_and_user_information() {
+        let config: RestCommandConfig = toml::from_str(
+            "base_url = 'https://api.example.com:8443'\nasset_hosts = ['assets.example.com', 'api.example.com']",
+        ).unwrap();
+        for target in [
+            "http://assets.example.com/file",
+            "https://assets.example.com:8443/file",
+            "https://assets.example.com:22/file",
+            "https://user:pass@assets.example.com/file",
+            "https://user@assets.example.com/file",
+        ] {
+            assert!(
+                matches!(
+                    validate_broker_asset_origin(&config, target),
+                    Err(ViaError::Denied {
+                        reason: "asset_origin_not_allowed",
+                        ..
+                    })
+                ),
+                "{target}"
+            );
+        }
+        for target in [
+            "https://assets.example.com/file",
+            "https://assets.example.com:443/file",
+            "https://api.example.com:8443/file",
+        ] {
+            validate_broker_asset_origin(&config, target).unwrap();
+        }
+    }
+
+    #[test]
+    fn broker_body_enforces_size_and_utf8() {
+        let limit = MAX_BROKER_BODY_BYTES as usize;
+        assert_eq!(
+            read_broker_body(io::Cursor::new(vec![b'x'; limit]), Duration::from_secs(5))
+                .unwrap()
+                .len(),
+            limit
+        );
+        assert!(matches!(
+            read_broker_body(
+                io::Cursor::new(vec![b'x'; limit + 1]),
+                Duration::from_secs(5)
+            ),
+            Err(ViaError::Denied {
+                reason: "body_too_large",
+                ..
+            })
+        ));
+        assert!(matches!(
+            read_broker_body(io::Cursor::new(vec![0xff]), Duration::from_secs(5)),
+            Err(ViaError::InvalidArgument(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_body_deadline_does_not_wait_for_eof() {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let result = read_broker_body(reader, Duration::from_millis(20));
+        drop(writer);
+        assert!(matches!(
+            result,
+            Err(ViaError::Denied {
+                reason: "body_timeout",
+                ..
+            })
+        ));
+    }
 
     fn rest_config() -> RestCommandConfig {
         toml::from_str(

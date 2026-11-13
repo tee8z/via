@@ -389,8 +389,10 @@ In broker mode, via:
   capabilities. It refuses delegated capabilities, `config`, `login` and
   `daemon` commands, `@file` bodies, and `--output <path>`.
 - Applies each capability's method and path rules.
+- Bounds standard input bodies to 8 MiB and 30 seconds, after authorization.
+- Requires HTTPS and an approved port for absolute asset URLs.
 - Honors a kill switch directory that disables one service or everything.
-- Writes one audit record per request to journald or a file, and refuses
+- Writes admission and completion audit records to journald or a file, and refuses
   requests when it cannot.
 
 Follow the [Broker Mode](docs/broker-mode.md) guide for the threat model,

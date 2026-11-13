@@ -18,17 +18,19 @@ const MAX_SSH_COMMAND_BYTES: usize = 512;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
+    Started,
     Ok,
     Denied,
     Error,
 }
 
-// One record per broker request. Every field is always present so the shape
-// is stable; a field that does not apply is `null`. A record never holds a
+// Admission and completion records share a request ID. Every field is present;
+// a field that does not apply is `null`. A record never holds a
 // query string, a request or response body, or a header value.
 #[derive(Debug, Serialize)]
 pub struct AuditRecord {
     pub ts: String,
+    pub request_id: String,
     pub caller: Option<String>,
     pub client: Option<String>,
     pub request: Option<&'static str>,
@@ -50,6 +52,14 @@ impl AuditRecord {
     pub fn new(caller: Option<String>, client: Option<String>) -> Self {
         Self {
             ts: String::new(),
+            request_id: format!(
+                "{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
             caller,
             client,
             request: None,
@@ -245,7 +255,7 @@ impl AuditSink {
 #[cfg(unix)]
 fn journald_datagram(line: &str, outcome: AuditOutcome) -> String {
     let priority = match outcome {
-        AuditOutcome::Ok => 6,
+        AuditOutcome::Started | AuditOutcome::Ok => 6,
         AuditOutcome::Denied | AuditOutcome::Error => 5,
     };
 
@@ -331,6 +341,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&line).unwrap();
         let names = [
             "ts",
+            "request_id",
             "caller",
             "client",
             "request",

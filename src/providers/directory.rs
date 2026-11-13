@@ -70,24 +70,8 @@ fn read_credential(directory: &Path, reference: &str) -> Result<SecretValue, Via
         reason: reason.to_owned(),
     };
 
-    let directory = fs::canonicalize(directory)
-        .map_err(|_| unavailable("the credential directory does not exist or is not accessible"))?;
-    let resolved = fs::canonicalize(directory.join(name))
-        .map_err(|_| unavailable("the credential file does not exist or is not accessible"))?;
-    // A symbolic link may only point at another file in the same directory.
-    if resolved.parent() != Some(directory.as_path()) {
-        return Err(unavailable(
-            "the credential file resolves outside the credential directory",
-        ));
-    }
-    let metadata = fs::metadata(resolved.as_path())
-        .map_err(|_| unavailable("the credential file does not exist or is not accessible"))?;
-    check_credential_metadata(&metadata).map_err(unavailable)?;
-
-    // Check the opened handle again so a file swapped in after the first
-    // check cannot bypass the file type and mode requirements.
-    let file = File::open(resolved.as_path())
-        .map_err(|_| unavailable("the credential file could not be opened"))?;
+    let checked = CredentialPath::prepare(directory, name).map_err(unavailable)?;
+    let file = checked.open().map_err(unavailable)?;
     let metadata = file
         .metadata()
         .map_err(|_| unavailable("the credential file could not be inspected"))?;
@@ -105,6 +89,52 @@ fn read_credential(directory: &Path, reference: &str) -> Result<SecretValue, Via
     strip_one_trailing_newline(&mut value);
 
     Ok(SecretValue::new(value))
+}
+
+// Keep the directory handle across validation and opening. cap-std enforces
+// confinement during resolution on Unix and Windows, including replacements
+// of a previously checked file or directory with a symlink/reparse point.
+struct CredentialPath {
+    directory: cap_std::fs::Dir,
+    name: OsString,
+}
+
+impl CredentialPath {
+    fn prepare(directory: &Path, name: &str) -> Result<Self, &'static str> {
+        let canonical = fs::canonicalize(directory)
+            .map_err(|_| "the credential directory does not exist or is not accessible")?;
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&canonical, cap_std::ambient_authority())
+                .map_err(|_| "the credential directory could not be opened")?;
+        let resolved = fs::canonicalize(canonical.join(name))
+            .map_err(|_| "the credential file does not exist or is not accessible")?;
+        if resolved.parent() != Some(canonical.as_path()) {
+            return Err("the credential file resolves outside the credential directory");
+        }
+        let metadata = fs::metadata(&resolved)
+            .map_err(|_| "the credential file does not exist or is not accessible")?;
+        check_credential_metadata(&metadata)?;
+        let name = resolved
+            .file_name()
+            .ok_or("the credential path has no file name")?
+            .to_owned();
+        Ok(Self { directory, name })
+    }
+
+    fn open(&self) -> Result<File, &'static str> {
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            // A replacement FIFO must not block before handle validation.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        self.directory
+            .open_with(&self.name, &options)
+            .map(cap_std::fs::File::into_std)
+            .map_err(|_| "the credential file could not be opened within its directory")
+    }
 }
 
 fn check_credential_metadata(metadata: &fs::Metadata) -> Result<(), &'static str> {
@@ -308,6 +338,43 @@ mod tests {
         let secret = read_credential(directory.path(), "cred://alias").unwrap();
 
         assert_eq!(secret.expose(), "secret-token");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_symlink_swapped_in_after_validation() {
+        let directory = TempDir::create("credential-swap");
+        let outside = TempDir::create("credential-swap-outside");
+        let path = directory.write_private("token", b"inside");
+        let target = outside.write_private("token", b"outside");
+        let checked = CredentialPath::prepare(directory.path(), "token").unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(checked.open().is_err());
+        fs::remove_file(&path).unwrap();
+        // Exercise relative traversal as well as an absolute link.
+        let relative = Path::new("..")
+            .join(outside.path().file_name().unwrap())
+            .join("token");
+        std::os::unix::fs::symlink(relative, &path).unwrap();
+        assert!(checked.open().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_the_original_directory_when_its_path_is_replaced() {
+        let root = TempDir::create("credential-directory-swap");
+        let directory = root.join("credentials");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("token"), b"inside").unwrap();
+        set_mode(&directory.join("token"), 0o600);
+        let checked = CredentialPath::prepare(&directory, "token").unwrap();
+        fs::rename(&directory, root.join("original")).unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("token"), b"replacement").unwrap();
+        let mut value = String::new();
+        checked.open().unwrap().read_to_string(&mut value).unwrap();
+        assert_eq!(value, "inside");
     }
 
     #[test]

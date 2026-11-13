@@ -73,6 +73,7 @@ fn run_request(
             original_command,
             &mut record,
             &mut trace,
+            &mut sink,
         )
     }));
     let panicked = served.is_err();
@@ -130,6 +131,7 @@ fn serve(
     original_command: Option<&OsStr>,
     record: &mut AuditRecord,
     trace: &mut InvocationTrace,
+    sink: &mut AuditSink,
 ) -> Result<(), ViaError> {
     let args = select_request(cli_request, original_command)?;
     let request = BrokerRequest::parse(args)?;
@@ -144,6 +146,14 @@ fn serve(
         record.capability = Some(capability.clone());
     }
     check_kill_switch(config, &request)?;
+
+    // Persist admission before any stdin, network, SSH, or output operation
+    // can block. The completion record uses the same ID. Do not log raw
+    // targets or command arguments before secrets are available for redaction.
+    record.ts = rfc3339_utc(SystemTime::now());
+    record.outcome = AuditOutcome::Started;
+    record.sanitize(&trace.redactor);
+    sink.write(record)?;
 
     let context = ExecutionContext::broker();
     match request {
@@ -504,10 +514,11 @@ base_url = "{base_url}"
             self.audit_log()
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
+                .filter(|record: &serde_json::Value| record["outcome"] != "started")
                 .collect()
         }
 
-        // The single record written by the only request of a test.
+        // The completion record written by the only request of a test.
         fn record(&self) -> serde_json::Value {
             let mut records = self.records();
             assert_eq!(records.len(), 1, "expected exactly one audit record");
