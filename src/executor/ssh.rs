@@ -12,7 +12,7 @@ use base64::Engine as _;
 
 use crate::config::{valid_ssh_host_value, SshCommandConfig, SshProfileConfig};
 use crate::error::ViaError;
-use crate::executor::InvocationTrace;
+use crate::executor::{ExecutionContext, InvocationTrace};
 use crate::providers::SecretProvider;
 
 static TEMP_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -25,6 +25,7 @@ const DEFAULT_SSH_PROGRAM: &str = "/usr/bin/ssh";
 const DEFAULT_SSH_ADD_PROGRAM: &str = "/usr/bin/ssh-add";
 
 pub fn execute(
+    context: &ExecutionContext,
     config: &SshCommandConfig,
     profile: &SshProfileConfig,
     provider: &dyn SecretProvider,
@@ -54,6 +55,7 @@ pub fn execute(
     let identity_file = PublicKeyFile::create(&public_key)?;
 
     let mut command = build_command(
+        context,
         &ssh_program,
         config,
         &invocation,
@@ -598,6 +600,7 @@ fn invalid_identity_path(reason: &str) -> ViaError {
 }
 
 fn build_command(
+    context: &ExecutionContext,
     ssh_program: &Path,
     config: &SshCommandConfig,
     invocation: &SshInvocation,
@@ -643,6 +646,12 @@ fn build_command(
         .arg("HostbasedAuthentication=no")
         .arg("-l")
         .arg(&config.user);
+    // A broker caller must not decide which host keys the broker account
+    // trusts. With a terminal it could otherwise answer the host-key prompt
+    // and add an entry to the account's known_hosts file.
+    if context.is_broker() {
+        command.arg("-o").arg("StrictHostKeyChecking=yes");
+    }
     if let Some(port) = config.port {
         command.arg("-p").arg(port.to_string());
     }
@@ -856,6 +865,7 @@ mod tests {
     fn execute_rejects_a_disallowed_host_before_provider_or_agent_access() {
         let mut trace = InvocationTrace::default();
         let error = execute(
+            &ExecutionContext::direct(),
             &ssh_config(&["allowed.example.com"]),
             &profile(None),
             &NeverResolveProvider,
@@ -878,6 +888,7 @@ mod tests {
     fn execute_does_not_mark_a_missing_host_as_denied() {
         let mut trace = InvocationTrace::default();
         let error = execute(
+            &ExecutionContext::direct(),
             &ssh_config(&["allowed.example.com"]),
             &profile(None),
             &NeverResolveProvider,
@@ -927,6 +938,7 @@ mod tests {
             remote_args: vec!["uname".to_owned(), "-a".to_owned()],
         };
         let command = build_command(
+            &ExecutionContext::direct(),
             Path::new("/secure/bin/ssh"),
             &config,
             &invocation,
@@ -1041,6 +1053,7 @@ mod tests {
             remote_args: Vec::new(),
         };
         let error = build_command(
+            &ExecutionContext::direct(),
             Path::new("/secure/bin/ssh"),
             &ssh_config(&["host.example.com"]),
             &invocation,
@@ -1065,6 +1078,7 @@ mod tests {
             remote_args: Vec::new(),
         };
         let built = build_command(
+            &ExecutionContext::direct(),
             &ssh_program,
             &ssh_config(&["host.example.com"]),
             &invocation,
@@ -1158,6 +1172,7 @@ mod tests {
             remote_args: Vec::new(),
         };
         let command = build_command(
+            &ExecutionContext::direct(),
             Path::new("/secure/bin/ssh"),
             &config,
             &invocation,
@@ -1169,6 +1184,48 @@ mod tests {
 
         assert!(!args.iter().any(|argument| *argument == OsStr::new("-p")));
         assert_eq!(args.last(), Some(&OsStr::new("host.example.com")));
+    }
+
+    #[test]
+    fn broker_context_refuses_unknown_host_keys_without_a_prompt() {
+        let invocation = SshInvocation {
+            host: "host.example.com".to_owned(),
+            remote_args: vec!["-o".to_owned(), "StrictHostKeyChecking=no".to_owned()],
+        };
+        let arguments = |context: ExecutionContext| {
+            build_command(
+                &context,
+                Path::new("/secure/bin/ssh"),
+                &ssh_config(&["host.example.com"]),
+                &invocation,
+                Path::new("/tmp/agent.sock"),
+                Path::new("/tmp/identity.pub"),
+            )
+            .unwrap()
+            .get_args()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        };
+        let strict = OsString::from("StrictHostKeyChecking=yes");
+
+        // The option is an OpenSSH option only before `--`. After the host,
+        // the caller's arguments are the remote command.
+        let broker = arguments(ExecutionContext::broker());
+        let separator = broker.iter().position(|argument| argument == "--").unwrap();
+        let option = broker
+            .iter()
+            .position(|argument| *argument == strict)
+            .unwrap();
+        assert!(option < separator);
+        assert_eq!(broker[option - 1], "-o");
+        assert_eq!(
+            broker[separator + 1..],
+            ["host.example.com", "-o", "StrictHostKeyChecking=no"]
+        );
+
+        // A direct caller owns its known_hosts file and keeps the prompt.
+        let direct = arguments(ExecutionContext::direct());
+        assert!(!direct.contains(&strict));
     }
 
     #[test]
@@ -1221,6 +1278,7 @@ mod tests {
 
         let mut trace = InvocationTrace::default();
         let error = execute(
+            &ExecutionContext::direct(),
             &ssh_config(&["node.example.com"]),
             &profile,
             &FakeProvider {

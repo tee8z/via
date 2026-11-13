@@ -182,9 +182,10 @@ agent_socket = "/run/via-broker/ssh-agent.sock"
 via reads only the public key. It asks the agent for that one identity, so
 the private key never enters via or the caller's session.
 
-via keeps host-key verification on, and a broker session cannot answer a
-host-key prompt. Add each allowed host's key to the broker account's
-`known_hosts` file before the first request.
+In broker mode via runs OpenSSH with `StrictHostKeyChecking=yes`. OpenSSH
+refuses a host whose key is not in `known_hosts` and never asks the caller to
+accept one, even when the caller's key has `pty`. Add each allowed host's key
+to the broker account's `known_hosts` file before the first request.
 
 OpenSSH joins the remote command's arguments with spaces and the remote
 shell parses the result, as it does for a local `ssh` command.

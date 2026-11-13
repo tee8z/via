@@ -115,7 +115,7 @@ pub fn invoke_with_context(
                 ))
             })?;
             let provider = providers.get(&profile.provider)?;
-            ssh::execute(ssh_config, profile, provider, args, trace)
+            ssh::execute(context, ssh_config, profile, provider, args, trace)
         }
     }
 }
